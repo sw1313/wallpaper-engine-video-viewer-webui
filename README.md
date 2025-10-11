@@ -17,10 +17,17 @@ wallpaper-engine-video-viewer-webui, Docker deployment, mimicking the we path di
 │     ├─ style.css
 │     └─ app.js
 ├─ Dockerfile```
-</br></br>
-进入程序文件夹，比如`cd /volume1/docker/webui`</br>
-创建镜像： `docker build -t wallpaper-webui:latest .`</br>
-部署容器</br>
+
+
+进入程序文件夹，比如`cd /volume1/docker/webui`
+
+
+创建镜像： `docker build -t wallpaper-webui:latest .`
+
+
+部署容器
+
+
 ```docker run -d -it \
   -p 8066:8066 \
   -e WORKSHOP_PATH=/data/workshop/content/431960 \
@@ -29,4 +36,6 @@ wallpaper-engine-video-viewer-webui, Docker deployment, mimicking the we path di
   -v <程序主目录路径，例：/volume1/steam/SteamLibrary/steamapps/common/wallpaper_engine>:/data/wallpaper_engine:ro \
   --name wallpaper-webui \
   <镜像名>```
+
+
 不保证windows docker能够使用
