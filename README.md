@@ -4,8 +4,11 @@ wallpaper-engine-video-viewer-webui, Docker deployment, mimicking the we path di
 1.网页内播放，支持文件夹批量播放，电脑支持框选及快捷键多选播放  
 2.适配手机浏览  
   
-部署教程
-文件树：
+# 部署教程
+
+## 文件结构
+
+```text
 webui/
 ├─ app/
 │  ├─ main.py
@@ -17,21 +20,34 @@ webui/
 │     ├─ style.css
 │     └─ app.js
 ├─ Dockerfile
+```
 
-进入程序文件夹：
+---
+
+## 快速部署（可直接复制）
+
+### 1. 进入程序目录
+
+```bash
 cd /volume1/docker/webui
+```
 
-创建镜像：
+### 2. 构建镜像
+
+```bash
 docker build -t wallpaper-webui:latest .
+```
 
-部署容器：
-docker run -d -p 8066:8066 \
+### 3. 运行容器（Linux / Synology 示例）
+
+```bash
+docker run -d \
+  -p 8066:8066 \
   -e WORKSHOP_PATH=/data/workshop/content/431960 \
   -e WE_PATH=/data/wallpaper_engine \
-  -v /volume1/steam/SteamLibrary/steamapps/workshop/content/431960:/data/workshop/content/431960 \
-  -v /volume1/steam/SteamLibrary/steamapps/common/wallpaper_engine:/data/wallpaper_engine:ro \
-  --restart unless-stopped \
-  --name wallpaper-webui wallpaper-webui:latest
+  -v /path/to/workshop/content/431960:/data/workshop/content/431960 \
+  -v /path/to/wallpaper_engine:/data/wallpaper_engine:ro \
+  --name wallpaper-webui \
+  wallpaper-webui:latest
+```
 
-
-Windows用户注意：可能需要调整一些配置。
