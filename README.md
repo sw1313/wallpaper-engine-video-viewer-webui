@@ -50,4 +50,4 @@ docker run -d \
   --name wallpaper-webui \
   wallpaper-webui:latest
 ```
-
+没有做账号验证，请不要部署在外网环境中
