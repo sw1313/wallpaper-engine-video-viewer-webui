@@ -60,7 +60,7 @@ def index(request: Request):
 def api_scan(
     path: str = Query("/", description="形如 /A/B"),
     page: int = Query(1, ge=1),
-    per_page: int = Query(45, ge=1, le=200),
+    per_page: int = Query(45, ge=1, le=500),  # 放宽到 500，配合前端收集
     sort_idx: int = Query(0, ge=0, le=5),
     mature_only: bool = Query(False),
     q: str = Query("", description="标题筛选，空格分词，全部包含")
@@ -254,7 +254,13 @@ def health():
     cfg_ok = os.path.isfile(os.path.join(WE_PATH, "config.json"))
     work_ok = os.path.isdir(WORKSHOP_PATH)
     try:
-        work_has_dirs = any(name.isdigit() for name in os.listdir(WORKSHOP_PATH))
+      work_has_dirs = any(name.isdigit() for name in os.listdir(WORKSHOP_PATH))
     except Exception:
-        work_has_dirs = False
-    return {"WE_PATH": WE_PATH, "config_json_exists": cfg_ok, "WORKSHOP_PATH": WORKSHOP_PATH, "workshop_exists": work_ok, "workshop_has_digit_dirs": work_has_dirs}
+      work_has_dirs = False
+    return {
+      "WE_PATH": WE_PATH,
+      "config_json_exists": cfg_ok,
+      "WORKSHOP_PATH": WORKSHOP_PATH,
+      "workshop_exists": work_ok,
+      "workshop_has_digit_dirs": work_has_dirs
+    }

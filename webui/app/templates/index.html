@@ -5,8 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
   <meta name="theme-color" content="#ffffff"/>
   <title>Wallpaper WebUI</title>
-  <!-- 若你已用我之前的 fs-13 样式，可继续沿用；无需变更 -->
-  <link rel="stylesheet" href="/static/style.css?v=fs-13"/>
+  <link rel="stylesheet" href="/static/style.css?v=fs-20"/>
 </head>
 <body>
   <header class="topbar">
@@ -23,7 +22,6 @@
       <label class="chk"><input type="checkbox" id="mature"> 只显示成人</label>
       <input id="q" type="search" placeholder="筛选标题…"/>
       <button id="refresh">刷新</button>
-      <!-- ✅ 新增“播放全部” -->
       <button id="playAll">播放全部</button>
     </div>
   </header>
@@ -32,7 +30,6 @@
 
   <main>
     <div id="grid" class="grid" tabindex="0"></div>
-    <!-- 无限滚动状态 & 触底哨兵 -->
     <div id="infiniteStatus" class="inf-status" aria-live="polite"></div>
     <div id="sentinel" class="sentinel" aria-hidden="true"></div>
   </main>
@@ -43,16 +40,19 @@
   <div id="playerFS" class="playerfs" style="display:none;">
     <video id="fsVideo" controls playsinline></video>
     <div id="overlay" class="overlay">
+      <!-- ✅ 遮罩：抽屉打开时启用 -->
+      <div id="shade" class="shade hidden" aria-hidden="true"></div>
+
       <button id="btnBack" class="icon-btn back" title="返回所在路径" aria-label="返回所在路径">⟵</button>
       <button id="btnMenu" class="icon-btn menu" title="播放列表" aria-label="播放列表">≡</button>
-      <aside id="playlistPanel" class="playlist hidden">
+
+      <aside id="playlistPanel" class="playlist hidden" aria-label="播放列表抽屉">
         <div class="plist-header">播放列表</div>
         <ul id="plist"></ul>
       </aside>
     </div>
   </div>
 
-  <!-- ✅ 升级到 fs-15 -->
-  <script src="/static/app.js?v=fs-15"></script>
+  <script src="/static/app.js?v=fs-20"></script>
 </body>
 </html>
