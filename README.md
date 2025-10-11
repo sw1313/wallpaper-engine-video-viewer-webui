@@ -7,16 +7,16 @@ wallpaper-engine-video-viewer-webui, Docker deployment, mimicking the we path di
 部署教程：</br>
 文件树：</br>
 webui/</br>
-├─ app/</br>
-│  ├─ main.py</br>                
-│  ├─ models.py</br>            
-│  ├─ we_scan.py</br>          
-│  ├─ templates/</br>
-│  │  └─ index.html</br>
-│  └─ static/</br>
-│     ├─ style.css</br>
-│     └─ app.js</br>
-├─ Dockerfile</br>
+├─ app/
+│  ├─ main.py              
+│  ├─ models.py          
+│  ├─ we_scan.py          
+│  ├─ templates/
+│  │  └─ index.html
+│  └─ static/
+│     ├─ style.css
+│     └─ app.js
+├─ Dockerfile
 </br>
 进入程序文件夹，比如`cd /volume1/docker/webui`</br>
 创建镜像： `docker build -t wallpaper-webui:latest .`</br>
