@@ -1,4 +1,5 @@
-/* app/static/app.js  (fs-14：无限滚动 + 预取下一页 + 不等待图片 + 自动补页 + 返回所在路径) */
+/* app/static/app.js  (fs-16：无限滚动 + 预取下一页 + 不等待图片 + 自动补页
+   + 返回所在路径 + 顶部“播放全部”渐进播放/边读边播) */
 
 /* ---- 全局状态 ---- */
 let state = {
@@ -38,6 +39,14 @@ let prefetchState = {
   data: null,               // 预取到的 JSON 数据
   controller: null,         // AbortController
   inflight: false,
+};
+
+/* —— 渐进“播放全部”后台加载器 —— */
+let progressive = {
+  key: "",
+  running: false,
+  cancel: false,
+  seen: new Set(),          // 已加入到播放列表的 id（去重）
 };
 
 const $ = (id) => document.getElementById(id);
@@ -147,9 +156,7 @@ async function autoFillViewport(maxLoops=3){
       if (!state.hasMore || state.isLoading) break;
       const sent = $("sentinel"); if (!sent) break;
       const rect = sent.getBoundingClientRect();
-      // 若哨兵距可视区底部 < 1000px，认为仍“接近底部”，继续拉下一页
       if (rect.top - window.innerHeight > 1000) break;
-      // 触发下一页加载（注意：loadNextPage 内部会把 isLoading 设为 true/false）
       await loadNextPage();
       loops++;
     }
@@ -173,17 +180,14 @@ async function loadNextPage(){
   try{
     let data;
     if (usePrefetch){
-      // ✅ 直接使用预取数据，零等待
       data = prefetchState.data;
-      prefetchState.data = null; // 用过即丢
+      prefetchState.data = null;
     } else {
-      // 常规拉取（不等待图片）
       const opts = snapshotOpts();
       data = await apiScan(opts, state.page, undefined);
       if (keyAtStart !== makeQueryKey()){ state.isLoading=false; return; }
     }
 
-    // 面包屑（每页一致，更新一次无妨）
     const crumb = ["<a class='link' href='#/' data-path='/'>/</a>"].concat(
       data.breadcrumb.map((seg,i)=>{const p="/"+data.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}' data-path='${p}'>${seg}</a>`;})
     ).join(" / ");
@@ -192,28 +196,22 @@ async function loadNextPage(){
       a.onclick = (ev)=>{ ev.preventDefault(); changeContext({path: a.getAttribute("data-path")}); };
     });
 
-    // 首次页：清空骨架
     if (state.page === 1) { grid().innerHTML = ""; state.tiles = []; }
+    appendTiles(data); // 不等待图片
 
-    appendTiles(data); // ✅ 仅根据数据立即渲染，占位方形容器先撑开高度；不等待图片 onload
-
-    // 更新翻页状态
     state.hasMore = state.page < data.total_pages;
     state.page += 1;
 
     setInfStatus(state.hasMore ? "下拉加载更多…" : "已到底部");
 
-    // 绑定一次事件委托 & 框选（不会重复）
     bindDelegatedEvents();
     bindRubber();
 
-    // ✅ 立刻预取“下一页”，提升后续滚动速度
     schedulePrefetch();
   } catch(err){
     setInfStatus("加载失败，请重试");
   } finally{
     state.isLoading = false;
-    // ✅ 页面没撑满时，自动补页（不等图片）
     queueMicrotask(()=> autoFillViewport(3));
   }
 }
@@ -239,7 +237,6 @@ function appendTiles(data){
   data.videos.forEach(v=>{
     const el = document.createElement("div");
     el.className = "tile"; el.dataset.type="video"; el.dataset.vid=v.id; el.dataset.idx=idx;
-    // ✅ 不等待图片：使用 aspect-ratio 方形容器先占位；图片 lazy+async 解码
     el.innerHTML = `
       <div class="thumb">
         <img src="${v.preview_url}" alt="preview" draggable="false"
@@ -259,6 +256,7 @@ function setInfStatus(text){ const el=$("infiniteStatus"); if(el) el.textContent
 
 /* 切换上下文（路径/筛选/排序/搜索变化）→ 重置并从第一页开始累积 */
 function changeContext({path, sort_idx, mature_only, q}={}){
+  cancelProgressive(); // ✅ 切换时中止后台“边读边播”
   if (path!==undefined) state.path = path;
   if (sort_idx!==undefined) state.sort_idx = sort_idx;
   if (mature_only!==undefined) state.mature_only = mature_only;
@@ -270,25 +268,21 @@ function changeContext({path, sort_idx, mature_only, q}={}){
   state.isLoading = false;
   state.queryKey = makeQueryKey();
 
-  // 取消旧预取，准备新预取
   resetPrefetch();
 
-  // 骨架 + 状态条
   renderSkeleton(buildCrumbHtml(state.path));
   setInfStatus("加载中…");
 
-  // 触底观察器（仅初始化一次）
   if (!io){
     const sentinel = $("sentinel");
     io = new IntersectionObserver((entries)=>{
       entries.forEach(e=>{
         if (e.isIntersecting) loadNextPage();
       });
-    }, { root:null, rootMargin:"1000px 0px", threshold:0 }); // 提前 1000px 触发
+    }, { root:null, rootMargin:"1000px 0px", threshold:0 });
     io.observe(sentinel);
   }
 
-  // 拉取第一页
   loadNextPage();
 }
 
@@ -307,7 +301,6 @@ function buildCrumbHtml(pathStr){
 function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
 
 function bindDelegatedEvents(){
-  // 赋值到容器属性，不会重复累加
   grid().onclick = async (ev)=>{
     const menuBtn = ev.target.closest(".tile-menu");
     if (menuBtn) {
@@ -418,8 +411,118 @@ async function expandSelectionToItems(){
   return out;
 }
 
+/* ===== 渐进“播放全部”：从当前已加载项立即开播，后台继续补齐 ===== */
+function getCurrentlyLoadedVideoItems(){
+  const out = [];
+  for (const t of state.tiles){
+    if (t.type === "video") out.push({ id: t.vid, title: t.title || `视频 ${t.vid}` });
+  }
+  return out;
+}
+function appendToPlaylist(items){
+  let added = 0;
+  for (const it of items){
+    if (!progressive.seen.has(it.id)){
+      progressive.seen.add(it.id);
+      player.ids.push(it.id);
+      player.titles[it.id] = it.title || `视频 ${it.id}`;
+      added++;
+    }
+  }
+  if (added>0) renderPlaylistPanel();
+}
+function cancelProgressive(){
+  progressive.cancel = true;
+  progressive.running = false;
+  progressive.key = "";
+  progressive.seen.clear();
+}
+
+/* 后台逐页补齐（边读边播） */
+async function runProgressiveAppend(firstData, localOpts, keyAtStart){
+  progressive.running = true;
+  progressive.cancel = false;
+  progressive.key = keyAtStart;
+
+  try{
+    const totalPages = (firstData && firstData.total_pages) ? firstData.total_pages : 1;
+
+    // 先用第 1 页数据追加（若已用于起播也会被去重）
+    if (firstData){
+      const batch = (firstData.videos || []).map(v => ({ id:v.id, title: v.title || `视频 ${v.id}` }));
+      appendToPlaylist(batch);
+      setInfStatus(`播放全部：边读边播 1 / ${totalPages}`);
+    }
+
+    // 然后 2..N 页
+    for (let p=2; p<=totalPages; p++){
+      if (progressive.cancel || progressive.key!==makeQueryKey()) break;
+      const data = await apiScan(localOpts, p);
+      if (progressive.cancel || progressive.key!==makeQueryKey()) break;
+      const batch = (data.videos || []).map(v => ({ id:v.id, title: v.title || `视频 ${v.id}` }));
+      appendToPlaylist(batch);
+      setInfStatus(`播放全部：边读边播 ${p} / ${totalPages}`);
+    }
+
+    if (!progressive.cancel) setInfStatus("播放全部：已加载全部");
+  } catch(_){
+    if (!progressive.cancel) setInfStatus("播放全部：后台加载失败");
+  } finally{
+    progressive.running = false;
+  }
+}
+
+/* 顶部“播放全部”——渐进版本 */
+async function handlePlayAllProgressive(){
+  // 任何已在进行的渐进加载先取消
+  cancelProgressive();
+
+  const keyAtStart = makeQueryKey();
+  const local = { ...snapshotOpts(), per_page: 240 }; // 提高每页容量，加速后台补齐
+
+  // ① 立即用“当前已加载在页面上的视频”开播
+  let initial = getCurrentlyLoadedVideoItems();
+
+  let firstData = null;
+  // ② 如果当前页面还没加载出任何视频，快速拉取第 1 页来开播
+  if (initial.length === 0){
+    setInfStatus("播放全部：正在准备首批视频…");
+    try{
+      firstData = await apiScan(local, 1);
+      if (keyAtStart !== makeQueryKey()) throw new Error("query-changed");
+      initial = (firstData.videos || []).map(v => ({ id:v.id, title: v.title || `视频 ${v.id}` }));
+    }catch(_){
+      setInfStatus("播放全部失败：无法获取首批视频");
+      return;
+    }
+  } else {
+    // 若已有已加载项，也取一次第 1 页用于拿 total_pages（顺便会去重）
+    try{
+      firstData = await apiScan(local, 1);
+    }catch(_){
+      // 拿不到总页数也没关系，至少先播已加载的
+      firstData = { videos: [], total_pages: 1 };
+    }
+  }
+
+  if (!initial.length){
+    setInfStatus("当前条件下没有视频");
+    return;
+  }
+
+  // ③ 立即开播（returnPath 为当前路径）
+  progressive.seen = new Set(initial.map(x=>x.id));
+  await startPlaylist(initial, 0, state.path);
+
+  // ④ 后台继续补齐（边读边播）
+  runProgressiveAppend(firstData, local, keyAtStart);
+}
+
 /* 全屏播放器逻辑（含“返回所在路径”） */
 async function startPlaylist(items, startIndex=0, returnPath=null){
+  // 开新播放前，取消旧的渐进追加，避免串台
+  cancelProgressive();
+
   player.ids = items.map(x=>x.id);
   player.titles = {}; items.forEach(x=> player.titles[x.id] = x.title || `视频 ${x.id}`);
   player.index = Math.max(0, Math.min(startIndex, player.ids.length-1));
@@ -471,6 +574,9 @@ function renderPlaylistPanel(){
 function togglePlaylistPanel(){ $("playlistPanel").classList.toggle("hidden"); }
 async function nextInPlaylist(){ if (player.index < player.ids.length - 1) await playIndex(player.index + 1); }
 async function exitPlayer(){
+  // 退出播放也中止后台“边读边播”
+  cancelProgressive();
+
   const wrap = $("playerFS"); const v = $("fsVideo");
   try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
   v.pause(); v.removeAttribute("src"); v.load();
@@ -522,6 +628,9 @@ $("mature").onchange = ()=> changeContext({mature_only: $("mature").checked});
 $("refresh").onclick = ()=> changeContext({});
 let qTimer=null;
 $("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContext({q:$("q").value.trim()}), 250); };
+
+/* ✅ 顶部“播放全部”（渐进/边读边播）绑定 */
+$("playAll").onclick = handlePlayAllProgressive;
 
 /* 首次进入：骨架 + 无限滚动启动 */
 window.addEventListener("load", ()=>{

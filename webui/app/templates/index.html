@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
   <meta name="theme-color" content="#ffffff"/>
   <title>Wallpaper WebUI</title>
-  <link rel="stylesheet" href="/static/style.css?v=fs-12"/>
+  <!-- 若你已用我之前的 fs-13 样式，可继续沿用；无需变更 -->
+  <link rel="stylesheet" href="/static/style.css?v=fs-13"/>
 </head>
 <body>
   <header class="topbar">
@@ -22,6 +23,8 @@
       <label class="chk"><input type="checkbox" id="mature"> 只显示成人</label>
       <input id="q" type="search" placeholder="筛选标题…"/>
       <button id="refresh">刷新</button>
+      <!-- ✅ 新增“播放全部” -->
+      <button id="playAll">播放全部</button>
     </div>
   </header>
 
@@ -29,7 +32,6 @@
 
   <main>
     <div id="grid" class="grid" tabindex="0"></div>
-
     <!-- 无限滚动状态 & 触底哨兵 -->
     <div id="infiniteStatus" class="inf-status" aria-live="polite"></div>
     <div id="sentinel" class="sentinel" aria-hidden="true"></div>
@@ -50,6 +52,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=fs-12"></script>
+  <!-- ✅ 升级到 fs-15 -->
+  <script src="/static/app.js?v=fs-15"></script>
 </body>
 </html>
