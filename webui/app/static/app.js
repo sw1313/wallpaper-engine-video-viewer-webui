@@ -1,9 +1,10 @@
-/* app/static/app.js (fs-20)
-   - 播放列表抽屉变为模态：shade 遮罩 + 外部点击收回 + Esc 收回
-   - 抽屉打开时仅允许：收回抽屉、滚动/点击抽屉；其余点击/滑动被遮罩拦截
-   - 其余功能同 fs-19（UA 右键加固、渐进播放全部、不等图、预取、自动补页）
+/* app/static/app.js (fs-21)
+   - 播放列表改为居中模态（约 1/3 屏以下）
+   - 弹出时：遮罩+全局捕获屏蔽（含移动手势），仅允许抽屉内滚动/点击 + 关闭抽屉
+   - 收回后完整释放
+   - 其他：UA 右键加固、渐进播放全部、不等图、预取、自动补页（承自 fs-20）
 */
-console.log("app.js version fs-20");
+console.log("app.js version fs-21");
 
 /* ---- 全局状态 ---- */
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
@@ -21,10 +22,15 @@ let progressive = { key:"", running:false, cancel:false, seen:new Set() };
 /* —— 模态锁（抽屉打开时为 true） —— */
 let uiLock = { byPlaylist:false };
 
+/* —— 全局手势/滚动屏蔽器（需要时挂载在 document 上） —— */
+const modalGuards = [];
+function addModalGuard(type, handler, opts){ document.addEventListener(type, handler, opts); modalGuards.push([type, handler, opts]); }
+function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.removeEventListener(t,h,o); } modalGuards.length = 0; }
+
 const $ = (id) => document.getElementById(id);
 const grid = () => $("grid");
 
-/* ======== UA 识别（与 fs-19 相同） ======== */
+/* ======== UA 识别（仅 UA） ======== */
 function detectByUA(){
   const ua = navigator.userAgent || navigator.vendor || window.opera || "";
   try { const o = localStorage.getItem("uaMode");
@@ -60,7 +66,7 @@ function renderSkeleton(nextBreadcrumb) {
   }
 }
 
-/* 查询 key */
+/* 查询 key & 快照 */
 function makeQueryKey(){ return `${state.path}|${state.sort_idx}|${state.mature_only?'1':'0'}|${state.q}`; }
 function snapshotOpts(){ return { path:state.path, sort_idx:state.sort_idx, mature_only:state.mature_only, q:state.q, per_page:state.per_page }; }
 
@@ -310,6 +316,8 @@ async function expandSelectionToItems(){
 /* ===== 抽屉模态：打开/收回 ===== */
 function showPlaylistPanel(){
   uiLock.byPlaylist = true;
+
+  $("playerFS").classList.add("locked");          // 禁用视频指针/手势
   $("playlistPanel").classList.remove("hidden");
   const shade = $("shade");
   shade.classList.remove("hidden");
@@ -317,38 +325,56 @@ function showPlaylistPanel(){
   // 点击遮罩 => 收回
   const closeOnShade = (e)=>{ e.preventDefault(); hidePlaylistPanel(); };
   const blockScroll = (e)=>{ e.preventDefault(); }; // 禁止遮罩区域滚动穿透
-
-  // 存引用以便移除
   shade._closeOnShade = closeOnShade;
   shade._blockScroll = blockScroll;
-
   shade.addEventListener("click", closeOnShade);
   shade.addEventListener("wheel", blockScroll, { passive:false });
   shade.addEventListener("touchmove", blockScroll, { passive:false });
-  shade.addEventListener("pointerdown", blockScroll, { passive:false });
 
-  // Esc 收回
-  document.addEventListener("keydown", escToClose, true);
+  // 全局捕获：除抽屉内/菜单按钮/遮罩点击外，一律拦截（进一步抑制移动音量/亮度手势）
+  const allowInPanel = (el)=> !!(el && (el.closest("#playlistPanel") || el.closest("#btnMenu")));
+  const allowShadeClick = (type, el)=> (type==="click" && el && el.id==="shade");
+
+  const guard = (e)=>{
+    const el = e.target;
+    if (allowInPanel(el) || allowShadeClick(e.type, el)) return;
+    // 移动端上对 move 类事件强制阻断
+    if (e.type==="touchmove" || e.type==="pointermove" || e.type==="wheel") {
+      e.preventDefault(); e.stopPropagation(); return;
+    }
+    // pointerdown / touchstart：允许在 shade 上产生点击关闭
+    if (e.type==="pointerdown" || e.type==="touchstart") {
+      if (el && el.id==="shade") return; // 允许 shade 接收 pointerdown 以触发随后 click
+      e.preventDefault(); e.stopPropagation(); return;
+    }
+    // 其他交互也一律不透传
+    e.preventDefault(); e.stopPropagation();
+  };
+
+  addModalGuard("touchstart", guard, { capture:true, passive:false });
+  addModalGuard("touchmove",  guard, { capture:true, passive:false });
+  addModalGuard("pointerdown",guard, { capture:true, passive:false });
+  addModalGuard("pointermove",guard, { capture:true, passive:false });
+  addModalGuard("wheel",      guard, { capture:true, passive:false });
+
+  // Esc 关闭
+  const escToClose = (e)=>{ if (uiLock.byPlaylist && e.key==="Escape"){ e.preventDefault(); hidePlaylistPanel(); } };
+  addModalGuard("keydown", escToClose, true);
 }
 function hidePlaylistPanel(){
   uiLock.byPlaylist = false;
   $("playlistPanel").classList.add("hidden");
+  $("playerFS").classList.remove("locked");
+
   const shade = $("shade");
   shade.classList.add("hidden");
-
-  // 移除遮罩监听
   if (shade._closeOnShade){ shade.removeEventListener("click", shade._closeOnShade); shade._closeOnShade=null; }
   if (shade._blockScroll){
-    shade.removeEventListener("wheel", shade._blockScroll); 
+    shade.removeEventListener("wheel", shade._blockScroll);
     shade.removeEventListener("touchmove", shade._blockScroll);
-    shade.removeEventListener("pointerdown", shade._blockScroll);
     shade._blockScroll=null;
   }
-  document.removeEventListener("keydown", escToClose, true);
-}
-function escToClose(e){
-  if (!uiLock.byPlaylist) return;
-  if (e.key === "Escape"){ e.preventDefault(); hidePlaylistPanel(); }
+  removeModalGuards();
 }
 
 /* ===== 渐进“播放全部” ===== */
@@ -430,8 +456,7 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   try { if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" }); else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen(); } catch(_){}
 
   $("btnBack").onclick = async ()=>{
-    // 抽屉开启时禁用返回键（由遮罩拦截），这里仍保留逻辑
-    if (uiLock.byPlaylist) return;
+    if (uiLock.byPlaylist) return;   // 抽屉开着禁止返回
     await exitPlayer();
     if (state.path !== player.returnPath) changeContext({path: player.returnPath});
   };
@@ -469,10 +494,6 @@ function renderPlaylistPanel(){
     li.onclick = ()=> playIndex(i);
     ul.appendChild(li);
   });
-}
-function togglePlaylistPanel(){ // 兼容旧调用（目前未直接使用）
-  if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel();
-  else hidePlaylistPanel();
 }
 async function nextInPlaylist(){ if (player.index < player.ids.length - 1) await playIndex(player.index + 1); }
 async function exitPlayer(){

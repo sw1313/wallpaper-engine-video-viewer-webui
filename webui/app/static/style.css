@@ -1,4 +1,4 @@
-/* app/static/style.css  (fs-20) — 仅在 fs-13 基础上新增 .shade 与层级微调 */
+/* app/static/style.css  (fs-21) — 居中模态播放列表 + 手势屏蔽增强 */
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 html, body { height:100%; overflow-x:hidden; }
@@ -90,26 +90,28 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   background: rgba(0,170,255,.13); pointer-events:none;
 }
 
-/* 全屏播放器 */
+/* 全屏播放器容器 */
 .playerfs{
   position:fixed; left:0; top:0; width:100vw; height:100vh; background:#000;
   z-index:1200; display:flex; align-items:center; justify-content:center;
 }
 .playerfs video{ width:100vw; height:100vh; object-fit:contain; }
 
-/* 覆盖层容器（按键/抽屉/遮罩都放里） */
+/* 覆盖层容器 */
 .overlay{ position:fixed; left:0; top:0; width:100%; height:100%; pointer-events:none; }
 
-/* 遮罩：抽屉打开时启用，拦截除抽屉与“≡”外的一切操作 */
+/* ✅ 播放列表弹出时的遮罩：拦截全部操作 */
 .shade{
   position:fixed; left:0; top:0; width:100%; height:100%;
   background: rgba(0,0,0,.25);
   pointer-events:auto;
-  z-index:1301; /* 在返回键和视频之上 */
+  z-index:1301;
+  touch-action:none;             /* 进一步抑制浏览器手势 */
+  overscroll-behavior: contain;
 }
 .shade.hidden{ display:none; }
 
-/* 顶部按钮 */
+/* 顶部按钮（返回会被遮罩挡住，菜单不挡） */
 .icon-btn{
   pointer-events:auto; position:fixed; top:14px; width:38px; height:38px; border-radius:38px;
   background:rgba(255,255,255,.75); color:#111; border:none; font-size:18px;
@@ -117,18 +119,25 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   opacity:.85; transition:opacity .2s ease;
 }
 .icon-btn:hover{ opacity:1; }
-.icon-btn.back{ left:14px; z-index:1300; }  /* 会被 shade 挡住 */
+.icon-btn.back{ left:14px; z-index:1300; }   /* 会被 shade 挡住 */
 .icon-btn.menu{ right:14px; z-index:1303; }  /* 始终可点，用于收回抽屉 */
 .playerfs.idle .icon-btn{ opacity:0; }
 
-/* 播放列表抽屉（在 shade 之上） */
+/* ✅ 居中模态播放列表（宽度不超过 ~1/3 屏幕） */
 .playlist{
-  position:fixed; right:14px; top:60px; bottom:14px; width:320px; pointer-events:auto;
+  position:fixed; left:50%; transform:translateX(-50%);
+  top:60px; bottom:14px;
+  width:28vw;                    /* 约 1/3 以下 */
+  max-width:420px;               /* 桌面上保持可读 */
+  pointer-events:auto;
   background:rgba(255,255,255,.96); border:1px solid #ddd; border-radius:10px;
   box-shadow:0 8px 24px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
   z-index:1302;
 }
 .playlist.hidden{ display:none; }
+@media (min-width: 1024px){
+  .playlist{ width:360px; }      /* 大屏稍宽一些，但仍不触碰两侧手势区 */
+}
 .plist-header{ padding:10px 12px; font-weight:600; border-bottom:1px solid #eee; background:#fafafa; }
 #plist{ list-style:none; margin:0; padding:0; overflow:auto; }
 #plist li{ display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid #f1f1f1; cursor:pointer; }
@@ -136,6 +145,10 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 #plist li.active{ background:#e8f3ff; }
 #plist .dot{ width:8px; height:8px; border-radius:8px; background:#bbb; }
 #plist li.active .dot{ background:#007fff; }
+
+/* 播放列表弹出期间，彻底禁用视频的指针与触摸手势 */
+.playerfs.locked{ touch-action:none; overscroll-behavior:contain; }
+.playerfs.locked video{ pointer-events:none; }
 
 /* 无限滚动状态条 & 触底哨兵 */
 .inf-status{ text-align:center; padding:12px 10px; color:#666; font-size:13px; }
