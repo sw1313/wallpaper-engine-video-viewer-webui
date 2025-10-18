@@ -1,11 +1,15 @@
-/* app/static/app.js (fs-25)
-   变更要点：
-   - 新增基于 location.hash 的前端路由：进入文件夹会写入 #/路径
-   - 浏览器/手机“返回” => 回到上一路径（hash 返回），不再直接退出到主页
-   - 面包屑链接走 # 路由；点击文件夹、菜单“打开此文件夹”、播放器返回按钮，都改用 navigateToPath()
-   - 保留你之前所有“边拉边播”、已观看打勾等功能
+/* app/static/app.js (fs-27)
+   关键改动：
+   - “全屏内物理返回键”：进入播放时 pushState 占位；popstate 时若播放器开启则仅退出全屏
+   - 息屏/切后台继续播放音频：
+       * 独立 <audio id="bgAudio"> 不用 display:none（避免被浏览器挂起）
+       * 首次用户手势解锁播放（unlockPlaybackOnUserGesture）
+       * visibilitychange/pagehide/freeze 时切换到 audio；前台恢复 video
+       * play() Promise 失败时优雅提示并等待下一次用户手势
+       * Media Session API：绝对 URL 的封面、上一/下一/seek 控制
+   - 保留：hash 路由、渐进“边拉边播”、已播放打勾
 */
-console.log("app.js version fs-25");
+console.log("app.js version fs-27");
 
 /* ---- 全局状态 ---- */
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
@@ -14,7 +18,7 @@ let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:""
 
 let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/" };
 
-/* —— 预取状态（滚动加载网格用） —— */
+/* —— 预取状态（滚动加载网格） —— */
 let prefetchState = { key:"", page:0, opts:null, data:null, controller:null, inflight:false };
 
 /* —— 渐进播放（后台追加器） —— */
@@ -23,7 +27,7 @@ let progressive = { key:"", running:false, cancel:false, seen:new Set() };
 /* —— 模态锁 —— */
 let uiLock = { byPlaylist:false };
 
-/* —— 全局手势/滚动屏蔽器 —— */
+/* —— 手势/滚动防穿透管理 —— */
 const modalGuards = [];
 function addModalGuard(type, handler, opts){ document.addEventListener(type, handler, opts); modalGuards.push([type, handler, opts]); }
 function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.removeEventListener(t,h,o); } modalGuards.length = 0; }
@@ -31,7 +35,7 @@ function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.remove
 const $ = (id) => document.getElementById(id);
 const grid = () => $("grid");
 
-/* ======== UA 识别（仅 UA） ======== */
+/* ======== UA 识别 ======== */
 function detectByUA(){
   const ua = navigator.userAgent || navigator.vendor || window.opera || "";
   try { const o = localStorage.getItem("uaMode");
@@ -44,38 +48,23 @@ function detectByUA(){
 const UA = detectByUA();
 const IS_MOBILE_UA = UA.isMobile;
 
-/* ====== 已完成（本地持久化） ====== */
+/* ====== 已完成持久化 ====== */
 const WATCH_KEY = "we_watched_ids_v1";
 let watched = new Set();
-function loadWatched(){
-  try{
-    const raw = localStorage.getItem(WATCH_KEY);
-    watched = new Set(JSON.parse(raw || "[]"));
-  }catch(_){ watched = new Set(); }
-}
-function saveWatched(){
-  try{ localStorage.setItem(WATCH_KEY, JSON.stringify([...watched])); }catch(_){}
-}
+function loadWatched(){ try{ watched = new Set(JSON.parse(localStorage.getItem(WATCH_KEY) || "[]")); }catch(_){ watched = new Set(); } }
+function saveWatched(){ try{ localStorage.setItem(WATCH_KEY, JSON.stringify([...watched])); }catch(_){ } }
 function isWatched(id){ return watched.has(id); }
-function markWatched(id){
-  if (!id) return;
-  if (!watched.has(id)){ watched.add(id); saveWatched(); }
-  updateTileWatchedUI(id, true);
-}
+function markWatched(id){ if (!id) return; if (!watched.has(id)){ watched.add(id); saveWatched(); } updateTileWatchedUI(id, true); }
 function updateTileWatchedUI(id, done){
   const t = state.tiles.find(t => t.type==="video" && t.vid===id);
-  if (t){
-    const badge = t.el.querySelector(".status-badge");
-    if (badge) badge.classList.toggle("done", !!done);
-  }
+  if (t){ const badge = t.el.querySelector(".status-badge"); if (badge) badge.classList.toggle("done", !!done); }
 }
 
 /* ===== 通用工具 ===== */
 document.addEventListener("dragstart", e => e.preventDefault());
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
-
-function showNotice(msg){ const n=$("notice"); if(!n) return; n.style.display="block"; n.textContent="ℹ︎ "+msg; }
+function showNotice(msg){ const n=$("notice"); if(!n) return; n.style.display="block"; n.innerHTML="ℹ︎ " + msg; }
 function clearNotice(){ const n=$("notice"); if(!n) return; n.style.display="none"; n.textContent=""; }
 function fmtSize(sz){ if (sz>=1<<30) return (sz/(1<<30)).toFixed(1)+" GB"; if (sz>=1<<20) return (sz/(1<<20)).toFixed(1)+" MB"; if (sz>=1<<10) return (sz/(1<<10)).toFixed(1)+" KB"; return sz+" B"; }
 function fmtDate(ts){ return new Date(ts*1000).toLocaleString(); }
@@ -84,7 +73,7 @@ function setSel(t,on){ if(t.type==="video"){on?state.selV.add(t.vid):state.selV.
 function clearSel(){ state.tiles.forEach(t=>t.el.classList.remove("selected")); state.selV.clear(); state.selF.clear(); }
 
 /* ======================
-   Hash 路由（关键改动）
+   Hash 路由（返回到上一路径）
    ====================== */
 function pathFromHash(){
   let h = window.location.hash || "";
@@ -96,19 +85,12 @@ function pathFromHash(){
 function navigateToPath(path){
   if (!path) path = "/";
   const target = "#" + encodeURI(path);
-  if (window.location.hash === target){
-    // 已在此路径，强制刷新当前内容（某些场景下需要）
-    changeContext({path});
-  } else {
-    // 触发浏览器历史栈：后退即可回到前一路径
-    window.location.hash = target;
-  }
+  if (window.location.hash === target) changeContext({path});
+  else window.location.hash = target;
 }
 function onHashChange(){
   const newPath = pathFromHash();
-  if (newPath !== state.path){
-    changeContext({path: newPath});
-  }
+  if (newPath !== state.path) changeContext({path:newPath});
 }
 window.addEventListener("hashchange", onHashChange);
 
@@ -124,11 +106,11 @@ function renderSkeleton(nextBreadcrumb) {
   }
 }
 
-/* 查询 key & 快照（和后端对齐排序/筛选） */
+/* 查询 key & 快照 */
 function makeQueryKey(){ return `${state.path}|${state.sort_idx}|${state.mature_only?'1':'0'}|${state.q}`; }
 function snapshotOpts(){ return { path:state.path, sort_idx:state.sort_idx, mature_only:state.mature_only, q:state.q, per_page:state.per_page }; }
 
-/* REST：scan（分页，当前路径非递归） */
+/* REST：scan（分页） */
 async function apiScan(opts, page, signal){
   const params = new URLSearchParams({ path:opts.path, page, per_page:opts.per_page, sort_idx:opts.sort_idx, mature_only:opts.mature_only, q:opts.q });
   const res = await fetch(`/api/scan?${params.toString()}`, { signal });
@@ -171,7 +153,7 @@ async function autoFillViewport(maxLoops=3){
   } finally { autoFillRunning=false; }
 }
 
-/* 加载一页并追加渲染（网格） */
+/* 加载一页并渲染（网格） */
 let io=null, rubberBound=false;
 async function loadNextPage(){
   if (state.isLoading || !state.hasMore) return;
@@ -187,7 +169,6 @@ async function loadNextPage(){
       data.breadcrumb.map((seg,i)=>{const p="/"+data.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}'>${seg}</a>`;})
     ).join(" / ");
     $("crumb").innerHTML = "当前位置：" + crumb;
-    // 注意：这里不再绑定 onclick 拦截，直接让 a 的 hash 生效，从而加入浏览器历史栈
 
     if (state.page===1){ grid().innerHTML=""; state.tiles=[]; }
     appendTiles(data);
@@ -234,7 +215,6 @@ function setInfStatus(text){ const el=$("infiniteStatus"); if(el) el.textContent
 
 /* 切换上下文（网格） */
 function changeContext({path, sort_idx, mature_only, q}={}){
-  // 仅用于渲染，不负责 push 历史；导航统一使用 navigateToPath()
   if (path!==undefined) state.path = path;
   if (sort_idx!==undefined) state.sort_idx = sort_idx;
   if (mature_only!==undefined) state.mature_only = mature_only;
@@ -305,7 +285,7 @@ function bindDelegatedEvents(){
   el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
 }
 
-/* 右键/⋮菜单（均为渐进播放版本；仅“打开此文件夹”是导航） */
+/* 右键/⋮菜单（渐进播放；仅“打开此文件夹”做导航） */
 function openContextMenu(x,y){
   const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
   const selCount = state.selV.size + state.selF.size;
@@ -319,22 +299,22 @@ function openContextMenu(x,y){
   if (oneVideo) {
     const vid = [...state.selV][0];
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
-    add("播放此视频", ()=> startPlaylist([{id:vid, title}], 0, state.path));
-    add("从该处开始播放", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
+    add("播放此视频（全屏）", ()=> startPlaylist([{id:vid, title}], 0, state.path));
+    add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
     add("打开创意工坊链接", ()=> window.open(`/go/workshop/${vid}`, "_blank"));
     sep();
-    add("删除", async ()=>{
+    add("删除（不可恢复）", async ()=>{
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
       await deleteByIds([vid]); clearSel(); changeContext({});
     });
   } else if (oneFolder) {
     const path = [...state.selF][0];
     add("打开此文件夹", ()=> navigateToPath(path));
-    add("播放此文件夹", async ()=>{ await progressivePlayFolder(path); });
+    add("播放此文件夹（全屏顺序播放）", async ()=>{ await progressivePlayFolder(path); });
   } else {
-    add("批量播放", async ()=>{ await progressivePlaySelection(); });
+    add("批量播放（全屏顺序播放）", async ()=>{ await progressivePlaySelection(); });
     sep();
-    add("删除所选", async ()=>{
+    add("删除所选（不可恢复）", async ()=>{
       const items = await expandSelectionToItems();
       if (!items.length) return alert("所选没有可删除的视频");
       if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
@@ -349,11 +329,9 @@ function openContextMenu(x,y){
 function hideMenu(){ $("ctxmenu").style.display="none"; }
 
 /* 删除 */
-async function deleteByIds(ids){
-  await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) });
-}
+async function deleteByIds(ids){ await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) }); }
 
-/* —— 后端递归列出某路径全部视频（已按 sort_idx 排序） —— */
+/* —— 递归列出某路径全部视频 —— */
 async function getFolderItems(path){
   const params = new URLSearchParams({ path, sort_idx: state.sort_idx, mature_only: state.mature_only, with_meta: "1" });
   const r = await fetch(`/api/folder_videos?${params.toString()}`);
@@ -361,7 +339,7 @@ async function getFolderItems(path){
   return (j.items || []).map(it => ({id: it.id, title: it.title || `视频 ${it.id}`}));
 }
 
-/* —— 选择集展开（一次性，给“删除所选”等用） —— */
+/* —— 选择集展开（删除用） —— */
 async function expandSelectionToItems(){
   const list = [];
   state.selV.forEach(id => list.push({id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}`}));
@@ -371,10 +349,9 @@ async function expandSelectionToItems(){
   return out;
 }
 
-/* ===== 抽屉模态：打开/收回 ===== */
+/* ===== 抽屉模态 ===== */
 function showPlaylistPanel(){
   uiLock.byPlaylist = true;
-
   $("playerFS").classList.add("locked");
   $("playlistPanel").classList.remove("hidden");
   const shade = $("shade");
@@ -394,13 +371,8 @@ function showPlaylistPanel(){
   const guard = (e)=>{
     const el = e.target;
     if (allowInPanel(el) || allowShadeClick(e.type, el)) return;
-    if (e.type==="touchmove" || e.type==="pointermove" || e.type==="wheel") {
-      e.preventDefault(); e.stopPropagation(); return;
-    }
-    if (e.type==="pointerdown" || e.type==="touchstart") {
-      if (el && el.id==="shade") return;
-      e.preventDefault(); e.stopPropagation(); return;
-    }
+    if (e.type==="touchmove" || e.type==="pointermove" || e.type==="wheel") { e.preventDefault(); e.stopPropagation(); return; }
+    if (e.type==="pointerdown" || e.type==="touchstart") { if (el && el.id==="shade") return; e.preventDefault(); e.stopPropagation(); return; }
     e.preventDefault(); e.stopPropagation();
   };
 
@@ -429,7 +401,7 @@ function hidePlaylistPanel(){
   removeModalGuards();
 }
 
-/* ===== 渐进追加器（统一） ===== */
+/* ===== 渐进追加器 ===== */
 function cancelProgressive(){ progressive.cancel=true; progressive.running=false; progressive.key=""; progressive.seen.clear(); }
 function appendToPlaylist(items){
   let added=0;
@@ -443,15 +415,8 @@ function appendToPlaylist(items){
   }
   if (added>0) renderPlaylistPanel();
 }
-function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
-/**
- * progressiveAppendFrom: 启动后台从 asyncGenerator 逐批取数据并追加到播放列表
- */
 async function progressiveAppendFrom(producer, label="后台加载"){
-  progressive.running = true;
-  progressive.cancel = false;
-  const myKey = progressive.key = makeQueryKey();
-  let total = 0;
+  progressive.running = true; progressive.cancel = false; const myKey = progressive.key = makeQueryKey(); let total = 0;
   try{
     for await (const batch of producer()){
       if (progressive.cancel || progressive.key!==myKey) break;
@@ -463,22 +428,15 @@ async function progressiveAppendFrom(producer, label="后台加载"){
       }
     }
     if (!progressive.cancel) setInfStatus(`${label}：已加载全部`);
-  }catch(e){
-    if (!progressive.cancel) setInfStatus(`${label}：加载失败`);
-    console.error(e);
-  }finally{
-    progressive.running = false;
-  }
+  }catch(e){ if (!progressive.cancel) setInfStatus(`${label}：加载失败`); console.error(e); }
+  finally{ progressive.running = false; }
 }
 
-/* ======= 顶部“播放未完成”（递归整个文件夹，边拉边播） ======= */
+/* ======= 顶部“播放未完成” ======= */
 async function handlePlayUnwatched(){
   cancelProgressive();
   const initial = getCurrentlyLoadedVideoItems().filter(x => !isWatched(x.id)).slice(0, 30);
-  if (initial.length){
-    await startPlaylist(initial, 0, state.path);
-    progressive.seen = new Set(player.ids);
-  }
+  if (initial.length){ await startPlaylist(initial, 0, state.path); progressive.seen = new Set(player.ids); }
   const initialSet = new Set(initial.map(i=>i.id));
   const BATCH = 200;
   const producer = async function* (){
@@ -487,19 +445,17 @@ async function handlePlayUnwatched(){
     for (const part of chunk(pending, BATCH)) yield part;
   };
   if (!initial.length){
-    const first = await (async ()=>{
-      const all = await getFolderItems(state.path);
-      const pending = all.filter(x => !isWatched(x.id));
-      return pending.slice(0, 30);
-    })();
+    const all = await getFolderItems(state.path);
+    const pending = all.filter(x => !isWatched(x.id));
+    const first = pending.slice(0, 30);
     if (!first.length){ setInfStatus("当前路径下没有未完成的视频"); return; }
     await startPlaylist(first, 0, state.path);
     progressive.seen = new Set(player.ids);
     const restSet = new Set(first.map(i=>i.id));
     const p2 = async function* (){
-      const all = await getFolderItems(state.path);
-      const pending = all.filter(x => !isWatched(x.id) && !restSet.has(x.id));
-      for (const part of chunk(pending, BATCH)) yield part;
+      const all2 = await getFolderItems(state.path);
+      const pend2 = all2.filter(x => !isWatched(x.id) && !restSet.has(x.id));
+      for (const part of chunk(pend2, BATCH)) yield part;
     };
     progressiveAppendFrom(p2, "未完成后台加载");
   } else {
@@ -507,7 +463,7 @@ async function handlePlayUnwatched(){
   }
 }
 
-/* ======= 从该处开始播放（忽略已完成，边拉边播） ======= */
+/* ======= 从该处开始播放 ======= */
 async function handlePlayFromHereProgressive(vid, title){
   cancelProgressive();
   const initial = [{ id: vid, title: title || `视频 ${vid}` }];
@@ -526,15 +482,14 @@ async function handlePlayFromHereProgressive(vid, title){
   progressiveAppendFrom(producer, "从该处后台加载");
 }
 
-/* ======= 播放整个文件夹（右键/三点，边拉边播） ======= */
+/* ======= 播放文件夹 ======= */
 async function progressivePlayFolder(path){
   cancelProgressive();
   setInfStatus("准备读取文件夹…");
   const all = await getFolderItems(path);
   if (!all.length){ alert("该文件夹没有可播放视频"); return; }
 
-  const FIRST = Math.min(30, all.length);
-  const initial = all.slice(0, FIRST);
+  const initial = all.slice(0, Math.min(30, all.length));
   await startPlaylist(initial, 0, path);
   progressive.seen = new Set(player.ids);
 
@@ -547,11 +502,10 @@ async function progressivePlayFolder(path){
   progressiveAppendFrom(producer, "文件夹后台加载");
 }
 
-/* ======= 批量播放（右键/三点，边拉边播） ======= */
+/* ======= 批量播放 ======= */
 async function progressivePlaySelection(){
   cancelProgressive();
-  const selVideos = [...state.selV];
-  const selFolders = [...state.selF];
+  const selVideos = [...state.selV], selFolders = [...state.selF];
 
   let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
   if (!initial.length && selFolders.length){
@@ -579,35 +533,201 @@ async function progressivePlaySelection(){
   progressiveAppendFrom(producer, "批量后台加载");
 }
 
-/* 仍保留：取得当前已加载视频（用于“播放未完成”的首发批） */
+/* 取得当前已加载视频（用于“播放未完成”的首批） */
 function getCurrentlyLoadedVideoItems(){
   const out = []; for (const t of state.tiles){ if (t.type === "video") out.push({ id:t.vid, title:t.title || `视频 ${t.vid}` }); }
   return out;
 }
 
+/* =========================
+   播放器（全屏 & 后台音频）
+   ========================= */
+let fsOverlayInHistory = false;     // 是否压入了“全屏占位”的历史项
+let playbackMode = "video";         // 'video' | 'audio'
+const media = { v:null, a:null };
+
+function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
+
+/* ---- 首次用户手势解锁播放 ---- */
+let userGestureUnlocked = false;
+async function unlockPlaybackOnUserGesture(){
+  if (userGestureUnlocked) return;
+  const a = $("bgAudio"), v = $("fsVideo");
+  try {
+    await a.play(); a.pause();
+    userGestureUnlocked = true;
+    console.log("playback unlocked via audio");
+  } catch (e) {
+    try { await v.play(); v.pause(); userGestureUnlocked = true; console.log("playback unlocked via video"); }
+    catch(e2){ console.log("unlock playback failed — will retry on next gesture"); }
+  }
+}
+function installUserGestureUnlock(){
+  const once = async ()=>{
+    await unlockPlaybackOnUserGesture();
+    document.removeEventListener("pointerdown", once);
+    document.removeEventListener("touchstart", once);
+    document.removeEventListener("click", once);
+    document.removeEventListener("keydown", once);
+  };
+  document.addEventListener("pointerdown", once, {passive:true});
+  document.addEventListener("touchstart", once, {passive:true});
+  document.addEventListener("click", once, {passive:true});
+  document.addEventListener("keydown", once, {passive:true});
+}
+window.addEventListener("load", installUserGestureUnlock);
+
+/* ---- popstate：全屏内第一次返回仅退出全屏 ---- */
+function installPopStateGuard(){
+  window.addEventListener("popstate", () => {
+    if (isPlayerActive()){
+      fsOverlayInHistory = false; // 弹出这层占位
+      exitPlayer();               // 仅退出全屏，不做路径跳转
+    }
+  });
+}
+installPopStateGuard();
+
+/* ---- 播放封装 ---- */
+async function safePlay(el){
+  try { await el.play(); return true; }
+  catch(e){ console.warn("play() rejected:", e); return false; }
+}
+
+/* ---- 切换：前台 video / 后台 audio ---- */
+async function switchToAudio(){
+  if (!isPlayerActive() || playbackMode === "audio") return;
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  media.v = v; media.a = a;
+
+  const src = v.src || `/media/video/${player.ids[player.index]}`;
+  if (a.src !== src) a.src = src;
+  try { if (!isNaN(v.currentTime)) a.currentTime = v.currentTime; } catch(_){}
+
+  // 先尝试 audio 播放，成功后再暂停 video（失败则维持 video）
+  const ok = await safePlay(a);
+  if (ok){
+    try{ v.pause(); }catch(_){}
+    playbackMode = "audio";
+    updateMediaSessionPlaybackState();
+  } else {
+    showNotice("浏览器阻止后台播放，请点击页面任意处以解锁。");
+    installUserGestureUnlock();
+  }
+}
+async function switchToVideo(){
+  if (!isPlayerActive() || playbackMode === "video") return;
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  media.v = v; media.a = a;
+
+  try { if (!isNaN(a.currentTime)) v.currentTime = a.currentTime; } catch(_){}
+  const ok = await safePlay(v);
+  if (ok){
+    try{ a.pause(); }catch(_){}
+    playbackMode = "video";
+    updateMediaSessionPlaybackState();
+  } else {
+    showNotice("恢复视频播放被阻止，点击屏幕继续。");
+    installUserGestureUnlock();
+  }
+}
+
+/* ---- 前后台切换监听 ---- */
+document.addEventListener("visibilitychange", async ()=>{
+  if (!isPlayerActive()) return;
+  if (document.visibilityState === "hidden") {
+    await switchToAudio();
+    const ok = await safePlay(media.a || $("bgAudio"));
+    if (!ok){ showNotice("后台播放被阻止，需要点击一次屏幕以继续。"); installUserGestureUnlock(); }
+  } else {
+    await switchToVideo();
+    const ok = await safePlay(media.v || $("fsVideo"));
+    if (!ok){ showNotice("恢复前台播放被阻止，点击屏幕继续。"); installUserGestureUnlock(); }
+  }
+});
+// 兼容：部分浏览器在 pagehide/freeze 时冻结
+window.addEventListener("pagehide", ()=> { if (isPlayerActive()) switchToAudio(); });
+document.addEventListener("freeze",   ()=> { if (isPlayerActive()) switchToAudio(); });
+
+/* ---- 统一结束事件（避免双触发） ---- */
+function handleEndedFromActive(el){
+  const activeElId = (playbackMode === "video" ? "fsVideo" : "bgAudio");
+  if (el.id !== activeElId) return;
+  const curId = player.ids[player.index];
+  markWatched(curId);
+  nextInPlaylist();
+}
+
+/* ---- Media Session ---- */
+function setMediaSessionMeta(id){
+  if (!("mediaSession" in navigator)) return;
+  const title = player.titles[id] || `视频 ${id}`;
+  const origin = location.origin;
+  const artwork = [
+    { src: `${origin}/media/preview/${id}`, sizes:"512x512", type:"image/png" },
+    { src: `${origin}/media/preview/${id}?s=128`, sizes:"128x128", type:"image/png" },
+  ];
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title, artist:"Wallpaper Engine", album: state.path, artwork
+    });
+  } catch(_){}
+
+  if (!setMediaSessionMeta._installed){
+    const getActive = ()=> (playbackMode==="video" ? media.v || $("fsVideo") : media.a || $("bgAudio"));
+    navigator.mediaSession.setActionHandler("play", async ()=>{ await safePlay(getActive()); });
+    navigator.mediaSession.setActionHandler("pause", ()=>{ try{ getActive().pause(); }catch(_){ } });
+    navigator.mediaSession.setActionHandler("previoustrack", async ()=>{ if (player.index>0) await playIndex(player.index-1); });
+    navigator.mediaSession.setActionHandler("nexttrack", async ()=>{ await nextInPlaylist(); });
+    navigator.mediaSession.setActionHandler("seekbackward", (d)=>{ const el=getActive(); el.currentTime=Math.max(0, el.currentTime-(d?.seekOffset||10)); });
+    navigator.mediaSession.setActionHandler("seekforward", (d)=>{ const el=getActive(); el.currentTime=Math.min((el.duration||1e9), el.currentTime+(d?.seekOffset||10)); });
+    navigator.mediaSession.setActionHandler("seekto", (d)=>{ const el=getActive(); if (d.fastSeek && "fastSeek" in el) el.fastSeek(d.seekTime); else el.currentTime = d.seekTime; });
+    setMediaSessionMeta._installed = true;
+  }
+  updateMediaSessionPlaybackState();
+}
+function updateMediaSessionPlaybackState(){
+  if (!("mediaSession" in navigator)) return;
+  const el = (playbackMode==="video" ? media.v || $("fsVideo") : media.a || $("bgAudio"));
+  try { navigator.mediaSession.playbackState = el.paused ? "paused" : "playing"; } catch(_){}
+}
+
 /* ===== 全屏播放器（结束→打勾→自动播下一个） ===== */
 async function startPlaylist(items, startIndex=0, returnPath=null){
   cancelProgressive();
+
   player.ids = items.map(x=>x.id);
   player.titles = {}; items.forEach(x=> player.titles[x.id] = x.title || `视频 ${x.id}`);
   player.index = Math.max(0, Math.min(startIndex, player.ids.length-1));
   player.returnPath = returnPath || state.path;
 
-  const wrap = $("playerFS"); const v = $("fsVideo");
+  const wrap = $("playerFS");
+  const v = $("fsVideo");
+  const a = $("bgAudio");
+  media.v = v; media.a = a;
+  playbackMode = "video";
+
   wrap.style.display = "flex";
+
   if (!v._bound) {
-    v.addEventListener("ended", ()=> {
-      const curId = player.ids[player.index];
-      markWatched(curId);
-      nextInPlaylist();
-    });
-    v._bound = true;
+    v.addEventListener("ended", ()=> handleEndedFromActive(v));
+    a.addEventListener("ended", ()=> handleEndedFromActive(a));
+    v._bound = a._bound = true;
   }
-  try { if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" }); else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen(); } catch(_){}
+
+  // 进入全屏 + 压入占位历史项（保证物理返回先退出全屏）
+  try { 
+    if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" });
+    else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen();
+  } catch(_){}
+  try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
 
   $("btnBack").onclick = async ()=>{
     if (uiLock.byPlaylist) return;
     await exitPlayer();
+    if (fsOverlayInHistory){ fsOverlayInHistory = false; try{ history.back(); }catch(_){ } }
     if (state.path !== player.returnPath) navigateToPath(player.returnPath);
   };
 
@@ -620,6 +740,9 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   wrap.addEventListener("touchstart", wakeOverlay);
   wakeOverlay();
 
+  // 确保尽早解锁
+  unlockPlaybackOnUserGesture();
+
   await playIndex(player.index);
 }
 function wakeOverlay(){
@@ -628,11 +751,26 @@ function wakeOverlay(){
   if (player.idleTimer) clearTimeout(player.idleTimer);
   player.idleTimer = setTimeout(()=> wrap.classList.add("idle"), 1500);
 }
+
 async function playIndex(i){
   player.index = i;
-  const id = player.ids[i]; const v = $("fsVideo");
-  v.src = `/media/video/${id}`;
-  try { await v.play().catch(()=>{}); } catch(_){}
+  const id = player.ids[i];
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+
+  const src = `/media/video/${id}`;
+  v.src = src;
+  a.src = src; // 方便随时切后台音频
+
+  setMediaSessionMeta(id);
+
+  // 根据当前模式选择播放介质
+  if (document.visibilityState === "hidden") playbackMode = "audio"; else playbackMode = "video";
+  const ok = await safePlay(playbackMode==="audio" ? a : v);
+  if (!ok){
+    showNotice("播放被阻止：请点击屏幕以继续播放。");
+    installUserGestureUnlock();
+  }
   renderPlaylistPanel();
 }
 function renderPlaylistPanel(){
@@ -650,8 +788,11 @@ async function exitPlayer(){
   cancelProgressive();
   hidePlaylistPanel();
   try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
-  const wrap = $("playerFS"); const v = $("fsVideo");
-  v.pause(); v.removeAttribute("src"); v.load();
+  const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
+  try { v.pause(); } catch(_){}
+  try { a.pause(); } catch(_){}
+  // 保留 audio 元素（不 display:none），只是暂停
+  try { v.removeAttribute("src"); v.load(); } catch(_){}
   wrap.style.display = "none";
   $("playlistPanel").classList.add("hidden");
 }

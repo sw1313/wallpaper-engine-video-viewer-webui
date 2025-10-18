@@ -1,4 +1,9 @@
-/* app/static/style.css  (fs-23) — 居中模态播放列表 + 手势屏蔽增强 + 已完成徽标 */
+/* app/static/style.css  (fs-28)
+   - 修复 Chrome 全屏下 overlay 被 <video> 遮挡：明确 z-index 分层 + :fullscreen 兼容处理
+   - 修正若干拼写：justify-content / line-height / min-width
+*/
+
+/* ===== 基础 ===== */
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 html, body { height:100%; overflow-x:hidden; }
@@ -6,6 +11,9 @@ body {
   margin:0; background:#ffffff !important; color:#222;
   font-family: system-ui, -apple-system, "PingFang SC", "Microsoft Yahei", sans-serif;
 }
+button { cursor:pointer; }
+a.link { color:#0059c9; text-decoration:none; }
+a.link:hover { text-decoration:underline; }
 
 /* ===== 顶部（手机不超宽，自动换行） ===== */
 .topbar {
@@ -24,7 +32,7 @@ body {
 .controls select { flex:1 1 40%; }
 @media (min-width: 720px) {
   .controls { flex:0 0 auto; }
-  .controls input[type=search] { min宽:160px; flex:0 0 auto; }
+  .controls input[type=search] { min-width:160px; flex:0 0 auto; } /* 修正：min-width */
   .controls select { flex:0 0 auto; }
 }
 
@@ -53,7 +61,8 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .tile .meta{
   padding:0 10px 10px; font-size:12px; color:#555; opacity:.9;
-  height:16px; line_height:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  height:16px; line-height:16px; /* 修正：line-height */
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
 @media (max-width:640px){ .tile .meta{ display:none; } }
 
@@ -105,49 +114,57 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   background: rgba(0,170,255,.13); pointer-events:none;
 }
 
-/* 全屏播放器容器 */
+/* ===============================
+   全屏播放器容器 + 分层（关键修复）
+   =============================== */
 .playerfs{
   position:fixed; left:0; top:0; width:100vw; height:100vh; background:#000;
-  z-index:1200; display:flex; align-items:center; justify_content:center;
+  z-index:1200; display:flex; align-items:center; justify-content:center; /* 修正：justify-content */
 }
-.playerfs video{ width:100vw; height:100vh; object-fit:contain; }
+/* 让 video 成为明确的较低层（避免合成层把兄弟元素盖住） */
+.playerfs video{
+  position:absolute; left:0; top:0; width:100vw; height:100vh;
+  object-fit:contain; z-index:10;
+  background:#000;
+}
+/* 覆盖层容器始终在 video 之上 */
+.overlay{
+  position:absolute; left:0; top:0; width:100vw; height:100vh;
+  pointer-events:none; z-index:20;
+}
 
-/* 覆盖层容器 */
-.overlay{ position:fixed; left:0; top:0; width:100%; height:100%; pointer-events:none; }
+/* 遮罩与控件层次（overlay 上的按钮要再高一些） */
+.icon-btn{
+  pointer-events:auto; position:fixed; top:14px; width:38px; height:38px; border-radius:38px;
+  background:rgba(255,255,255,.75); color:#111; border:none; font-size:18px;
+  display:flex; align-items:center; justify-content:center; box-shadow:0 2px 10px rgba(0,0,0,.2);
+  opacity:.85; transition:opacity .2s ease; z-index:30; /* 提升到 overlay 之上 */
+}
+.icon-btn:hover{ opacity:1; }
+.icon-btn.back{ left:14px; }
+.icon-btn.menu{ right:14px; }
+.playerfs.idle .icon-btn{ opacity:0; }
 
-/* ✅ 播放列表弹出时的遮罩：拦截全部操作 */
+/* 遮罩与播放列表再往上叠 */
 .shade{
   position:fixed; left:0; top:0; width:100%; height:100%;
   background: rgba(0,0,0,.25);
   pointer-events:auto;
-  z-index:1301;
+  z-index:32;
   touch-action:none;
   overscroll-behavior: contain;
 }
 .shade.hidden{ display:none; }
 
-/* 顶部按钮（返回会被遮罩挡住，菜单不挡） */
-.icon-btn{
-  pointer-events:auto; position:fixed; top:14px; width:38px; height:38px; border-radius:38px;
-  background:rgba(255,255,255,.75); color:#111; border:none; font-size:18px;
-  display:flex; align-items:center; justify-content:center; box-shadow:0 2px 10px rgba(0,0,0,.2);
-  opacity:.85; transition:opacity .2s ease;
-}
-.icon-btn:hover{ opacity:1; }
-.icon-btn.back{ left:14px; z-index:1300; }
-.icon-btn.menu{ right:14px; z-index:1303; }
-.playerfs.idle .icon-btn{ opacity:0; }
-
-/* ✅ 居中模态播放列表（宽度不超过 ~1/3 屏幕） */
+/* ✅ 居中模态播放列表 */
 .playlist{
   position:fixed; left:50%; transform:translateX(-50%);
   top:60px; bottom:14px;
-  width:28vw;
-  max-width:420px;
+  width:28vw; max-width:420px;
   pointer-events:auto;
   background:rgba(255,255,255,.96); border:1px solid #ddd; border-radius:10px;
   box-shadow:0 8px 24px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
-  z-index:1302;
+  z-index:33;
 }
 .playlist.hidden{ display:none; }
 @media (min-width: 1024px){
@@ -169,7 +186,31 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 .inf-status{ text-align:center; padding:12px 10px; color:#666; font-size:13px; }
 .sentinel{ width:100%; height:1px; }
 
-/* 基础 */
-button { cursor:pointer; }
-a.link { color:#0059c9; text-decoration:none; }
-a.link:hover { text-decoration:underline; }
+/* ===============================
+   ▶︎ Chrome 全屏兼容：:fullscreen / :-webkit-full-screen
+   强制 overlay/按钮/列表 在最顶层
+   =============================== */
+#playerFS:fullscreen,
+#playerFS:-webkit-full-screen{
+  z-index:2147483638; /* 远高于页面其它层 */
+}
+#playerFS:fullscreen video,
+#playerFS:-webkit-full-screen video{
+  z-index:10;
+}
+#playerFS:fullscreen .overlay,
+#playerFS:-webkit-full-screen .overlay{
+  z-index:20;
+}
+#playerFS:fullscreen .icon-btn,
+#playerFS:-webkit-full-screen .icon-btn{
+  z-index:30;
+}
+#playerFS:fullscreen .shade,
+#playerFS:-webkit-full-screen .shade{
+  z-index:32;
+}
+#playerFS:fullscreen .playlist,
+#playerFS:-webkit-full-screen .playlist{
+  z-index:33;
+}
