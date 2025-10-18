@@ -1,9 +1,11 @@
-/* app/static/app.js (fs-24)
-   - 统一“边拉边播”：所有多视频播放模式均采用“先播一小批/单个 + 后台分批追加”
-   - 播放完成打勾（持久化）
-   - 右键/三点新增“从该处开始播放（忽略已完成）”并改为渐进模式
+/* app/static/app.js (fs-25)
+   变更要点：
+   - 新增基于 location.hash 的前端路由：进入文件夹会写入 #/路径
+   - 浏览器/手机“返回” => 回到上一路径（hash 返回），不再直接退出到主页
+   - 面包屑链接走 # 路由；点击文件夹、菜单“打开此文件夹”、播放器返回按钮，都改用 navigateToPath()
+   - 保留你之前所有“边拉边播”、已观看打勾等功能
 */
-console.log("app.js version fs-24");
+console.log("app.js version fs-25");
 
 /* ---- 全局状态 ---- */
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
@@ -81,6 +83,35 @@ function isSel(t){ return t.type==="video" ? state.selV.has(t.vid) : state.selF.
 function setSel(t,on){ if(t.type==="video"){on?state.selV.add(t.vid):state.selV.delete(t.vid);} else {on?state.selF.add(t.path):state.selF.delete(t.path);} t.el.classList.toggle("selected",on); }
 function clearSel(){ state.tiles.forEach(t=>t.el.classList.remove("selected")); state.selV.clear(); state.selF.clear(); }
 
+/* ======================
+   Hash 路由（关键改动）
+   ====================== */
+function pathFromHash(){
+  let h = window.location.hash || "";
+  if (!h || h === "#") return "/";
+  if (h.startsWith("#")) h = h.slice(1);
+  if (!h.startsWith("/")) h = "/" + h;
+  return decodeURI(h);
+}
+function navigateToPath(path){
+  if (!path) path = "/";
+  const target = "#" + encodeURI(path);
+  if (window.location.hash === target){
+    // 已在此路径，强制刷新当前内容（某些场景下需要）
+    changeContext({path});
+  } else {
+    // 触发浏览器历史栈：后退即可回到前一路径
+    window.location.hash = target;
+  }
+}
+function onHashChange(){
+  const newPath = pathFromHash();
+  if (newPath !== state.path){
+    changeContext({path: newPath});
+  }
+}
+window.addEventListener("hashchange", onHashChange);
+
 /* 骨架屏 */
 function renderSkeleton(nextBreadcrumb) {
   if (nextBreadcrumb) $("crumb").innerHTML = "当前位置：" + nextBreadcrumb;
@@ -152,11 +183,11 @@ async function loadNextPage(){
     let data;
     if (usePrefetch){ data=prefetchState.data; prefetchState.data=null; }
     else { const opts=snapshotOpts(); data = await apiScan(opts, state.page, undefined); if (keyAtStart!==makeQueryKey()){ state.isLoading=false; return; } }
-    const crumb = ["<a class='link' href='#/' data-path='/'>/</a>"].concat(
-      data.breadcrumb.map((seg,i)=>{const p="/"+data.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}' data-path='${p}'>${seg}</a>`;})
+    const crumb = ["<a class='link' href='#/'>/</a>"].concat(
+      data.breadcrumb.map((seg,i)=>{const p="/"+data.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}'>${seg}</a>`;})
     ).join(" / ");
     $("crumb").innerHTML = "当前位置：" + crumb;
-    $("crumb").querySelectorAll("a[data-path]").forEach(a=>{ a.onclick=(ev)=>{ev.preventDefault(); changeContext({path:a.getAttribute("data-path")});}; });
+    // 注意：这里不再绑定 onclick 拦截，直接让 a 的 hash 生效，从而加入浏览器历史栈
 
     if (state.page===1){ grid().innerHTML=""; state.tiles=[]; }
     appendTiles(data);
@@ -203,11 +234,12 @@ function setInfStatus(text){ const el=$("infiniteStatus"); if(el) el.textContent
 
 /* 切换上下文（网格） */
 function changeContext({path, sort_idx, mature_only, q}={}){
-  cancelProgressive();
+  // 仅用于渲染，不负责 push 历史；导航统一使用 navigateToPath()
   if (path!==undefined) state.path = path;
   if (sort_idx!==undefined) state.sort_idx = sort_idx;
   if (mature_only!==undefined) state.mature_only = mature_only;
   if (q!==undefined) state.q = q;
+  cancelProgressive();
   clearSel(); state.page=1; state.hasMore=true; state.isLoading=false; state.queryKey=makeQueryKey();
   resetPrefetch(); renderSkeleton(buildCrumbHtml(state.path)); setInfStatus("加载中…");
   if (!io){ const sentinel=$("sentinel");
@@ -219,9 +251,9 @@ function changeContext({path, sort_idx, mature_only, q}={}){
 
 /* 面包屑 html */
 function buildCrumbHtml(pathStr){
-  const html = ["<a class='link' href=\"#/\" data-path=\"/\">/</a>"];
+  const html = ["<a class='link' href=\"#/\">/</a>"];
   const segs = pathStr.split("/").filter(Boolean);
-  segs.forEach((seg,i)=>{ const p="/"+segs.slice(0,i+1).join("/"); html.push(`<a class='link' href='#${p}' data-path='${p}'>${seg}</a>`); });
+  segs.forEach((seg,i)=>{ const p="/"+segs.slice(0,i+1).join("/"); html.push(`<a class='link' href='#${p}'>${seg}</a>`); });
   return "当前位置：" + html.join(" / ");
 }
 
@@ -251,7 +283,7 @@ function bindDelegatedEvents(){
     }
     t.el.classList.add("pulse"); setTimeout(()=> t.el.classList.remove("pulse"), 200);
     clearSel(); setSel(t,true); state.lastIdx=t.idx;
-    if (t.type === "folder") changeContext({path: t.path});
+    if (t.type === "folder") navigateToPath(t.path);
     else await startPlaylist([{id:t.vid, title:t.title}], 0, state.path);
   });
 
@@ -273,7 +305,7 @@ function bindDelegatedEvents(){
   el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
 }
 
-/* 右键/⋮菜单（均改为渐进播放） */
+/* 右键/⋮菜单（均为渐进播放版本；仅“打开此文件夹”是导航） */
 function openContextMenu(x,y){
   const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
   const selCount = state.selV.size + state.selF.size;
@@ -287,7 +319,7 @@ function openContextMenu(x,y){
   if (oneVideo) {
     const vid = [...state.selV][0];
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
-    add("播放此视频", ()=> startPlaylist([{id:vid, title}], 0, state.path));  // 单视频不需要渐进
+    add("播放此视频", ()=> startPlaylist([{id:vid, title}], 0, state.path));
     add("从该处开始播放", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
     add("打开创意工坊链接", ()=> window.open(`/go/workshop/${vid}`, "_blank"));
     sep();
@@ -297,13 +329,13 @@ function openContextMenu(x,y){
     });
   } else if (oneFolder) {
     const path = [...state.selF][0];
-    add("打开此文件夹", ()=> changeContext({path}));
+    add("打开此文件夹", ()=> navigateToPath(path));
     add("播放此文件夹", async ()=>{ await progressivePlayFolder(path); });
   } else {
     add("批量播放", async ()=>{ await progressivePlaySelection(); });
     sep();
     add("删除所选", async ()=>{
-      const items = await expandSelectionToItems();   // 删除仍需一次性列出
+      const items = await expandSelectionToItems();
       if (!items.length) return alert("所选没有可删除的视频");
       if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
       await deleteByIds(items.map(x=>x.id)); clearSel(); changeContext({});
@@ -329,7 +361,7 @@ async function getFolderItems(path){
   return (j.items || []).map(it => ({id: it.id, title: it.title || `视频 ${it.id}`}));
 }
 
-/* —— 选择集展开（一次性，依然保留给“删除所选”等用） —— */
+/* —— 选择集展开（一次性，给“删除所选”等用） —— */
 async function expandSelectionToItems(){
   const list = [];
   state.selV.forEach(id => list.push({id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}`}));
@@ -411,11 +443,9 @@ function appendToPlaylist(items){
   }
   if (added>0) renderPlaylistPanel();
 }
-
+function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
 /**
  * progressiveAppendFrom: 启动后台从 asyncGenerator 逐批取数据并追加到播放列表
- * @param {() => AsyncGenerator<Array<{id,title}>>} producer
- * @param {string} label 状态显示前缀
  */
 async function progressiveAppendFrom(producer, label="后台加载"){
   progressive.running = true;
@@ -429,7 +459,6 @@ async function progressiveAppendFrom(producer, label="后台加载"){
         appendToPlaylist(batch);
         total += batch.length;
         setInfStatus(`${label}：+${batch.length}（累计 ${total}）`);
-        // 稍作 yield，防止主线程长时间占用
         await sleep(0);
       }
     }
@@ -445,22 +474,19 @@ async function progressiveAppendFrom(producer, label="后台加载"){
 /* ======= 顶部“播放未完成”（递归整个文件夹，边拉边播） ======= */
 async function handlePlayUnwatched(){
   cancelProgressive();
-  // 1) 立即用“当前已加载”里未完成的先开播（如果有）
   const initial = getCurrentlyLoadedVideoItems().filter(x => !isWatched(x.id)).slice(0, 30);
   if (initial.length){
     await startPlaylist(initial, 0, state.path);
     progressive.seen = new Set(player.ids);
   }
-  // 2) 后台递归整目录，分批把“未完成但还没在列表里的”追加
   const initialSet = new Set(initial.map(i=>i.id));
   const BATCH = 200;
   const producer = async function* (){
-    const all = await getFolderItems(state.path); // 递归全部
+    const all = await getFolderItems(state.path);
     const pending = all.filter(x => !isWatched(x.id) && !initialSet.has(x.id));
     for (const part of chunk(pending, BATCH)) yield part;
   };
   if (!initial.length){
-    // 没有任何“已加载未完成”可先播，就先拉一小批作为首批
     const first = await (async ()=>{
       const all = await getFolderItems(state.path);
       const pending = all.filter(x => !isWatched(x.id));
@@ -484,7 +510,6 @@ async function handlePlayUnwatched(){
 /* ======= 从该处开始播放（忽略已完成，边拉边播） ======= */
 async function handlePlayFromHereProgressive(vid, title){
   cancelProgressive();
-  // 先用这个视频立刻开播
   const initial = [{ id: vid, title: title || `视频 ${vid}` }];
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
@@ -492,9 +517,9 @@ async function handlePlayFromHereProgressive(vid, title){
   const initialSet = new Set([vid]);
   const BATCH = 200;
   const producer = async function* (){
-    const all = await getFolderItems(state.path);   // 递归全部
+    const all = await getFolderItems(state.path);
     const idx = all.findIndex(x => x.id === vid);
-    const tail = (idx>=0) ? all.slice(idx+1) : all; // 从该视频之后开始
+    const tail = (idx>=0) ? all.slice(idx+1) : all;
     const pending = tail.filter(x => !initialSet.has(x.id));
     for (const part of chunk(pending, BATCH)) yield part;
   };
@@ -525,11 +550,9 @@ async function progressivePlayFolder(path){
 /* ======= 批量播放（右键/三点，边拉边播） ======= */
 async function progressivePlaySelection(){
   cancelProgressive();
-
   const selVideos = [...state.selV];
   const selFolders = [...state.selF];
 
-  // 初始批：若有直接选中的“视频”则先用这些；否则先取第一个文件夹的一小批
   let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
   if (!initial.length && selFolders.length){
     const firstFolderItems = await getFolderItems(selFolders[0]);
@@ -545,21 +568,18 @@ async function progressivePlaySelection(){
   const BATCH = 200;
 
   const producer = async function* (){
-    // 先把剩下未播放的“直接选中的视频”（极少数遗漏）
     const extraVideos = selVideos.filter(id => !initialSet.has(id)).map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
     if (extraVideos.length) yield extraVideos;
-
-    // 再对每个文件夹依次拉取（顺序即可），并去重
     for (let i=0;i<selFolders.length;i++){
       const items = await getFolderItems(selFolders[i]);
-      const pending = items.filter(x => !progressive.seen.has(x.id)); // 动态去重
+      const pending = items.filter(x => !progressive.seen.has(x.id));
       for (const part of chunk(pending, BATCH)) yield part;
     }
   };
   progressiveAppendFrom(producer, "批量后台加载");
 }
 
-/* ======= 仍保留：取得当前已加载视频（用于“播放未完成”的首发批） ======= */
+/* 仍保留：取得当前已加载视频（用于“播放未完成”的首发批） */
 function getCurrentlyLoadedVideoItems(){
   const out = []; for (const t of state.tiles){ if (t.type === "video") out.push({ id:t.vid, title:t.title || `视频 ${t.vid}` }); }
   return out;
@@ -588,7 +608,7 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   $("btnBack").onclick = async ()=>{
     if (uiLock.byPlaylist) return;
     await exitPlayer();
-    if (state.path !== player.returnPath) changeContext({path: player.returnPath});
+    if (state.path !== player.returnPath) navigateToPath(player.returnPath);
   };
 
   $("btnMenu").onclick = ()=>{
@@ -680,9 +700,10 @@ $("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContex
 /* 顶部“播放未完成” */
 $("playUnwatched").onclick = handlePlayUnwatched;
 
-/* 首次进入 */
+/* 首次进入：读 hash 作为初始路径 */
 window.addEventListener("load", ()=>{
   loadWatched();
-  renderSkeleton(buildCrumbHtml(state.path));
-  changeContext({});
+  const initPath = pathFromHash();
+  renderSkeleton(buildCrumbHtml(initPath));
+  changeContext({path: initPath});
 });
