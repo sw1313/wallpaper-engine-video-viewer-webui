@@ -1,8 +1,9 @@
 # wallpaper-engine-video-viewer-webui
 wallpaper-engine-video-viewer-webui, Docker deployment, mimicking the we path directory.  
 由项目https://github.com/sw1313/wallpaper-engine-video-viewer  修改  
-1.网页内播放，支持文件夹批量播放，电脑支持框选及快捷键多选播放  
-2.适配手机浏览  
+1.网页内播放，支持文件夹批量播放，支持播放完成记录，电脑支持框选及快捷键多选播放  
+2.适配手机浏览 
+3.添加后台播放音频功能，仅用chrome安卓版测试，via之类无法正常工作
   
 # 部署教程
 
