@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
   <meta name="theme-color" content="#ffffff"/>
   <title>Wallpaper WebUI</title>
-  <link rel="stylesheet" href="/static/style.css?v=fs-21"/>
+  <!-- 样式未改动，如需强制刷新可手动 bump，这里沿用 fs-23 -->
+  <link rel="stylesheet" href="/static/style.css?v=fs-23"/>
 </head>
 <body>
   <header class="topbar">
@@ -22,7 +23,7 @@
       <label class="chk"><input type="checkbox" id="mature"> 只显示成人</label>
       <input id="q" type="search" placeholder="筛选标题…"/>
       <button id="refresh">刷新</button>
-      <button id="playAll">播放全部</button>
+      <button id="playUnwatched">播放未完成</button>
     </div>
   </header>
 
@@ -38,9 +39,9 @@
   <div id="rubber" class="rubber" style="display:none;"></div>
 
   <div id="playerFS" class="playerfs" style="display:none;">
+    <!-- 继续 preload="auto" -->
     <video id="fsVideo" controls playsinline preload="auto"></video>
     <div id="overlay" class="overlay">
-      <!-- 遮罩：抽屉打开时启用 -->
       <div id="shade" class="shade hidden" aria-hidden="true"></div>
 
       <button id="btnBack" class="icon-btn back" title="返回所在路径" aria-label="返回所在路径">⟵</button>
@@ -53,6 +54,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=fs-21"></script>
+  <!-- JS 版本升级为 fs-24 -->
+  <script src="/static/app.js?v=fs-24"></script>
 </body>
 </html>

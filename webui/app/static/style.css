@@ -1,4 +1,4 @@
-/* app/static/style.css  (fs-21) — 居中模态播放列表 + 手势屏蔽增强 */
+/* app/static/style.css  (fs-23) — 居中模态播放列表 + 手势屏蔽增强 + 已完成徽标 */
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 html, body { height:100%; overflow-x:hidden; }
@@ -24,7 +24,7 @@ body {
 .controls select { flex:1 1 40%; }
 @media (min-width: 720px) {
   .controls { flex:0 0 auto; }
-  .controls input[type=search] { min-width:160px; flex:0 0 auto; }
+  .controls input[type=search] { min宽:160px; flex:0 0 auto; }
   .controls select { flex:0 0 auto; }
 }
 
@@ -53,7 +53,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .tile .meta{
   padding:0 10px 10px; font-size:12px; color:#555; opacity:.9;
-  height:16px; line-height:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  height:16px; line_height:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
 @media (max-width:640px){ .tile .meta{ display:none; } }
 
@@ -66,6 +66,21 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   box-shadow:0 1px 4px rgba(0,0,0,.12);
 }
 .tile .tile-menu:hover{ background:rgba(255,255,255,.62); }
+
+/* ✅ 已完成徽标（左上角带圈勾） */
+.status-badge{
+  position:absolute; z-index:3;
+  top:8px; left:8px;
+  width:22px; height:22px; border-radius:22px;
+  border:2px solid rgba(0,0,0,.35);
+  background:rgba(255,255,255,.92);
+  color:#0b7d0b; font-weight:700; font-size:14px; line-height:18px;
+  display:flex; align-items:center; justify-content:center;
+  box-shadow:0 2px 8px rgba(0,0,0,.15);
+  opacity:0; transform:scale(.9);
+  transition: opacity .15s ease, transform .15s ease;
+}
+.status-badge.done{ opacity:1; transform:scale(1); }
 
 /* 选中/动画 */
 .tile.selected { border-color:#00aaff; box-shadow: 0 0 0 2px rgba(0,170,255,.35) inset; }
@@ -93,7 +108,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 /* 全屏播放器容器 */
 .playerfs{
   position:fixed; left:0; top:0; width:100vw; height:100vh; background:#000;
-  z-index:1200; display:flex; align-items:center; justify-content:center;
+  z-index:1200; display:flex; align-items:center; justify_content:center;
 }
 .playerfs video{ width:100vw; height:100vh; object-fit:contain; }
 
@@ -106,7 +121,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   background: rgba(0,0,0,.25);
   pointer-events:auto;
   z-index:1301;
-  touch-action:none;             /* 进一步抑制浏览器手势 */
+  touch-action:none;
   overscroll-behavior: contain;
 }
 .shade.hidden{ display:none; }
@@ -119,16 +134,16 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   opacity:.85; transition:opacity .2s ease;
 }
 .icon-btn:hover{ opacity:1; }
-.icon-btn.back{ left:14px; z-index:1300; }   /* 会被 shade 挡住 */
-.icon-btn.menu{ right:14px; z-index:1303; }  /* 始终可点，用于收回抽屉 */
+.icon-btn.back{ left:14px; z-index:1300; }
+.icon-btn.menu{ right:14px; z-index:1303; }
 .playerfs.idle .icon-btn{ opacity:0; }
 
 /* ✅ 居中模态播放列表（宽度不超过 ~1/3 屏幕） */
 .playlist{
   position:fixed; left:50%; transform:translateX(-50%);
   top:60px; bottom:14px;
-  width:28vw;                    /* 约 1/3 以下 */
-  max-width:420px;               /* 桌面上保持可读 */
+  width:28vw;
+  max-width:420px;
   pointer-events:auto;
   background:rgba(255,255,255,.96); border:1px solid #ddd; border-radius:10px;
   box-shadow:0 8px 24px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden;
@@ -136,7 +151,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .playlist.hidden{ display:none; }
 @media (min-width: 1024px){
-  .playlist{ width:360px; }      /* 大屏稍宽一些，但仍不触碰两侧手势区 */
+  .playlist{ width:360px; }
 }
 .plist-header{ padding:10px 12px; font-weight:600; border-bottom:1px solid #eee; background:#fafafa; }
 #plist{ list-style:none; margin:0; padding:0; overflow:auto; }
