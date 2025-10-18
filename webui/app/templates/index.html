@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
   <meta name="theme-color" content="#ffffff"/>
   <title>Wallpaper WebUI</title>
-  <!-- 样式未改动，如需强制刷新可手动 bump，这里沿用 fs-23 -->
+  <!-- 样式无需改动，沿用上次版本号 -->
   <link rel="stylesheet" href="/static/style.css?v=fs-23"/>
 </head>
 <body>
@@ -39,7 +39,6 @@
   <div id="rubber" class="rubber" style="display:none;"></div>
 
   <div id="playerFS" class="playerfs" style="display:none;">
-    <!-- 继续 preload="auto" -->
     <video id="fsVideo" controls playsinline preload="auto"></video>
     <div id="overlay" class="overlay">
       <div id="shade" class="shade hidden" aria-hidden="true"></div>
@@ -54,7 +53,7 @@
     </div>
   </div>
 
-  <!-- JS 版本升级为 fs-24 -->
-  <script src="/static/app.js?v=fs-24"></script>
+  <!-- 升级 JS 版本号，避免缓存 -->
+  <script src="/static/app.js?v=fs-25"></script>
 </body>
 </html>
