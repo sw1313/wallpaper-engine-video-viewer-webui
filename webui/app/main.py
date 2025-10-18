@@ -1,8 +1,17 @@
 # app/main.py
 import os, math, mimetypes, re
 from typing import List, Tuple
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse, PlainTextResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    StreamingResponse,
+    PlainTextResponse,
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -201,25 +210,88 @@ def api_playlist(req: PlaylistRequest):
     "Content-Disposition": "attachment; filename=we_playlist.m3u"
   })
 
-# 预览与视频（Range）
-CHUNK = 1024 * 1024
-def _parse_range(range_header: str, file_size: int) -> Tuple[int, int]:
-  m = re.match(r"bytes=(\d+)-(\d+)?", range_header)
+# =======================
+# 媒体传输（预览 & 视频）
+# =======================
+
+CHUNK = 8 * 1024 * 1024  # LAN 下更大的块，减少 Python 循环与 syscall 次数
+_range_re = re.compile(r"bytes=(\d*)-(\d*)$")
+
+def _etag_for(path: str) -> str:
+  st = os.stat(path)
+  # inode-size-mtime 的弱 ETag（无需读文件）
+  return f'W/"{st.st_ino}-{st.st_size}-{int(st.st_mtime)}"'
+
+def _last_modified_str(path: str) -> str:
+  st = os.stat(path)
+  dt = datetime.utcfromtimestamp(st.st_mtime)
+  return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+def _parse_range_header(range_header: str, file_size: int):
+  """支持 bytes=start-, bytes=-N, bytes=start-end；拒绝多段（含逗号）"""
+  if not range_header:
+    return None, None
+  if "," in range_header:
+    return None, "MULTI"
+  m = _range_re.match(range_header.strip())
   if not m:
-    return 0, file_size - 1
-  start = int(m.group(1))
-  end = int(m.group(2)) if m.group(2) else file_size - 1
+    return None, "BAD"
+  start_s, end_s = m.groups()
+  if start_s == "" and end_s == "":
+    return None, "BAD"
+  if start_s == "":  # bytes=-N
+    length = int(end_s or "0")
+    if length <= 0:
+      return None, "BAD"
+    start = max(0, file_size - length)
+    end = file_size - 1
+  else:
+    start = int(start_s)
+    end = int(end_s) if end_s else file_size - 1
+  if start >= file_size:
+    return None, "OUT"
   end = min(end, file_size - 1)
-  if start > end: start = 0
-  return start, end
+  if start > end:
+    return None, "BAD"
+  return (start, end), None
 
 @app.get("/media/preview/{vid_id}")
-def media_preview(vid_id: str):
+def media_preview(vid_id: str, request: Request):
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
   if not v: raise HTTPException(404)
-  mime, _ = mimetypes.guess_type(v.preview_path)
-  return FileResponse(v.preview_path, media_type=mime or "image/gif")
+  path = v.preview_path
+  mime, _ = mimetypes.guess_type(path)
+  mime = mime or "image/gif"
+  etag = _etag_for(path)
+  last_mod = _last_modified_str(path)
+
+  # 条件缓存命中 → 304
+  inm = request.headers.get("if-none-match")
+  ims = request.headers.get("if-modified-since")
+  if inm == etag:
+    return Response(status_code=304, headers={
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Cache-Control": "public, max-age=31536000, immutable",
+    })
+  if ims:
+    try:
+      ims_dt = parsedate_to_datetime(ims)
+      if int(os.stat(path).st_mtime) <= int(ims_dt.timestamp()):
+        return Response(status_code=304, headers={
+          "ETag": etag,
+          "Last-Modified": last_mod,
+          "Cache-Control": "public, max-age=31536000, immutable",
+        })
+    except Exception:
+      pass
+
+  return FileResponse(path, media_type=mime, headers={
+    "ETag": etag,
+    "Last-Modified": last_mod,
+    "Cache-Control": "public, max-age=31536000, immutable",
+  })
 
 @app.get("/media/video/{vid_id}")
 def media_video(request: Request, vid_id: str):
@@ -228,22 +300,84 @@ def media_video(request: Request, vid_id: str):
   if not v: raise HTTPException(404)
   path = v.video_path
   file_size = os.path.getsize(path)
+  mime, _ = mimetypes.guess_type(path)
+  mime = mime or "application/octet-stream"
+
+  etag = _etag_for(path)
+  last_mod = _last_modified_str(path)
+
+  # 条件缓存（虽然视频一般不会 304 命中，但加上无害且可复用）
+  inm = request.headers.get("if-none-match")
+  ims = request.headers.get("if-modified-since")
+  if inm == etag:
+    return Response(status_code=304, headers={
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    })
+  if ims:
+    try:
+      ims_dt = parsedate_to_datetime(ims)
+      if int(os.stat(path).st_mtime) <= int(ims_dt.timestamp()):
+        return Response(status_code=304, headers={
+          "ETag": etag,
+          "Last-Modified": last_mod,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "public, max-age=31536000, immutable",
+        })
+    except Exception:
+      pass
+
   range_header = request.headers.get("range")
-  if range_header:
-    start, end = _parse_range(range_header, file_size)
-    length = end - start + 1
-    def iterfile():
-      with open(path, "rb") as f:
-        f.seek(start)
-        remaining = length
-        while remaining > 0:
-          data = f.read(min(CHUNK, remaining))
-          if not data: break
-          remaining -= len(data)
-          yield data
-    headers = {"Content-Range": f"bytes {start}-{end}/{file_size}", "Accept-Ranges": "bytes", "Content-Length": str(length)}
-    return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type="video/mp4")
-  return FileResponse(path, media_type="video/mp4")
+  rng, err = _parse_range_header(range_header, file_size) if range_header else (None, None)
+
+  # 无 Range：走 FileResponse（更省心，部分 server/平台可走 sendfile 快路径）
+  if not rng:
+    if err == "MULTI":
+      return Response(status_code=416, headers={
+        "Content-Range": f"bytes */{file_size}",
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Last-Modified": last_mod,
+      })
+    if err in ("BAD", "OUT"):
+      return Response(status_code=416, headers={
+        "Content-Range": f"bytes */{file_size}",
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Last-Modified": last_mod,
+      })
+    return FileResponse(path, media_type=mime, headers={
+      "Accept-Ranges": "bytes",
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Cache-Control": "public, max-age=31536000, immutable",
+    })
+
+  # 有 Range：单段 206
+  start, end = rng
+  length = end - start + 1
+
+  def iterfile():
+    with open(path, "rb") as f:
+      f.seek(start)
+      remaining = length
+      while remaining > 0:
+        data = f.read(min(CHUNK, remaining))
+        if not data: break
+        remaining -= len(data)
+        yield data
+
+  headers = {
+    "Content-Range": f"bytes {start}-{end}/{file_size}",
+    "Accept-Ranges": "bytes",
+    "Content-Length": str(length),
+    "ETag": etag,
+    "Last-Modified": last_mod,
+    "Cache-Control": "public, max-age=31536000, immutable",
+  }
+  return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=mime)
 
 @app.get("/go/workshop/{vid_id}")
 def go_workshop(vid_id: str):
