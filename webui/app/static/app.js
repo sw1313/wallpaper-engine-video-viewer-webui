@@ -1,15 +1,12 @@
-/* app/static/app.js (fs-27)
-   关键改动：
-   - “全屏内物理返回键”：进入播放时 pushState 占位；popstate 时若播放器开启则仅退出全屏
-   - 息屏/切后台继续播放音频：
-       * 独立 <audio id="bgAudio"> 不用 display:none（避免被浏览器挂起）
-       * 首次用户手势解锁播放（unlockPlaybackOnUserGesture）
-       * visibilitychange/pagehide/freeze 时切换到 audio；前台恢复 video
-       * play() Promise 失败时优雅提示并等待下一次用户手势
-       * Media Session API：绝对 URL 的封面、上一/下一/seek 控制
-   - 保留：hash 路由、渐进“边拉边播”、已播放打勾
+/* app/static/app.js (fs-29)
+   变更要点：
+   - “已播放”标记改为服务端记录（/api/watched，SQLite 持久化）
+   - 网格每次追加视频后批量查询 watched，并更新勾选
+   - 播放结束时 POST /api/watched 标记完成
+   - “播放未完成”等逻辑在过滤前先与服务端同步 watched
+   - 其余播放器/路由/渐进加载逻辑保持与 fs-27 一致
 */
-console.log("app.js version fs-27");
+console.log("app.js version fs-29");
 
 /* ---- 全局状态 ---- */
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
@@ -48,16 +45,50 @@ function detectByUA(){
 const UA = detectByUA();
 const IS_MOBILE_UA = UA.isMobile;
 
-/* ====== 已完成持久化 ====== */
-const WATCH_KEY = "we_watched_ids_v1";
-let watched = new Set();
-function loadWatched(){ try{ watched = new Set(JSON.parse(localStorage.getItem(WATCH_KEY) || "[]")); }catch(_){ watched = new Set(); } }
-function saveWatched(){ try{ localStorage.setItem(WATCH_KEY, JSON.stringify([...watched])); }catch(_){ } }
-function isWatched(id){ return watched.has(id); }
-function markWatched(id){ if (!id) return; if (!watched.has(id)){ watched.add(id); saveWatched(); } updateTileWatchedUI(id, true); }
+/* ======（新）服务端“已完成”缓存与 API ====== */
+const watchedCache = new Map(); // id(string) -> true/false
+
+function isWatched(id){ return watchedCache.get(String(id)) === true; }
 function updateTileWatchedUI(id, done){
-  const t = state.tiles.find(t => t.type==="video" && t.vid===id);
+  const t = state.tiles.find(t => t.type==="video" && String(t.vid)===String(id));
   if (t){ const badge = t.el.querySelector(".status-badge"); if (badge) badge.classList.toggle("done", !!done); }
+}
+
+async function apiGetWatched(ids){
+  if (!ids.length) return new Set();
+  const qs = new URLSearchParams({ ids: ids.join(",") });
+  const r = await fetch(`/api/watched?${qs.toString()}`).catch(()=>null);
+  if (!r || !r.ok) return new Set();
+  const j = await r.json().catch(()=>({watched:[]}));
+  return new Set((j.watched || []).map(String));
+}
+async function apiSetWatched(ids, flag=true){
+  if (!ids.length) return;
+  try{
+    await fetch("/api/watched",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ ids: ids.map(String), watched: !!flag })
+    });
+  }catch(_){}
+}
+async function syncWatched(ids){
+  const uniq = [...new Set(ids.map(String))];
+  const BATCH = 500;
+  for (let i=0;i<uniq.length;i+=BATCH){
+    const part = uniq.slice(i, i+BATCH);
+    const set = await apiGetWatched(part);
+    part.forEach(id=>{
+      const flag = set.has(String(id));
+      watchedCache.set(String(id), flag);
+      updateTileWatchedUI(id, flag);
+    });
+  }
+}
+async function markWatched(id){
+  watchedCache.set(String(id), true);
+  updateTileWatchedUI(id, true);
+  apiSetWatched([id], true).catch(()=>{});
 }
 
 /* ===== 通用工具 ===== */
@@ -171,7 +202,8 @@ async function loadNextPage(){
     $("crumb").innerHTML = "当前位置：" + crumb;
 
     if (state.page===1){ grid().innerHTML=""; state.tiles=[]; }
-    appendTiles(data);
+    const newIds = appendTiles(data);       // 返回本批新增视频 id
+    if (newIds.length) syncWatched(newIds); // 追加后立即同步服务端已播放
 
     state.hasMore = state.page < data.total_pages;
     state.page += 1;
@@ -182,9 +214,11 @@ async function loadNextPage(){
   finally{ state.isLoading=false; queueMicrotask(()=>autoFillViewport(3)); }
 }
 
-/* 追加 tiles */
+/* 追加 tiles —— 返回新增视频 id 数组，便于批量查 watched */
 function appendTiles(data){
   let idx = state.tiles.length;
+  const batchVideoIds = [];
+
   data.folders.forEach(f=>{
     const path = (state.path.endsWith("/")? state.path : state.path + "/") + f.title;
     const el = document.createElement("div");
@@ -195,8 +229,9 @@ function appendTiles(data){
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"folder", path, idx, title:f.title}); idx++;
   });
+
   (data.videos||[]).forEach(v=>{
-    const done = isWatched(v.id);
+    const done = isWatched(v.id); // 首次多为 false，随后 syncWatched 会更新
     const el = document.createElement("div");
     el.className="tile"; el.dataset.type="video"; el.dataset.vid=v.id; el.dataset.idx=idx;
     el.innerHTML = `<div class="thumb">
@@ -207,7 +242,10 @@ function appendTiles(data){
                     <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"video", vid:v.id, idx, title:v.title}); idx++;
+    batchVideoIds.push(String(v.id));
   });
+
+  return batchVideoIds;
 }
 
 /* 状态条 */
@@ -336,16 +374,16 @@ async function getFolderItems(path){
   const params = new URLSearchParams({ path, sort_idx: state.sort_idx, mature_only: state.mature_only, with_meta: "1" });
   const r = await fetch(`/api/folder_videos?${params.toString()}`);
   const j = await r.json();
-  return (j.items || []).map(it => ({id: it.id, title: it.title || `视频 ${it.id}`}));
+  return (j.items || []).map(it => ({id: String(it.id), title: it.title || `视频 ${it.id}`}));
 }
 
 /* —— 选择集展开（删除用） —— */
 async function expandSelectionToItems(){
   const list = [];
-  state.selV.forEach(id => list.push({id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}`}));
+  state.selV.forEach(id => list.push({id: String(id), title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}`}));
   for (const p of state.selF) list.push(...await getFolderItems(p));
   const seen = new Set(); const out=[];
-  for (const it of list) if(!seen.has(it.id)){ seen.add(it.id); out.push(it); }
+  for (const it of list) if(!seen.has(String(it.id))){ seen.add(String(it.id)); out.push(it); }
   return out;
 }
 
@@ -435,30 +473,32 @@ async function progressiveAppendFrom(producer, label="后台加载"){
 /* ======= 顶部“播放未完成” ======= */
 async function handlePlayUnwatched(){
   cancelProgressive();
-  const initial = getCurrentlyLoadedVideoItems().filter(x => !isWatched(x.id)).slice(0, 30);
+
+  // 先同步当前格子的 watched
+  const current = getCurrentlyLoadedVideoItems();
+  await syncWatched(current.map(x=>x.id));
+
+  const initial = current.filter(x => !isWatched(x.id)).slice(0, 30);
   if (initial.length){ await startPlaylist(initial, 0, state.path); progressive.seen = new Set(player.ids); }
-  const initialSet = new Set(initial.map(i=>i.id));
+  const exclude = new Set(initial.map(i=>String(i.id)));
+
+  // 再递归取整个目录 & 同步 watched
+  const all = await getFolderItems(state.path);
+  await syncWatched(all.map(x=>x.id));
+
+  const pending = all.filter(x => !isWatched(x.id) && !exclude.has(String(x.id)));
+  if (!initial.length && !pending.length){ setInfStatus("当前路径下没有未完成的视频"); return; }
+
   const BATCH = 200;
-  const producer = async function* (){
-    const all = await getFolderItems(state.path);
-    const pending = all.filter(x => !isWatched(x.id) && !initialSet.has(x.id));
-    for (const part of chunk(pending, BATCH)) yield part;
-  };
   if (!initial.length){
-    const all = await getFolderItems(state.path);
-    const pending = all.filter(x => !isWatched(x.id));
     const first = pending.slice(0, 30);
-    if (!first.length){ setInfStatus("当前路径下没有未完成的视频"); return; }
     await startPlaylist(first, 0, state.path);
     progressive.seen = new Set(player.ids);
-    const restSet = new Set(first.map(i=>i.id));
-    const p2 = async function* (){
-      const all2 = await getFolderItems(state.path);
-      const pend2 = all2.filter(x => !isWatched(x.id) && !restSet.has(x.id));
-      for (const part of chunk(pend2, BATCH)) yield part;
-    };
-    progressiveAppendFrom(p2, "未完成后台加载");
+    const rest = pending.slice(first.length);
+    const producer = async function* (){ for (const part of chunk(rest, BATCH)) yield part; };
+    progressiveAppendFrom(producer, "未完成后台加载");
   } else {
+    const producer = async function* (){ for (const part of chunk(pending, BATCH)) yield part; };
     progressiveAppendFrom(producer, "未完成后台加载");
   }
 }
@@ -466,19 +506,18 @@ async function handlePlayUnwatched(){
 /* ======= 从该处开始播放 ======= */
 async function handlePlayFromHereProgressive(vid, title){
   cancelProgressive();
-  const initial = [{ id: vid, title: title || `视频 ${vid}` }];
+  const initial = [{ id: String(vid), title: title || `视频 ${vid}` }];
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
 
-  const initialSet = new Set([vid]);
+  const all = await getFolderItems(state.path);
+  await syncWatched(all.map(x=>x.id));
+  const idx = all.findIndex(x => String(x.id) === String(vid));
+  const tail = (idx>=0) ? all.slice(idx+1) : all;
+  const pending = tail.filter(x => !isWatched(x.id));
+
   const BATCH = 200;
-  const producer = async function* (){
-    const all = await getFolderItems(state.path);
-    const idx = all.findIndex(x => x.id === vid);
-    const tail = (idx>=0) ? all.slice(idx+1) : all;
-    const pending = tail.filter(x => !initialSet.has(x.id));
-    for (const part of chunk(pending, BATCH)) yield part;
-  };
+  const producer = async function* (){ for (const part of chunk(pending, BATCH)) yield part; };
   progressiveAppendFrom(producer, "从该处后台加载");
 }
 
@@ -487,46 +526,51 @@ async function progressivePlayFolder(path){
   cancelProgressive();
   setInfStatus("准备读取文件夹…");
   const all = await getFolderItems(path);
+  await syncWatched(all.map(x=>x.id));
   if (!all.length){ alert("该文件夹没有可播放视频"); return; }
 
-  const initial = all.slice(0, Math.min(30, all.length));
+  const initial = all.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, all.length));
+  if (!initial.length){ alert("该文件夹没有未完成的视频"); return; }
+
   await startPlaylist(initial, 0, path);
   progressive.seen = new Set(player.ids);
 
-  const initialSet = new Set(initial.map(i=>i.id));
+  const rest = all.filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
   const BATCH = 200;
-  const producer = async function* (){
-    const rest = all.filter(x => !initialSet.has(x.id));
-    for (const part of chunk(rest, BATCH)) yield part;
-  };
+  const producer = async function* (){ for (const part of chunk(rest, BATCH)) yield part; };
   progressiveAppendFrom(producer, "文件夹后台加载");
 }
 
 /* ======= 批量播放 ======= */
 async function progressivePlaySelection(){
   cancelProgressive();
-  const selVideos = [...state.selV], selFolders = [...state.selF];
+  const selVideos = [...state.selV].map(String), selFolders = [...state.selF];
 
-  let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
+  let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }));
+  await syncWatched(initial.map(x=>x.id));
+
   if (!initial.length && selFolders.length){
     const firstFolderItems = await getFolderItems(selFolders[0]);
+    await syncWatched(firstFolderItems.map(x=>x.id));
     if (!firstFolderItems.length){ alert("所选文件夹没有可播放视频"); return; }
-    initial = firstFolderItems.slice(0, Math.min(30, firstFolderItems.length));
+    initial = firstFolderItems.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, firstFolderItems.length));
   }
-  if (!initial.length){ alert("所选没有可播放视频"); return; }
+  if (!initial.length){ alert("所选没有未完成的视频"); return; }
 
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
 
-  const initialSet = new Set(initial.map(i=>i.id));
   const BATCH = 200;
-
   const producer = async function* (){
-    const extraVideos = selVideos.filter(id => !initialSet.has(id)).map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
+    const extraVideos = selVideos
+      .map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }))
+      .filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
     if (extraVideos.length) yield extraVideos;
+
     for (let i=0;i<selFolders.length;i++){
       const items = await getFolderItems(selFolders[i]);
-      const pending = items.filter(x => !progressive.seen.has(x.id));
+      await syncWatched(items.map(x=>x.id));
+      const pending = items.filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
       for (const part of chunk(pending, BATCH)) yield part;
     }
   };
@@ -535,7 +579,7 @@ async function progressivePlaySelection(){
 
 /* 取得当前已加载视频（用于“播放未完成”的首批） */
 function getCurrentlyLoadedVideoItems(){
-  const out = []; for (const t of state.tiles){ if (t.type === "video") out.push({ id:t.vid, title:t.title || `视频 ${t.vid}` }); }
+  const out = []; for (const t of state.tiles){ if (t.type === "video") out.push({ id:String(t.vid), title:t.title || `视频 ${t.vid}` }); }
   return out;
 }
 
@@ -605,7 +649,6 @@ async function switchToAudio(){
   if (a.src !== src) a.src = src;
   try { if (!isNaN(v.currentTime)) a.currentTime = v.currentTime; } catch(_){}
 
-  // 先尝试 audio 播放，成功后再暂停 video（失败则维持 video）
   const ok = await safePlay(a);
   if (ok){
     try{ v.pause(); }catch(_){}
@@ -647,7 +690,6 @@ document.addEventListener("visibilitychange", async ()=>{
     if (!ok){ showNotice("恢复前台播放被阻止，点击屏幕继续。"); installUserGestureUnlock(); }
   }
 });
-// 兼容：部分浏览器在 pagehide/freeze 时冻结
 window.addEventListener("pagehide", ()=> { if (isPlayerActive()) switchToAudio(); });
 document.addEventListener("freeze",   ()=> { if (isPlayerActive()) switchToAudio(); });
 
@@ -656,7 +698,7 @@ function handleEndedFromActive(el){
   const activeElId = (playbackMode === "video" ? "fsVideo" : "bgAudio");
   if (el.id !== activeElId) return;
   const curId = player.ids[player.index];
-  markWatched(curId);
+  markWatched(curId);      // ← 改为服务器记录
   nextInPlaylist();
 }
 
@@ -843,7 +885,6 @@ $("playUnwatched").onclick = handlePlayUnwatched;
 
 /* 首次进入：读 hash 作为初始路径 */
 window.addEventListener("load", ()=>{
-  loadWatched();
   const initPath = pathFromHash();
   renderSkeleton(buildCrumbHtml(initPath));
   changeContext({path: initPath});
