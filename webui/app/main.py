@@ -1,8 +1,9 @@
 # app/main.py
-import os, math, mimetypes, re
+import os, math, mimetypes, re, sqlite3, threading
 from typing import List, Tuple
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import (
     FileResponse,
@@ -14,6 +15,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from .we_scan import (
     load_we_config, extract_folders_list, build_folder_tree, scan_workshop_items,
@@ -24,6 +26,28 @@ from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRe
 WORKSHOP_PATH = os.getenv("WORKSHOP_PATH", "/data/workshop/content/431960")
 WE_PATH       = os.getenv("WE_PATH", "/data/wallpaper_engine")
 
+# ========= watched（服务器端“已播放”持久化） =========
+APP_DIR = os.path.dirname(__file__)
+DB_PATH = os.getenv("WATCHED_DB", os.path.join(APP_DIR, "data", "watched.db"))
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+_db_lock = threading.Lock()
+
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS watched (
+        id TEXT PRIMARY KEY,
+        watched INTEGER NOT NULL DEFAULT 1,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    return conn
+
+class WatchedSet(BaseModel):
+    ids: List[str]
+    watched: bool = True
+
+# ========= FastAPI 应用 =========
 app = FastAPI(title="Wallpaper WebUI")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
@@ -65,6 +89,38 @@ def _build_video_out(id_map, vid_id) -> VideoOut:
 def index(request: Request):
   return templates.TemplateResponse("index.html", {"request": request})
 
+# ==========（新）已播放 API ==========
+@app.get("/api/watched")
+def api_get_watched(ids: str = ""):
+  ids_list = [x.strip() for x in ids.split(",") if x.strip()]
+  if not ids_list:
+    return {"watched": []}
+  q = ",".join("?" for _ in ids_list)
+  with _db_lock:
+    conn = _get_conn()
+    rows = conn.execute(f"SELECT id FROM watched WHERE watched=1 AND id IN ({q})", ids_list).fetchall()
+    conn.close()
+  return {"watched": [r[0] for r in rows]}
+
+@app.post("/api/watched")
+def api_set_watched(payload: WatchedSet):
+  ids = [str(i) for i in payload.ids if str(i)]
+  if not ids:
+    return {"ok": True, "count": 0}
+  sql = """
+  INSERT INTO watched(id, watched, updated_at)
+  VALUES(?, ?, CURRENT_TIMESTAMP)
+  ON CONFLICT(id) DO UPDATE SET watched=excluded.watched, updated_at=CURRENT_TIMESTAMP
+  """
+  data = [(i, 1 if payload.watched else 0) for i in ids]
+  with _db_lock:
+    conn = _get_conn()
+    conn.executemany(sql, data)
+    conn.commit()
+    conn.close()
+  return {"ok": True, "count": len(ids)}
+
+# ========== 扫描 / 列表 ==========
 @app.get("/api/scan", response_model=ScanResponse)
 def api_scan(
   path: str = Query("/", description="形如 /A/B"),
@@ -213,7 +269,6 @@ def api_playlist(req: PlaylistRequest):
 # =======================
 # 媒体传输（预览 & 视频）
 # =======================
-
 CHUNK = 8 * 1024 * 1024  # LAN 下更大的块，减少 Python 循环与 syscall 次数
 _range_re = re.compile(r"bytes=(\d*)-(\d*)$")
 
@@ -334,14 +389,7 @@ def media_video(request: Request, vid_id: str):
 
   # 无 Range：走 FileResponse（更省心，部分 server/平台可走 sendfile 快路径）
   if not rng:
-    if err == "MULTI":
-      return Response(status_code=416, headers={
-        "Content-Range": f"bytes */{file_size}",
-        "Accept-Ranges": "bytes",
-        "ETag": etag,
-        "Last-Modified": last_mod,
-      })
-    if err in ("BAD", "OUT"):
+    if err == "MULTI" or err in ("BAD", "OUT"):
       return Response(status_code=416, headers={
         "Content-Range": f"bytes */{file_size}",
         "Accept-Ranges": "bytes",
