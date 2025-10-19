@@ -15,6 +15,7 @@ webui/
 │  ├─ main.py
 │  ├─ models.py
 │  ├─ we_scan.py
+│  ├─ watched_api.py
 │  ├─ templates/
 │  │  └─ index.html
 │  └─ static/
