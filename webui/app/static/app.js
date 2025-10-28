@@ -1,12 +1,9 @@
-/* app/static/app.js (fs-29)
-   变更要点：
-   - “已播放”标记改为服务端记录（/api/watched，SQLite 持久化）
-   - 网格每次追加视频后批量查询 watched，并更新勾选
-   - 播放结束时 POST /api/watched 标记完成
-   - “播放未完成”等逻辑在过滤前先与服务端同步 watched
-   - 其余播放器/路由/渐进加载逻辑保持与 fs-27 一致
+/* app/static/app.js (fs-31)
+   - 预览图改用 srcset/sizes，自适应选择 128~512 像素缩略图
+   - 图片加载失败自动回退到原始 /media/preview/{id}
+   - 其余逻辑与 fs-30 相同（已观看按钮、播放、渐进加载…）
 */
-console.log("app.js version fs-29");
+console.log("app.js version fs-31");
 
 /* ---- 全局状态 ---- */
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
@@ -15,16 +12,16 @@ let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:""
 
 let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/" };
 
-/* —— 预取状态（滚动加载网格） —— */
+/* —— 预取状态 —— */
 let prefetchState = { key:"", page:0, opts:null, data:null, controller:null, inflight:false };
 
-/* —— 渐进播放（后台追加器） —— */
+/* —— 渐进播放 —— */
 let progressive = { key:"", running:false, cancel:false, seen:new Set() };
 
 /* —— 模态锁 —— */
 let uiLock = { byPlaylist:false };
 
-/* —— 手势/滚动防穿透管理 —— */
+/* —— 事件守卫 —— */
 const modalGuards = [];
 function addModalGuard(type, handler, opts){ document.addEventListener(type, handler, opts); modalGuards.push([type, handler, opts]); }
 function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.removeEventListener(t,h,o); } modalGuards.length = 0; }
@@ -45,15 +42,22 @@ function detectByUA(){
 const UA = detectByUA();
 const IS_MOBILE_UA = UA.isMobile;
 
-/* ======（新）服务端“已完成”缓存与 API ====== */
+/* ====== 服务端“已观看”缓存 & API ====== */
 const watchedCache = new Map(); // id(string) -> true/false
 
 function isWatched(id){ return watchedCache.get(String(id)) === true; }
-function updateTileWatchedUI(id, done){
-  const t = state.tiles.find(t => t.type==="video" && String(t.vid)===String(id));
-  if (t){ const badge = t.el.querySelector(".status-badge"); if (badge) badge.classList.toggle("done", !!done); }
+function paintWatchedButton(btn, on){
+  btn.classList.toggle("on", !!on);
+  btn.classList.toggle("off", !on);
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  btn.title = on ? "点击标记为未观看" : "点击标记为已观看";
 }
-
+function updateTileWatchedUI(id, on){
+  const t = state.tiles.find(t => t.type==="video" && String(t.vid)===String(id));
+  if (!t) return;
+  const btn = t.el.querySelector(".watched-btn");
+  if (btn) paintWatchedButton(btn, on);
+}
 async function apiGetWatched(ids){
   if (!ids.length) return new Set();
   const qs = new URLSearchParams({ ids: ids.join(",") });
@@ -74,22 +78,32 @@ async function apiSetWatched(ids, flag=true){
 }
 async function syncWatched(ids){
   const uniq = [...new Set(ids.map(String))];
-  const BATCH = 500;
-  for (let i=0;i<uniq.length;i+=BATCH){
-    const part = uniq.slice(i, i+BATCH);
+  for (let i=0;i<uniq.length;i+=500){
+    const part = uniq.slice(i, i+500);
     const set = await apiGetWatched(part);
     part.forEach(id=>{
-      const flag = set.has(String(id));
-      watchedCache.set(String(id), flag);
-      updateTileWatchedUI(id, flag);
+      const on = set.has(String(id));
+      watchedCache.set(String(id), on);
+      updateTileWatchedUI(id, on);
     });
   }
 }
-async function markWatched(id){
-  watchedCache.set(String(id), true);
-  updateTileWatchedUI(id, true);
-  apiSetWatched([id], true).catch(()=>{});
+async function setWatchedOptimistic(id, on){
+  const idStr = String(id);
+  const prev = isWatched(idStr);
+  watchedCache.set(idStr, on);
+  updateTileWatchedUI(idStr, on);
+  try{
+    await apiSetWatched([idStr], on);
+  }catch(e){
+    watchedCache.set(idStr, prev);
+    updateTileWatchedUI(idStr, prev);
+    showNotice("网络异常：已回滚观看状态");
+    setTimeout(clearNotice, 1600);
+  }
 }
+async function markWatched(id){ return setWatchedOptimistic(id, true); }
+async function unmarkWatched(id){ return setWatchedOptimistic(id, false); }
 
 /* ===== 通用工具 ===== */
 document.addEventListener("dragstart", e => e.preventDefault());
@@ -104,7 +118,7 @@ function setSel(t,on){ if(t.type==="video"){on?state.selV.add(t.vid):state.selV.
 function clearSel(){ state.tiles.forEach(t=>t.el.classList.remove("selected")); state.selV.clear(); state.selF.clear(); }
 
 /* ======================
-   Hash 路由（返回到上一路径）
+   Hash 路由
    ====================== */
 function pathFromHash(){
   let h = window.location.hash || "";
@@ -149,7 +163,7 @@ async function apiScan(opts, page, signal){
   return res.json();
 }
 
-/* 预取下一页（网格滚动） */
+/* 预取下一页 */
 function resetPrefetch(){ if (prefetchState.controller) try{ prefetchState.controller.abort(); }catch(_){}
   prefetchState = { key:"", page:0, opts:null, data:null, controller:null, inflight:false };
 }
@@ -168,7 +182,7 @@ async function schedulePrefetch(){
   }catch{ prefetchState.data=null; } finally{ prefetchState.inflight=false; }
 }
 
-/* 自动补页（网格） */
+/* 自动补页 */
 let autoFillRunning = false;
 async function autoFillViewport(maxLoops=3){
   if (autoFillRunning) return; autoFillRunning = true;
@@ -184,7 +198,7 @@ async function autoFillViewport(maxLoops=3){
   } finally { autoFillRunning=false; }
 }
 
-/* 加载一页并渲染（网格） */
+/* 加载一页并渲染 */
 let io=null, rubberBound=false;
 async function loadNextPage(){
   if (state.isLoading || !state.hasMore) return;
@@ -202,8 +216,8 @@ async function loadNextPage(){
     $("crumb").innerHTML = "当前位置：" + crumb;
 
     if (state.page===1){ grid().innerHTML=""; state.tiles=[]; }
-    const newIds = appendTiles(data);       // 返回本批新增视频 id
-    if (newIds.length) syncWatched(newIds); // 追加后立即同步服务端已播放
+    const newIds = appendTiles(data);
+    if (newIds.length) syncWatched(newIds);
 
     state.hasMore = state.page < data.total_pages;
     state.page += 1;
@@ -214,7 +228,7 @@ async function loadNextPage(){
   finally{ state.isLoading=false; queueMicrotask(()=>autoFillViewport(3)); }
 }
 
-/* 追加 tiles —— 返回新增视频 id 数组，便于批量查 watched */
+/* 追加 tiles：返回新增视频 id 列表 */
 function appendTiles(data){
   let idx = state.tiles.length;
   const batchVideoIds = [];
@@ -231,13 +245,26 @@ function appendTiles(data){
   });
 
   (data.videos||[]).forEach(v=>{
-    const done = isWatched(v.id); // 首次多为 false，随后 syncWatched 会更新
+    const done = isWatched(v.id);
+    const base = v.preview_url;
+    const s128 = `${base}?s=128`;
+    const s192 = `${base}?s=192`;
+    const s256 = `${base}?s=256`;
+    const s384 = `${base}?s=384`;
+    const s512 = `${base}?s=512`;
+    const fallback = base; // 原图兜底
     const el = document.createElement("div");
     el.className="tile"; el.dataset.type="video"; el.dataset.vid=v.id; el.dataset.idx=idx;
     el.innerHTML = `<div class="thumb">
-                      <img src="${v.preview_url}" alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"/>
+                      <img
+                        src="${s256}"
+                        srcset="${s128} 128w, ${s192} 192w, ${s256} 256w, ${s384} 384w, ${s512} 512w"
+                        sizes="(max-width:640px) 48vw, 190px"
+                        alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
+                        onerror="this.onerror=null; this.src='${fallback}'"
+                      />
                     </div>
-                    <div class="status-badge ${done?'done':''}" title="${done?'已播放完成':''}">✓</div>
+                    <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
                     <div class="title">${v.title}</div>
                     <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
@@ -251,7 +278,7 @@ function appendTiles(data){
 /* 状态条 */
 function setInfStatus(text){ const el=$("infiniteStatus"); if(el) el.textContent = text || ""; }
 
-/* 切换上下文（网格） */
+/* 切换上下文 */
 function changeContext({path, sort_idx, mature_only, q}={}){
   if (path!==undefined) state.path = path;
   if (sort_idx!==undefined) state.sort_idx = sort_idx;
@@ -275,14 +302,24 @@ function buildCrumbHtml(pathStr){
   return "当前位置：" + html.join(" / ");
 }
 
-/* —— 事件委托（网格 + 右键） —— */
+/* —— 事件委托（含 watched 按钮） —— */
 function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
 
 function bindDelegatedEvents(){
   const el = grid(); if (el._allBound) return; el._allBound = true;
 
-  // 点击/选择/进入
   el.addEventListener("click", async (ev)=>{
+    const wbtn = ev.target.closest(".watched-btn");
+    if (wbtn){
+      ev.preventDefault(); ev.stopPropagation();
+      const t = getTile(wbtn); if (!t || t.type!=="video") return;
+      const id = String(t.vid);
+      const next = !isWatched(id);
+      paintWatchedButton(wbtn, next);
+      await setWatchedOptimistic(id, next);
+      return;
+    }
+
     const menuBtn = ev.target.closest(".tile-menu");
     if (menuBtn) {
       const t = getTile(menuBtn); if (!t) return;
@@ -291,6 +328,7 @@ function bindDelegatedEvents(){
       openContextMenu(b.left + b.width/2, b.top + b.height);
       ev.stopPropagation(); return;
     }
+
     const t = getTile(ev.target); if (!t) return;
     if (ev.ctrlKey) { setSel(t, !isSel(t)); state.lastIdx=t.idx; ev.preventDefault(); return; }
     if (ev.shiftKey) {
@@ -305,7 +343,6 @@ function bindDelegatedEvents(){
     else await startPlaylist([{id:t.vid, title:t.title}], 0, state.path);
   });
 
-  // 右键（桌面 UA）
   try { el.oncontextmenu = null; } catch(_) {}
   if (IS_MOBILE_UA) {
     el.addEventListener("contextmenu", e => e.preventDefault(), { capture:true, passive:false });
@@ -323,17 +360,16 @@ function bindDelegatedEvents(){
   el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
 }
 
-/* 右键/⋮菜单（渐进播放；仅“打开此文件夹”做导航） */
+/* 右键/⋮菜单（同前） */
+async function deleteByIds(ids){ await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) }); }
 function openContextMenu(x,y){
   const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
   const selCount = state.selV.size + state.selF.size;
   const onlyOne = selCount === 1;
   const oneVideo = onlyOne && state.selV.size === 1;
   const oneFolder = onlyOne && state.selF.size === 1;
-
   function add(text, fn){ const d=document.createElement("div"); d.className="item"; d.textContent=text; d.onclick=()=>{ hideMenu(); fn(); }; menu.appendChild(d); }
   function sep(){ const s=document.createElement("div"); s.className="sep"; menu.appendChild(s); }
-
   if (oneVideo) {
     const vid = [...state.selV][0];
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
@@ -359,15 +395,11 @@ function openContextMenu(x,y){
       await deleteByIds(items.map(x=>x.id)); clearSel(); changeContext({});
     });
   }
-
   const vw=window.innerWidth,vh=window.innerHeight;
   menu.style.left = Math.min(x, vw-220)+"px"; menu.style.top = Math.min(y, vh-240)+"px";
   setTimeout(()=> document.addEventListener("click", hideMenu, {once:true}), 0);
 }
 function hideMenu(){ $("ctxmenu").style.display="none"; }
-
-/* 删除 */
-async function deleteByIds(ids){ await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) }); }
 
 /* —— 递归列出某路径全部视频 —— */
 async function getFolderItems(path){
@@ -376,8 +408,6 @@ async function getFolderItems(path){
   const j = await r.json();
   return (j.items || []).map(it => ({id: String(it.id), title: it.title || `视频 ${it.id}`}));
 }
-
-/* —— 选择集展开（删除用） —— */
 async function expandSelectionToItems(){
   const list = [];
   state.selV.forEach(id => list.push({id: String(id), title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}`}));
@@ -387,7 +417,7 @@ async function expandSelectionToItems(){
   return out;
 }
 
-/* ===== 抽屉模态 ===== */
+/* ===== 抽屉模态 / 播放清单 ===== */
 function showPlaylistPanel(){
   uiLock.byPlaylist = true;
   $("playerFS").classList.add("locked");
@@ -439,7 +469,7 @@ function hidePlaylistPanel(){
   removeModalGuards();
 }
 
-/* ===== 渐进追加器 ===== */
+/* ===== 渐进追加器 / 播放逻辑（同前） ===== */
 function cancelProgressive(){ progressive.cancel=true; progressive.running=false; progressive.key=""; progressive.seen.clear(); }
 function appendToPlaylist(items){
   let added=0;
@@ -469,26 +499,17 @@ async function progressiveAppendFrom(producer, label="后台加载"){
   }catch(e){ if (!progressive.cancel) setInfStatus(`${label}：加载失败`); console.error(e); }
   finally{ progressive.running = false; }
 }
-
-/* ======= 顶部“播放未完成” ======= */
 async function handlePlayUnwatched(){
   cancelProgressive();
-
-  // 先同步当前格子的 watched
   const current = getCurrentlyLoadedVideoItems();
   await syncWatched(current.map(x=>x.id));
-
   const initial = current.filter(x => !isWatched(x.id)).slice(0, 30);
   if (initial.length){ await startPlaylist(initial, 0, state.path); progressive.seen = new Set(player.ids); }
   const exclude = new Set(initial.map(i=>String(i.id)));
-
-  // 再递归取整个目录 & 同步 watched
   const all = await getFolderItems(state.path);
   await syncWatched(all.map(x=>x.id));
-
   const pending = all.filter(x => !isWatched(x.id) && !exclude.has(String(x.id)));
   if (!initial.length && !pending.length){ setInfStatus("当前路径下没有未完成的视频"); return; }
-
   const BATCH = 200;
   if (!initial.length){
     const first = pending.slice(0, 30);
@@ -502,53 +523,40 @@ async function handlePlayUnwatched(){
     progressiveAppendFrom(producer, "未完成后台加载");
   }
 }
-
-/* ======= 从该处开始播放 ======= */
 async function handlePlayFromHereProgressive(vid, title){
   cancelProgressive();
   const initial = [{ id: String(vid), title: title || `视频 ${vid}` }];
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
-
   const all = await getFolderItems(state.path);
   await syncWatched(all.map(x=>x.id));
   const idx = all.findIndex(x => String(x.id) === String(vid));
   const tail = (idx>=0) ? all.slice(idx+1) : all;
   const pending = tail.filter(x => !isWatched(x.id));
-
   const BATCH = 200;
   const producer = async function* (){ for (const part of chunk(pending, BATCH)) yield part; };
   progressiveAppendFrom(producer, "从该处后台加载");
 }
-
-/* ======= 播放文件夹 ======= */
 async function progressivePlayFolder(path){
   cancelProgressive();
   setInfStatus("准备读取文件夹…");
   const all = await getFolderItems(path);
   await syncWatched(all.map(x=>x.id));
   if (!all.length){ alert("该文件夹没有可播放视频"); return; }
-
   const initial = all.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, all.length));
   if (!initial.length){ alert("该文件夹没有未完成的视频"); return; }
-
   await startPlaylist(initial, 0, path);
   progressive.seen = new Set(player.ids);
-
   const rest = all.filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
   const BATCH = 200;
   const producer = async function* (){ for (const part of chunk(rest, BATCH)) yield part; };
   progressiveAppendFrom(producer, "文件夹后台加载");
 }
-
-/* ======= 批量播放 ======= */
 async function progressivePlaySelection(){
   cancelProgressive();
   const selVideos = [...state.selV].map(String), selFolders = [...state.selF];
-
   let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }));
   await syncWatched(initial.map(x=>x.id));
-
   if (!initial.length && selFolders.length){
     const firstFolderItems = await getFolderItems(selFolders[0]);
     await syncWatched(firstFolderItems.map(x=>x.id));
@@ -556,17 +564,14 @@ async function progressivePlaySelection(){
     initial = firstFolderItems.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, firstFolderItems.length));
   }
   if (!initial.length){ alert("所选没有未完成的视频"); return; }
-
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
-
   const BATCH = 200;
   const producer = async function* (){
     const extraVideos = selVideos
       .map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }))
       .filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
     if (extraVideos.length) yield extraVideos;
-
     for (let i=0;i<selFolders.length;i++){
       const items = await getFolderItems(selFolders[i]);
       await syncWatched(items.map(x=>x.id));
@@ -576,8 +581,6 @@ async function progressivePlaySelection(){
   };
   progressiveAppendFrom(producer, "批量后台加载");
 }
-
-/* 取得当前已加载视频（用于“播放未完成”的首批） */
 function getCurrentlyLoadedVideoItems(){
   const out = []; for (const t of state.tiles){ if (t.type === "video") out.push({ id:String(t.vid), title:t.title || `视频 ${t.vid}` }); }
   return out;
@@ -586,25 +589,18 @@ function getCurrentlyLoadedVideoItems(){
 /* =========================
    播放器（全屏 & 后台音频）
    ========================= */
-let fsOverlayInHistory = false;     // 是否压入了“全屏占位”的历史项
-let playbackMode = "video";         // 'video' | 'audio'
+let fsOverlayInHistory = false;
+let playbackMode = "video";
 const media = { v:null, a:null };
 
 function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
 
-/* ---- 首次用户手势解锁播放 ---- */
 let userGestureUnlocked = false;
 async function unlockPlaybackOnUserGesture(){
   if (userGestureUnlocked) return;
   const a = $("bgAudio"), v = $("fsVideo");
-  try {
-    await a.play(); a.pause();
-    userGestureUnlocked = true;
-    console.log("playback unlocked via audio");
-  } catch (e) {
-    try { await v.play(); v.pause(); userGestureUnlocked = true; console.log("playback unlocked via video"); }
-    catch(e2){ console.log("unlock playback failed — will retry on next gesture"); }
-  }
+  try { await a.play(); a.pause(); userGestureUnlocked = true; }
+  catch { try { await v.play(); v.pause(); userGestureUnlocked = true; } catch{} }
 }
 function installUserGestureUnlock(){
   const once = async ()=>{
@@ -621,94 +617,72 @@ function installUserGestureUnlock(){
 }
 window.addEventListener("load", installUserGestureUnlock);
 
-/* ---- popstate：全屏内第一次返回仅退出全屏 ---- */
 function installPopStateGuard(){
   window.addEventListener("popstate", () => {
     if (isPlayerActive()){
-      fsOverlayInHistory = false; // 弹出这层占位
-      exitPlayer();               // 仅退出全屏，不做路径跳转
+      fsOverlayInHistory = false;
+      exitPlayer();
     }
   });
 }
 installPopStateGuard();
 
-/* ---- 播放封装 ---- */
-async function safePlay(el){
-  try { await el.play(); return true; }
-  catch(e){ console.warn("play() rejected:", e); return false; }
-}
+async function safePlay(el){ try { await el.play(); return true; } catch { return False; } }
 
-/* ---- 切换：前台 video / 后台 audio ---- */
 async function switchToAudio(){
   if (!isPlayerActive() || playbackMode === "audio") return;
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
   media.v = v; media.a = a;
-
   const src = v.src || `/media/video/${player.ids[player.index]}`;
   if (a.src !== src) a.src = src;
   try { if (!isNaN(v.currentTime)) a.currentTime = v.currentTime; } catch(_){}
-
-  const ok = await safePlay(a);
-  if (ok){
-    try{ v.pause(); }catch(_){}
-    playbackMode = "audio";
-    updateMediaSessionPlaybackState();
-  } else {
-    showNotice("浏览器阻止后台播放，请点击页面任意处以解锁。");
-    installUserGestureUnlock();
-  }
+  const ok = await (async()=>{ try{ await a.play(); return true; }catch{ return false; } })();
+  if (ok){ try{ v.pause(); }catch(_){}
+    playbackMode = "audio"; updateMediaSessionPlaybackState();
+  } else { showNotice("后台播放被阻止，点一下屏幕以继续"); installUserGestureUnlock(); }
 }
 async function switchToVideo(){
   if (!isPlayerActive() || playbackMode === "video") return;
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
   media.v = v; media.a = a;
-
   try { if (!isNaN(a.currentTime)) v.currentTime = a.currentTime; } catch(_){}
-  const ok = await safePlay(v);
-  if (ok){
-    try{ a.pause(); }catch(_){}
-    playbackMode = "video";
-    updateMediaSessionPlaybackState();
-  } else {
-    showNotice("恢复视频播放被阻止，点击屏幕继续。");
-    installUserGestureUnlock();
-  }
+  const ok = await (async()=>{ try{ await v.play(); return true; }catch{ return false; } })();
+  if (ok){ try{ a.pause(); }catch(_){}
+    playbackMode = "video"; updateMediaSessionPlaybackState();
+  } else { showNotice("恢复前台播放被阻止，点一下屏幕"); installUserGestureUnlock(); }
 }
 
-/* ---- 前后台切换监听 ---- */
 document.addEventListener("visibilitychange", async ()=>{
   if (!isPlayerActive()) return;
   if (document.visibilityState === "hidden") {
     await switchToAudio();
-    const ok = await safePlay(media.a || $("bgAudio"));
-    if (!ok){ showNotice("后台播放被阻止，需要点击一次屏幕以继续。"); installUserGestureUnlock(); }
+    const ok = await (async()=>{ try{ await (media.a||$("bgAudio")).play(); return true; }catch{ return false; } })();
+    if (!ok){ showNotice("后台播放被阻止，需要点击以继续"); installUserGestureUnlock(); }
   } else {
     await switchToVideo();
-    const ok = await safePlay(media.v || $("fsVideo"));
-    if (!ok){ showNotice("恢复前台播放被阻止，点击屏幕继续。"); installUserGestureUnlock(); }
+    const ok = await (async()=>{ try{ await (media.v||$("fsVideo")).play(); return true; }catch{ return false; } })();
+    if (!ok){ showNotice("恢复前台播放被阻止，点击屏幕继续"); installUserGestureUnlock(); }
   }
 });
 window.addEventListener("pagehide", ()=> { if (isPlayerActive()) switchToAudio(); });
 document.addEventListener("freeze",   ()=> { if (isPlayerActive()) switchToAudio(); });
 
-/* ---- 统一结束事件（避免双触发） ---- */
 function handleEndedFromActive(el){
   const activeElId = (playbackMode === "video" ? "fsVideo" : "bgAudio");
   if (el.id !== activeElId) return;
   const curId = player.ids[player.index];
-  markWatched(curId);      // ← 改为服务器记录
+  markWatched(curId);
   nextInPlaylist();
 }
 
-/* ---- Media Session ---- */
 function setMediaSessionMeta(id){
   if (!("mediaSession" in navigator)) return;
   const title = player.titles[id] || `视频 ${id}`;
   const origin = location.origin;
   const artwork = [
-    { src: `${origin}/media/preview/${id}`, sizes:"512x512", type:"image/png" },
+    { src: `${origin}/media/preview/${id}?s=512`, sizes:"512x512", type:"image/png" },
     { src: `${origin}/media/preview/${id}?s=128`, sizes:"128x128", type:"image/png" },
   ];
   try {
@@ -716,10 +690,9 @@ function setMediaSessionMeta(id){
       title, artist:"Wallpaper Engine", album: state.path, artwork
     });
   } catch(_){}
-
   if (!setMediaSessionMeta._installed){
     const getActive = ()=> (playbackMode==="video" ? media.v || $("fsVideo") : media.a || $("bgAudio"));
-    navigator.mediaSession.setActionHandler("play", async ()=>{ await safePlay(getActive()); });
+    navigator.mediaSession.setActionHandler("play", async ()=>{ try{ await getActive().play(); }catch{} });
     navigator.mediaSession.setActionHandler("pause", ()=>{ try{ getActive().pause(); }catch(_){ } });
     navigator.mediaSession.setActionHandler("previoustrack", async ()=>{ if (player.index>0) await playIndex(player.index-1); });
     navigator.mediaSession.setActionHandler("nexttrack", async ()=>{ await nextInPlaylist(); });
@@ -736,55 +709,42 @@ function updateMediaSessionPlaybackState(){
   try { navigator.mediaSession.playbackState = el.paused ? "paused" : "playing"; } catch(_){}
 }
 
-/* ===== 全屏播放器（结束→打勾→自动播下一个） ===== */
 async function startPlaylist(items, startIndex=0, returnPath=null){
   cancelProgressive();
-
   player.ids = items.map(x=>x.id);
   player.titles = {}; items.forEach(x=> player.titles[x.id] = x.title || `视频 ${x.id}`);
   player.index = Math.max(0, Math.min(startIndex, player.ids.length-1));
   player.returnPath = returnPath || state.path;
-
   const wrap = $("playerFS");
   const v = $("fsVideo");
   const a = $("bgAudio");
   media.v = v; media.a = a;
   playbackMode = "video";
-
   wrap.style.display = "flex";
-
   if (!v._bound) {
     v.addEventListener("ended", ()=> handleEndedFromActive(v));
     a.addEventListener("ended", ()=> handleEndedFromActive(a));
     v._bound = a._bound = true;
   }
-
-  // 进入全屏 + 压入占位历史项（保证物理返回先退出全屏）
   try { 
     if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" });
     else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen();
   } catch(_){}
   try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
-
   $("btnBack").onclick = async ()=>{
     if (uiLock.byPlaylist) return;
     await exitPlayer();
     if (fsOverlayInHistory){ fsOverlayInHistory = false; try{ history.back(); }catch(_){ } }
     if (state.path !== player.returnPath) navigateToPath(player.returnPath);
   };
-
   $("btnMenu").onclick = ()=>{
     if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel();
     else hidePlaylistPanel();
   };
-
   wrap.addEventListener("mousemove", wakeOverlay);
   wrap.addEventListener("touchstart", wakeOverlay);
   wakeOverlay();
-
-  // 确保尽早解锁
   unlockPlaybackOnUserGesture();
-
   await playIndex(player.index);
 }
 function wakeOverlay(){
@@ -793,25 +753,20 @@ function wakeOverlay(){
   if (player.idleTimer) clearTimeout(player.idleTimer);
   player.idleTimer = setTimeout(()=> wrap.classList.add("idle"), 1500);
 }
-
 async function playIndex(i){
   player.index = i;
   const id = player.ids[i];
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
-
   const src = `/media/video/${id}`;
   v.src = src;
-  a.src = src; // 方便随时切后台音频
-
+  a.src = src;
   setMediaSessionMeta(id);
-
-  // 根据当前模式选择播放介质
   if (document.visibilityState === "hidden") playbackMode = "audio"; else playbackMode = "video";
-  const ok = await safePlay(playbackMode==="audio" ? a : v);
-  if (!ok){
-    showNotice("播放被阻止：请点击屏幕以继续播放。");
-    installUserGestureUnlock();
+  try{
+    if (playbackMode==="audio") await a.play(); else await v.play();
+  }catch{
+    showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock();
   }
   renderPlaylistPanel();
 }
@@ -833,7 +788,6 @@ async function exitPlayer(){
   const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
   try { v.pause(); } catch(_){}
   try { a.pause(); } catch(_){}
-  // 保留 audio 元素（不 display:none），只是暂停
   try { v.removeAttribute("src"); v.load(); } catch(_){}
   wrap.style.display = "none";
   $("playlistPanel").classList.add("hidden");
@@ -883,7 +837,7 @@ $("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContex
 /* 顶部“播放未完成” */
 $("playUnwatched").onclick = handlePlayUnwatched;
 
-/* 首次进入：读 hash 作为初始路径 */
+/* 首次进入 */
 window.addEventListener("load", ()=>{
   const initPath = pathFromHash();
   renderSkeleton(buildCrumbHtml(initPath));

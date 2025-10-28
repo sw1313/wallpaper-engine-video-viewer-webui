@@ -1,5 +1,5 @@
-# app/main.py
-import os, math, mimetypes, re, sqlite3, threading
+# app/main.py (fs-31)
+import os, math, mimetypes, re, sqlite3, threading, io, hashlib
 from typing import List, Tuple
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -23,12 +23,15 @@ from .we_scan import (
 )
 from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest
 
+# === 可配置路径 ===
 WORKSHOP_PATH = os.getenv("WORKSHOP_PATH", "/data/workshop/content/431960")
 WE_PATH       = os.getenv("WE_PATH", "/data/wallpaper_engine")
+APP_DIR       = os.path.dirname(__file__)
+DATA_DIR      = os.path.join(APP_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ========= watched（服务器端“已播放”持久化） =========
-APP_DIR = os.path.dirname(__file__)
-DB_PATH = os.getenv("WATCHED_DB", os.path.join(APP_DIR, "data", "watched.db"))
+DB_PATH = os.getenv("WATCHED_DB", os.path.join(DATA_DIR, "watched.db"))
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 _db_lock = threading.Lock()
 
@@ -46,6 +49,18 @@ def _get_conn():
 class WatchedSet(BaseModel):
     ids: List[str]
     watched: bool = True
+
+# ========= 预览图缓存 =========
+PREVIEW_CACHE_DIR = os.getenv("PREVIEW_CACHE_DIR", os.path.join(DATA_DIR, "preview_cache"))
+os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
+_cache_locks = {}
+_cache_global_lock = threading.Lock()
+
+def _get_cache_lock(path: str) -> threading.Lock:
+    with _cache_global_lock:
+        if path not in _cache_locks:
+            _cache_locks[path] = threading.Lock()
+        return _cache_locks[path]
 
 # ========= FastAPI 应用 =========
 app = FastAPI(title="Wallpaper WebUI")
@@ -252,7 +267,7 @@ def api_delete(req: DeleteRequest):
     else: skipped.append(vid)
   return {"deleted": deleted, "skipped": skipped}
 
-# （保留 m3u 接口，但前端已不再使用）
+# （保留 m3u 接口）
 @app.post("/api/playlist")
 def api_playlist(req: PlaylistRequest):
   _, id_map, _ = _scan_state()
@@ -269,12 +284,11 @@ def api_playlist(req: PlaylistRequest):
 # =======================
 # 媒体传输（预览 & 视频）
 # =======================
-CHUNK = 8 * 1024 * 1024  # LAN 下更大的块，减少 Python 循环与 syscall 次数
+CHUNK = 8 * 1024 * 1024  # LAN 下更大的块
 _range_re = re.compile(r"bytes=(\d*)-(\d*)$")
 
 def _etag_for(path: str) -> str:
   st = os.stat(path)
-  # inode-size-mtime 的弱 ETag（无需读文件）
   return f'W/"{st.st_ino}-{st.st_size}-{int(st.st_mtime)}"'
 
 def _last_modified_str(path: str) -> str:
@@ -283,7 +297,6 @@ def _last_modified_str(path: str) -> str:
   return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 def _parse_range_header(range_header: str, file_size: int):
-  """支持 bytes=start-, bytes=-N, bytes=start-end；拒绝多段（含逗号）"""
   if not range_header:
     return None, None
   if "," in range_header:
@@ -310,43 +323,215 @@ def _parse_range_header(range_header: str, file_size: int):
     return None, "BAD"
   return (start, end), None
 
+# ======= 预览图（新增：缩放/转码/缓存） =======
+def _client_supports_webp(request: Request) -> bool:
+  accept = request.headers.get("accept", "")
+  return "image/webp" in accept.lower()
+
+def _ext_from_mime(mime: str) -> str:
+  if not mime: return ".bin"
+  if "jpeg" in mime: return ".jpg"
+  if "png" in mime: return ".png"
+  if "gif" in mime: return ".gif"
+  if "webp" in mime: return ".webp"
+  return mimetypes.guess_extension(mime) or ".bin"
+
 @app.get("/media/preview/{vid_id}")
-def media_preview(vid_id: str, request: Request):
+def media_preview(vid_id: str, request: Request,
+                  s: int | None = Query(default=None, ge=32, le=2048, description="方形缩略图边长"),
+                  fmt: str | None = Query(default=None, description="webp|jpeg|png|auto"),
+                  q: int = Query(default=80, ge=10, le=100)):
+  # 构建原图信息
+  from PIL import Image, ImageSequence  # 需要 pillow
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
   if not v: raise HTTPException(404)
-  path = v.preview_path
-  mime, _ = mimetypes.guess_type(path)
-  mime = mime or "image/gif"
-  etag = _etag_for(path)
-  last_mod = _last_modified_str(path)
+  src_path = v.preview_path
 
-  # 条件缓存命中 → 304
-  inm = request.headers.get("if-none-match")
-  ims = request.headers.get("if-modified-since")
-  if inm == etag:
-    return Response(status_code=304, headers={
-      "ETag": etag,
-      "Last-Modified": last_mod,
+  # 基础元数据
+  src_mime, _ = mimetypes.guess_type(src_path)
+  src_mime = src_mime or "image/gif"
+  src_etag = _etag_for(src_path)
+  last_mod = _last_modified_str(src_path)
+
+  # 如果未请求缩放/转码，就直接走原图（保持你之前的强缓存行为）
+  want_auto = (fmt is None or fmt == "auto")
+  target_fmt = None
+  if want_auto:
+    target_fmt = "webp" if _client_supports_webp(request) else None
+  else:
+    f = (fmt or "").lower().strip()
+    if f in ("webp","jpeg","jpg","png"): target_fmt = "jpg" if f=="jpg" else f
+    else: target_fmt = None  # 未知 → 不转码
+
+  # 是否需要处理
+  need_resize = s is not None
+  need_transcode = target_fmt is not None and not src_mime.endswith(target_fmt)
+
+  if not need_resize and not need_transcode:
+    # 直接返回原图（带条件缓存）
+    inm = request.headers.get("if-none-match")
+    ims = request.headers.get("if-modified-since")
+    if inm == src_etag:
+      return Response(status_code=304, headers={
+        "ETag": src_etag, "Last-Modified": last_mod,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept",
+      })
+    if ims:
+      try:
+        ims_dt = parsedate_to_datetime(ims)
+        if int(os.stat(src_path).st_mtime) <= int(ims_dt.timestamp()):
+          return Response(status_code=304, headers={
+            "ETag": src_etag, "Last-Modified": last_mod,
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Vary": "Accept",
+          })
+      except Exception:
+        pass
+    return FileResponse(src_path, media_type=src_mime, headers={
+      "ETag": src_etag, "Last-Modified": last_mod,
       "Cache-Control": "public, max-age=31536000, immutable",
+      "Vary": "Accept",
     })
-  if ims:
-    try:
-      ims_dt = parsedate_to_datetime(ims)
-      if int(os.stat(path).st_mtime) <= int(ims_dt.timestamp()):
-        return Response(status_code=304, headers={
-          "ETag": etag,
-          "Last-Modified": last_mod,
-          "Cache-Control": "public, max-age=31536000, immutable",
-        })
-    except Exception:
-      pass
 
-  return FileResponse(path, media_type=mime, headers={
-    "ETag": etag,
-    "Last-Modified": last_mod,
-    "Cache-Control": "public, max-age=31536000, immutable",
-  })
+  # 生成缓存 key
+  st = os.stat(src_path)
+  key_raw = f"{vid_id}|{int(st.st_mtime)}|{st.st_size}|{s or 0}|{target_fmt or 'orig'}|{q}"
+  key_hash = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:20]
+  out_ext = ".webp" if (target_fmt == "webp") else (".jpg" if target_fmt in ("jpg","jpeg") else (".png" if target_fmt=="png" else _ext_from_mime(src_mime)))
+  cache_path = os.path.join(PREVIEW_CACHE_DIR, f"{vid_id}_{key_hash}{out_ext}")
+  etag = f'W/"prev-{key_hash}"'
+
+  # 条件缓存（对加工品）
+  inm = request.headers.get("if-none-match")
+  if inm == etag and os.path.isfile(cache_path):
+    return Response(status_code=304, headers={
+      "ETag": etag, "Last-Modified": last_mod,
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "Vary": "Accept",
+    })
+
+  # 命中文件缓存
+  if os.path.isfile(cache_path):
+    mime = mimetypes.guess_type(cache_path)[0] or "image/webp"
+    return FileResponse(cache_path, media_type=mime, headers={
+      "ETag": etag, "Last-Modified": last_mod,
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "Vary": "Accept",
+    })
+
+  # 需要生成：加锁防并发
+  lock = _get_cache_lock(cache_path)
+  with lock:
+    # 双检：可能别的请求已生成
+    if os.path.isfile(cache_path):
+      mime = mimetypes.guess_type(cache_path)[0] or "image/webp"
+      return FileResponse(cache_path, media_type=mime, headers={
+        "ETag": etag, "Last-Modified": last_mod,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept",
+      })
+
+    # 处理图像
+    try:
+      im = Image.open(src_path)
+    except Exception:
+      # 打不开 → 直接原图兜底
+      return FileResponse(src_path, media_type=src_mime, headers={
+        "ETag": src_etag, "Last-Modified": last_mod,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept",
+      })
+
+    # 判断动图
+    is_animated = getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1
+
+    def _resize_square(img):
+      """等比缩到最短边>=s，然后居中裁切 s×s；若 s 未给则原尺寸"""
+      if not s: return img
+      w, h = img.size
+      if w == 0 or h == 0: return img
+      # 先等比缩放使“短边”>= s（尽量少放大）
+      scale = max(s / float(min(w, h)), 1.0)
+      new_w, new_h = int(w * scale), int(h * scale)
+      if (new_w, new_h) != (w, h):
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+      # 居中裁切为 s×s
+      left = max((img.width - s) // 2, 0)
+      top  = max((img.height - s) // 2, 0)
+      right = left + s
+      bottom = top + s
+      img = img.crop((left, top, right, bottom))
+      return img
+
+    tmp_path = cache_path + ".tmp"
+
+    try:
+      if is_animated and (target_fmt == "webp"):
+        # 转 WebP 动图
+        frames = []
+        durations = []
+        try:
+          from PIL import ImageSequence
+          for f in ImageSequence.Iterator(im):
+            frame = f.convert("RGBA")
+            frame = _resize_square(frame)
+            frames.append(frame)
+            durations.append(f.info.get("duration", im.info.get("duration", 40)))
+        except Exception:
+          # 退化：取第一帧静态
+          frame = im.convert("RGBA")
+          frame = _resize_square(frame)
+          frames = [frame]
+          durations = [im.info.get("duration", 40)]
+        if not frames:
+          frames = [im.convert("RGBA")]
+          frames[0] = _resize_square(frames[0])
+          durations = [40]
+        frames[0].save(tmp_path, format="WEBP", save_all=True,
+                       append_images=frames[1:] if len(frames)>1 else None,
+                       duration=durations, loop=0, quality=q, method=6)
+      else:
+        # 静态图或不转码动图：导出为 webp/jpeg/png/或原格式
+        # 统一先转成 RGB(A) 以避免模式问题
+        fmt_out = ("WEBP" if target_fmt == "webp" else
+                   "JPEG" if target_fmt in ("jpg","jpeg") else
+                   "PNG"  if target_fmt == "png" else None)
+        base = im.convert("RGBA") if im.mode not in ("RGB","RGBA") else im
+        base = _resize_square(base) if need_resize else base
+        save_kwargs = {}
+        if fmt_out == "JPEG":
+          base = base.convert("RGB")
+          save_kwargs.update(dict(quality=q, progressive=True, optimize=True))
+        elif fmt_out == "WEBP":
+          save_kwargs.update(dict(quality=q, method=6))
+        elif fmt_out == "PNG":
+          save_kwargs.update(dict(optimize=True))
+        # 未指定 fmt_out → 按原后缀导出（尽量保真）
+        out_fmt_final = fmt_out or (im.format if im.format in ("PNG","JPEG","WEBP","GIF") else "PNG")
+        base.save(tmp_path, format=out_fmt_final, **save_kwargs)
+
+      # 原子落盘
+      os.replace(tmp_path, cache_path)
+      mime = mimetypes.guess_type(cache_path)[0] or "image/webp"
+      return FileResponse(cache_path, media_type=mime, headers={
+        "ETag": etag, "Last-Modified": last_mod,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept",
+      })
+    except Exception:
+      # 出错兜底：直接原图
+      try:
+        if os.path.exists(tmp_path):
+          os.remove(tmp_path)
+      except Exception:
+        pass
+      return FileResponse(src_path, media_type=src_mime, headers={
+        "ETag": src_etag, "Last-Modified": last_mod,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept",
+      })
 
 @app.get("/media/video/{vid_id}")
 def media_video(request: Request, vid_id: str):
@@ -361,7 +546,6 @@ def media_video(request: Request, vid_id: str):
   etag = _etag_for(path)
   last_mod = _last_modified_str(path)
 
-  # 条件缓存（虽然视频一般不会 304 命中，但加上无害且可复用）
   inm = request.headers.get("if-none-match")
   ims = request.headers.get("if-modified-since")
   if inm == etag:
@@ -387,7 +571,6 @@ def media_video(request: Request, vid_id: str):
   range_header = request.headers.get("range")
   rng, err = _parse_range_header(range_header, file_size) if range_header else (None, None)
 
-  # 无 Range：走 FileResponse（更省心，部分 server/平台可走 sendfile 快路径）
   if not rng:
     if err == "MULTI" or err in ("BAD", "OUT"):
       return Response(status_code=416, headers={
@@ -403,7 +586,6 @@ def media_video(request: Request, vid_id: str):
       "Cache-Control": "public, max-age=31536000, immutable",
     })
 
-  # 有 Range：单段 206
   start, end = rng
   length = end - start + 1
 

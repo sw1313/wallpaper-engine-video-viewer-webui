@@ -1,9 +1,8 @@
-/* app/static/style.css  (fs-28)
-   - 修复 Chrome 全屏下 overlay 被 <video> 遮挡：明确 z-index 分层 + :fullscreen 兼容处理
-   - 修正若干拼写：justify-content / line-height / min-width
+/* app/static/style.css  (fs-30)
+   - 全屏层级修复（保留）
+   - 新增：常显“已观看”按钮 .watched-btn（可点击切换）
 */
 
-/* ===== 基础 ===== */
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 html, body { height:100%; overflow-x:hidden; }
@@ -15,7 +14,7 @@ button { cursor:pointer; }
 a.link { color:#0059c9; text-decoration:none; }
 a.link:hover { text-decoration:underline; }
 
-/* ===== 顶部（手机不超宽，自动换行） ===== */
+/* ===== 顶部 ===== */
 .topbar {
   position: sticky; top:0; z-index:10;
   background:#f7f7f7; padding:10px;
@@ -32,7 +31,7 @@ a.link:hover { text-decoration:underline; }
 .controls select { flex:1 1 40%; }
 @media (min-width: 720px) {
   .controls { flex:0 0 auto; }
-  .controls input[type=search] { min-width:160px; flex:0 0 auto; } /* 修正：min-width */
+  .controls input[type=search] { min-width:160px; flex:0 0 auto; }
   .controls select { flex:0 0 auto; }
 }
 
@@ -43,7 +42,7 @@ a.link:hover { text-decoration:underline; }
 .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap:12px; padding:14px; user-select:none; width:100%; }
 @media (max-width: 640px) { .grid { grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; padding:10px; } }
 
-/* ===== 统一 tile ===== */
+/* ===== tile ===== */
 img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 .tile {
   position:relative; display:flex; flex-direction:column;
@@ -61,35 +60,49 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .tile .meta{
   padding:0 10px 10px; font-size:12px; color:#555; opacity:.9;
-  height:16px; line-height:16px; /* 修正：line-height */
+  height:16px; line-height:16px;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
 @media (max-width:640px){ .tile .meta{ display:none; } }
 
-/* 三点菜单 */
+/* ⋮ 菜单按钮（右上） */
 .tile .tile-menu{
   position:absolute; top:8px; right:8px;
   width:28px; height:28px; border:none; border-radius:14px;
   background:rgba(255,255,255,.42); color:#222;
   display:flex; align-items:center; justify-content:center; font-size:18px;
   box-shadow:0 1px 4px rgba(0,0,0,.12);
+  pointer-events:auto;
 }
 .tile .tile-menu:hover{ background:rgba(255,255,255,.62); }
 
-/* ✅ 已完成徽标（左上角带圈勾） */
-.status-badge{
+/* ✅ 常显“已观看”按钮（左上） */
+.watched-btn{
   position:absolute; z-index:3;
   top:8px; left:8px;
-  width:22px; height:22px; border-radius:22px;
-  border:2px solid rgba(0,0,0,.35);
-  background:rgba(255,255,255,.92);
-  color:#0b7d0b; font-weight:700; font-size:14px; line-height:18px;
+  width:26px; height:26px; border-radius:14px;
+  border:1px solid rgba(0,0,0,.25);
+  background:rgba(255,255,255,.35);
+  color:#888; font-weight:700; font-size:16px; line-height:1;
   display:flex; align-items:center; justify-content:center;
-  box-shadow:0 2px 8px rgba(0,0,0,.15);
-  opacity:0; transform:scale(.9);
-  transition: opacity .15s ease, transform .15s ease;
+  box-shadow:0 2px 6px rgba(0,0,0,.10);
+  opacity:.35;                /* 未观看：高透明 */
+  transition:opacity .15s ease, transform .12s ease, background .15s ease, color .15s ease, border-color .15s ease;
+  pointer-events:auto;        /* 一定要可点 */
 }
-.status-badge.done{ opacity:1; transform:scale(1); }
+.watched-btn:hover{ opacity:.9; transform:scale(1.05); }
+.watched-btn.off{               /* 未观看 */
+  background:rgba(255,255,255,.35);
+  color:#888;
+  border-color:rgba(0,0,0,.25);
+  opacity:.35;
+}
+.watched-btn.on{                /* 已观看：低透明 + 颜色 */
+  background:rgba(8,160,44,.12);
+  color:#0b7d0b;
+  border-color:rgba(8,160,44,.35);
+  opacity:.95;
+}
 
 /* 选中/动画 */
 .tile.selected { border-color:#00aaff; box-shadow: 0 0 0 2px rgba(0,170,255,.35) inset; }
@@ -114,38 +127,30 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   background: rgba(0,170,255,.13); pointer-events:none;
 }
 
-/* ===============================
-   全屏播放器容器 + 分层（关键修复）
-   =============================== */
+/* ============ 全屏播放器容器 + 分层（关键修复） ============ */
 .playerfs{
   position:fixed; left:0; top:0; width:100vw; height:100vh; background:#000;
-  z-index:1200; display:flex; align-items:center; justify-content:center; /* 修正：justify-content */
+  z-index:1200; display:flex; align-items:center; justify-content:center;
 }
-/* 让 video 成为明确的较低层（避免合成层把兄弟元素盖住） */
 .playerfs video{
   position:absolute; left:0; top:0; width:100vw; height:100vh;
-  object-fit:contain; z-index:10;
-  background:#000;
+  object-fit:contain; z-index:10; background:#000;
 }
-/* 覆盖层容器始终在 video 之上 */
 .overlay{
   position:absolute; left:0; top:0; width:100vw; height:100vh;
   pointer-events:none; z-index:20;
 }
-
-/* 遮罩与控件层次（overlay 上的按钮要再高一些） */
 .icon-btn{
   pointer-events:auto; position:fixed; top:14px; width:38px; height:38px; border-radius:38px;
   background:rgba(255,255,255,.75); color:#111; border:none; font-size:18px;
   display:flex; align-items:center; justify-content:center; box-shadow:0 2px 10px rgba(0,0,0,.2);
-  opacity:.85; transition:opacity .2s ease; z-index:30; /* 提升到 overlay 之上 */
+  opacity:.85; transition:opacity .2s ease; z-index:30;
 }
 .icon-btn:hover{ opacity:1; }
 .icon-btn.back{ left:14px; }
 .icon-btn.menu{ right:14px; }
 .playerfs.idle .icon-btn{ opacity:0; }
 
-/* 遮罩与播放列表再往上叠 */
 .shade{
   position:fixed; left:0; top:0; width:100%; height:100%;
   background: rgba(0,0,0,.25);
@@ -156,7 +161,6 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .shade.hidden{ display:none; }
 
-/* ✅ 居中模态播放列表 */
 .playlist{
   position:fixed; left:50%; transform:translateX(-50%);
   top:60px; bottom:14px;
@@ -167,9 +171,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   z-index:33;
 }
 .playlist.hidden{ display:none; }
-@media (min-width: 1024px){
-  .playlist{ width:360px; }
-}
+@media (min-width: 1024px){ .playlist{ width:360px; } }
 .plist-header{ padding:10px 12px; font-weight:600; border-bottom:1px solid #eee; background:#fafafa; }
 #plist{ list-style:none; margin:0; padding:0; overflow:auto; }
 #plist li{ display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid #f1f1f1; cursor:pointer; }
@@ -178,39 +180,22 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 #plist .dot{ width:8px; height:8px; border-radius:8px; background:#bbb; }
 #plist li.active .dot{ background:#007fff; }
 
-/* 播放列表弹出期间，彻底禁用视频的指针与触摸手势 */
 .playerfs.locked{ touch-action:none; overscroll-behavior:contain; }
 .playerfs.locked video{ pointer-events:none; }
 
-/* 无限滚动状态条 & 触底哨兵 */
 .inf-status{ text-align:center; padding:12px 10px; color:#666; font-size:13px; }
 .sentinel{ width:100%; height:1px; }
 
-/* ===============================
-   ▶︎ Chrome 全屏兼容：:fullscreen / :-webkit-full-screen
-   强制 overlay/按钮/列表 在最顶层
-   =============================== */
+/* 全屏 :fullscreen / :-webkit-full-screen 提升层级 */
 #playerFS:fullscreen,
-#playerFS:-webkit-full-screen{
-  z-index:2147483638; /* 远高于页面其它层 */
-}
+#playerFS:-webkit-full-screen{ z-index:2147483638; }
 #playerFS:fullscreen video,
-#playerFS:-webkit-full-screen video{
-  z-index:10;
-}
+#playerFS:-webkit-full-screen video{ z-index:10; }
 #playerFS:fullscreen .overlay,
-#playerFS:-webkit-full-screen .overlay{
-  z-index:20;
-}
+#playerFS:-webkit-full-screen .overlay{ z-index:20; }
 #playerFS:fullscreen .icon-btn,
-#playerFS:-webkit-full-screen .icon-btn{
-  z-index:30;
-}
+#playerFS:-webkit-full-screen .icon-btn{ z-index:30; }
 #playerFS:fullscreen .shade,
-#playerFS:-webkit-full-screen .shade{
-  z-index:32;
-}
+#playerFS:-webkit-full-screen .shade{ z-index:32; }
 #playerFS:fullscreen .playlist,
-#playerFS:-webkit-full-screen .playlist{
-  z-index:33;
-}
+#playerFS:-webkit-full-screen .playlist{ z-index:33; }
