@@ -5,7 +5,20 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
   <meta name="theme-color" content="#ffffff"/>
   <title>Wallpaper WebUI</title>
-  <!-- 样式沿用 -->
+
+  <!-- 一次性卸载旧 Service Worker 并清 Cache（放最前，避免旧 SW 抢先接管） -->
+  <script>
+  (function killSW(){
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.getRegistrations()
+      .then(regs => regs.forEach(r => r.unregister()))
+      .catch(()=>{});
+    if (window.caches && caches.keys) {
+      caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k)))).catch(()=>{});
+    }
+  })();
+  </script>
+
   <link rel="stylesheet" href="/static/style.css?v=fs-23"/>
 </head>
 <body>
@@ -40,8 +53,8 @@
 
   <!-- 全屏播放器容器 -->
   <div id="playerFS" class="playerfs" style="display:none;">
-    <!-- 前台用 video 播放；务必 playsinline / webkit-playsinline，避免 iOS 强制系统全屏 -->
-    <video id="fsVideo" controls playsinline webkit-playsinline preload="metadata" crossorigin="anonymous"></video>
+    <!-- 同源直取：去掉 crossorigin；保留 playsinline -->
+    <video id="fsVideo" controls playsinline webkit-playsinline preload="metadata"></video>
 
     <div id="overlay" class="overlay">
       <div id="shade" class="shade hidden" aria-hidden="true"></div>
@@ -56,14 +69,13 @@
     </div>
   </div>
 
-  <!-- 🔊 后台/息屏专用的隐藏 audio（注意：不能 display:none；放到视口外、极小尺寸） -->
+  <!-- 后台/息屏音频：去掉 autoplay 与 crossorigin -->
   <audio id="bgAudio"
-         preload="auto" autoplay playsinline
-         crossorigin="anonymous"
+         preload="auto" playsinline
          style="position:fixed; left:-9999px; top:-9999px; width:1px; height:1px; opacity:0.001; pointer-events:none;">
   </audio>
 
-  <!-- 升级 JS 版本，强制缓存刷新 -->
-  <script src="/static/app.js?v=fs-28"></script>
+  <!-- 强制刷新脚本缓存（版本号更新即可） -->
+  <script src="/static/app.js?v=fs-31b"></script>
 </body>
 </html>
