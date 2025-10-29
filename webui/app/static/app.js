@@ -1,10 +1,9 @@
-/* app/static/app.js (fs-31 + bg-stable-4b: first-hidden dedupe fix + bg-next autostart fix)
-   - 最小化修复：
-     1) 首次后台双播：脚本加载即禁用 bgAudio.autoplay；首次 hidden 若并发播放仅静音 video（不暂停），回前台还原
-     2) 后台切下一集不自动播：当 audio.src 变更时，显式 a.load() 再 play()
-   - 保留：后台自动切集三重保险（ended直切 + near-end兜底 + 看门狗）
+/* app/static/app.js (fs-32+repair-2)
+   - 修复：faststart 后统一通过 playIndex 重启当前条目，避免显示成上一集
+   - 新增：playIndex(i,{cacheBust,resumeAt}) + setSrcAndLoad()
+   - 保持：stalled/首帧超时触发修复、后台看门狗、UA/可见性处理等
 */
-console.log("app.js version fs-31+bg-stable-4b");
+console.log("app.js version fs-32+repair-2");
 
 /* ---- 全局状态 ---- */
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
@@ -568,7 +567,6 @@ async function progressivePlayFolder(path){
   await syncWatched(all.map(x=>x.id));
   if (!all.length){ alert("该文件夹没有可播放视频"); return; }
   const initial = all.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, all.length));
-  if (!初始长度){/* 兼容中文变量误写防止编译错误 */} // no-op
   if (!initial.length){ alert("该文件夹没有未完成的视频"); return; }
   await startPlaylist(initial, 0, path);
   progressive.seen = new Set(player.ids);
@@ -617,10 +615,9 @@ function getCurrentlyLoadedVideoItems(){
 let fsOverlayInHistory = false;
 let playbackMode = "video";
 const media = { v:null, a:null };
-
 function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
 
-/* === 关键修复 1：脚本加载即刻禁用 bgAudio.autoplay（避免第一次息屏抢跑） === */
+/* === 预防 bgAudio 首次抢跑 === */
 (function disableBgAutoplayEarly(){
   const a = $("bgAudio");
   if (a){
@@ -666,7 +663,7 @@ installPopStateGuard();
 /* 播放封装 */
 async function safePlay(el){ try { await el.play(); return true; } catch { return false; } }
 
-/* ====== 后台“看门狗”：防止 ended/timeupdate 被节流 ====== */
+/* ====== 后台“看门狗” ====== */
 const bgAdvanceGuard = { timer:null };
 function startBgAdvanceGuard(){
   if (bgAdvanceGuard.timer) return;
@@ -690,7 +687,7 @@ async function switchToAudio(){
   const a = media.a || $("bgAudio");
   media.v = v; media.a = a;
   const src = v.src || `/media/video/${player.ids[player.index]}`;
-  if (a.src !== src) { a.src = src; try{ a.load(); }catch(_){ } } // ★ 变更点：src 改变时显式 load()
+  if (a.src !== src) { a.src = src; try{ a.load(); }catch(_){ } }
   try { if (!isNaN(v.currentTime)) a.currentTime = v.currentTime; } catch(_){}
   const ok = await playWithMutedHack(a, {force: document.visibilityState === "hidden"});
   if (ok){
@@ -713,16 +710,15 @@ async function switchToVideo(){
   } else { showNotice("恢复前台播放被阻止，点一下屏幕"); installUserGestureUnlock(); }
 }
 
-/* === 关键修复 2：仅限“第一次隐藏”去重音（不改变顺序，不暂停 video） === */
+/* === 仅第一次隐藏静音 video 去重 === */
 let firstHiddenHandled = false;
 let videoMutedByFirstHiddenFix = false;
 
-/* 可见性监听：隐藏→音频；可见→视频 */
+/* 可见性监听 */
 document.addEventListener("visibilitychange", async ()=>{
   if (!isPlayerActive()) return;
 
   if (document.visibilityState === "hidden") {
-    // 再次确保 autoplay 关闭（防止极端时序）
     const a0 = $("bgAudio"); if (a0){ try{ a0.autoplay=false; a0.removeAttribute && a0.removeAttribute("autoplay"); }catch(_){ } }
 
     await switchToAudio();
@@ -730,7 +726,6 @@ document.addEventListener("visibilitychange", async ()=>{
     if (!ok){ showNotice("后台播放被阻止，需要点击以继续"); installUserGestureUnlock(); }
     startBgAdvanceGuard();
 
-    // 仅第一次隐藏：若 video 与 audio 同时在播，则只静音 video（不暂停）
     if (!firstHiddenHandled){
       const v = media.v || $("fsVideo");
       const a = media.a || $("bgAudio");
@@ -741,14 +736,12 @@ document.addEventListener("visibilitychange", async ()=>{
     }
 
   } else {
-    // 回到前台：先确保 bgAudio 不抢跑
     try{ const a=$("bgAudio"); a.autoplay=false; a.pause(); }catch(_){}
     await switchToVideo();
     const ok = await safePlay(media.v||$("fsVideo"));
     if (!ok){ showNotice("恢复前台播放被阻止，点击屏幕继续"); installUserGestureUnlock(); }
     stopBgAdvanceGuard();
 
-    // 仅当我们为“第一次隐藏”做过静音时，恢复之
     if (videoMutedByFirstHiddenFix){
       const v = media.v || $("fsVideo");
       try{ v.muted = false; }catch(_){}
@@ -768,9 +761,7 @@ function advanceToNextOnce(){
   markWatched(curId);
   nextInPlaylist();
 }
-// 结束事件：谁结束谁触发
 function handleEndedFromAny(){ advanceToNextOnce(); }
-/* audio near-end 兜底：后台节流时也能切集（2s 阈值；timeupdate + progress） */
 function installAudioNearEndDetector(a){
   if (a._nearEndBound) return; a._nearEndBound = true;
   const check = ()=>{
@@ -799,7 +790,7 @@ function setMediaSessionMeta(id){
     });
   } catch(_){}
   if (!setMediaSessionMeta._installed){
-    const getActive = ()=> (playbackMode==="video" ? media.v || $("fsVideo") : media.a || $("bgAudio"));
+    const getActive = ()=> (playbackMode==="video" ? (media.v||$("fsVideo")) : (media.a||$("bgAudio")));
     navigator.mediaSession.setActionHandler("play", async ()=>{ const el=getActive(); await playWithMutedHack(el); });
     navigator.mediaSession.setActionHandler("pause", ()=>{ try{ getActive().pause(); }catch(_){ } });
     navigator.mediaSession.setActionHandler("previoustrack", async ()=>{ if (player.index>0) await playIndex(player.index-1); });
@@ -813,8 +804,103 @@ function setMediaSessionMeta(id){
 }
 function updateMediaSessionPlaybackState(){
   if (!("mediaSession" in navigator)) return;
-  const el = (playbackMode==="video" ? media.v || $("fsVideo") : media.a || $("bgAudio"));
+  const el = (playbackMode==="video" ? (media.v||$("fsVideo")) : (media.a||$("bgAudio")));
   try { navigator.mediaSession.playbackState = el.paused ? "paused" : "playing"; } catch(_){}
+}
+
+/* =========================================================
+   🔧 stalled/首帧超时 → 自动修复（最多一次）
+   ========================================================= */
+const stallRepair = {
+  inFlight: false,
+  tried: new Set(),
+  timer: null,
+  detach: null,
+};
+function installStallListeners(v, a){
+  if (!v._stallBound){
+    const vh = async ()=> await maybeRepairFromEl('video', v);
+    v.addEventListener('stalled', vh);
+    v.addEventListener('waiting', vh);
+    v.addEventListener('error',   vh);
+    v._stallBound = true;
+  }
+  if (!a._stallBound){
+    const ah = async ()=> await maybeRepairFromEl('audio', a);
+    a.addEventListener('stalled', ah);
+    a.addEventListener('waiting', ah);
+    a.addEventListener('error',   ah);
+    a._stallBound = true;
+  }
+}
+async function maybeRepairFromEl(which, el){
+  if (!isPlayerActive()) return;
+  const id = player.ids[player.index];
+  if (!id || stallRepair.inFlight || stallRepair.tried.has(String(id))) return;
+  const early = (el.currentTime || 0) < 1.0;
+  const starving = (el.readyState || 0) < 3;
+  if (!(early || starving)) return;
+  await triggerRepair(id, el.currentTime || 0);
+}
+function armFirstPlayWatch(id, el){
+  disarmFirstPlayWatch();
+  let started = false;
+  const onPlaying = ()=>{ started = true; disarmFirstPlayWatch(); };
+  const onProgress = ()=>{ if ((el.currentTime||0) >= 0.25){ started = true; disarmFirstPlayWatch(); } };
+  el.addEventListener('playing', onPlaying, {once:true});
+  el.addEventListener('timeupdate', onProgress);
+  stallRepair.detach = ()=>{
+    try{ el.removeEventListener('timeupdate', onProgress); }catch(_){}
+  };
+  stallRepair.timer = setTimeout(()=>{
+    if (!started && !stallRepair.tried.has(String(id))) triggerRepair(id, el.currentTime||0);
+  }, 3500);
+}
+function disarmFirstPlayWatch(){
+  if (stallRepair.timer){ clearTimeout(stallRepair.timer); stallRepair.timer=null; }
+  if (stallRepair.detach){ try{ stallRepair.detach(); }catch(_){ } stallRepair.detach=null;
+  }
+}
+async function triggerRepair(id, resumeAt){
+  stallRepair.inFlight = true;
+  stallRepair.tried.add(String(id));
+  showNotice("正在修复该视频（无损重封装）…");
+  try{
+    const r = await fetch(`/api/faststart/${id}`, { method:"POST" });
+    if (r && r.ok){
+      await playIndex(player.index, { cacheBust:true, resumeAt: resumeAt||0 }); // ★ 关键：统一走 playIndex
+      showNotice("已修复，正在重新播放…");
+      setTimeout(clearNotice, 1200);
+    } else {
+      showNotice("修复失败：无法完成 faststart");
+      setTimeout(clearNotice, 2000);
+    }
+  }catch(_){
+    showNotice("修复失败：网络或权限问题");
+    setTimeout(clearNotice, 2000);
+  }finally{
+    stallRepair.inFlight = false;
+  }
+}
+
+/* ===== 工具：设置媒体源并在 loadedmetadata 后续播 ===== */
+async function setSrcAndLoad(v, a, src, resumeAt=0){
+  try{ v.src = src; v.load(); }catch(_){}
+  try{ a.src = src; a.load(); }catch(_){}
+  if (resumeAt > 0){
+    const set = (el)=>{ try{ el.currentTime = resumeAt; }catch(_){} };
+    const waitV = new Promise(res=>{
+      const h = ()=>{ v.removeEventListener('loadedmetadata', h); set(v); res(); };
+      v.addEventListener('loadedmetadata', h, {once:true});
+      setTimeout(()=>{ try{ v.removeEventListener('loadedmetadata', h);}catch(_){}; set(v); res(); }, 500);
+    });
+    const waitA = new Promise(res=>{
+      const h = ()=>{ a.removeEventListener('loadedmetadata', h); set(a); res(); };
+      a.addEventListener('loadedmetadata', h, {once:true});
+      setTimeout(()=>{ try{ a.removeEventListener('loadedmetadata', h);}catch(_){}; set(a); res(); }, 500);
+    });
+    await Promise.all([waitV, waitA]);
+  }
 }
 
 /* ===== 全屏播放器 ===== */
@@ -838,10 +924,10 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
     v.addEventListener("ended", ()=> handleEndedFromAny(v));
     a.addEventListener("ended", ()=> handleEndedFromAny(a));
     installAudioNearEndDetector(a);
+    installStallListeners(v, a); // 绑定 stalled 修复监听
     v._bound = a._bound = true;
   }
 
-  // 进入全屏时，确保 bgAudio 不会“抢跑”
   try{ a.autoplay = false; a.pause(); }catch(_){}
 
   try { 
@@ -862,6 +948,12 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
     else hidePlaylistPanel();
   };
 
+  const wakeOverlay = ()=>{
+    const wrap = $("playerFS");
+    wrap.classList.remove("idle");
+    if (player.idleTimer) clearTimeout(player.idleTimer);
+    player.idleTimer = setTimeout(()=> wrap.classList.add("idle"), 1500);
+  };
   wrap.addEventListener("mousemove", wakeOverlay);
   wrap.addEventListener("touchstart", wakeOverlay);
   wakeOverlay();
@@ -870,24 +962,19 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
 
   await playIndex(player.index);
 }
-function wakeOverlay(){
-  const wrap = $("playerFS");
-  wrap.classList.remove("idle");
-  if (player.idleTimer) clearTimeout(player.idleTimer);
-  player.idleTimer = setTimeout(()=> wrap.classList.add("idle"), 1500);
-}
 
-async function playIndex(i){
+async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   player.index = i;
   lastAdvanceId = null;
+  disarmFirstPlayWatch();
 
   const id = player.ids[i];
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
 
-  const src = `/media/video/${id}`;
-  v.src = src;
-  if (a.src !== src) { a.src = src; try{ a.load(); }catch(_){ } } // ★ 变更点：src 改变时显式 load()
+  const bust = cacheBust ? `?v=${Date.now()}` : "";
+  const src = `/media/video/${id}${bust}`;
+  await setSrcAndLoad(v, a, src, resumeAt);
 
   setMediaSessionMeta(id);
 
@@ -897,16 +984,18 @@ async function playIndex(i){
     const ok = await playWithMutedHack(a, {force:true});
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
     startBgAdvanceGuard();
-
+    armFirstPlayWatch(id, a);
   } else {
     playbackMode = "video";
     try{ a.autoplay=false; a.pause(); }catch(_){}
     const ok = await safePlay(v);
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
     stopBgAdvanceGuard();
+    armFirstPlayWatch(id, v);
   }
   renderPlaylistPanel();
 }
+
 function renderPlaylistPanel(){
   const ul = $("plist"); ul.innerHTML = "";
   player.ids.forEach((id, i)=>{
@@ -921,6 +1010,7 @@ async function nextInPlaylist(){ if (player.index < player.ids.length - 1) await
 async function exitPlayer(){
   cancelProgressive();
   hidePlaylistPanel();
+  disarmFirstPlayWatch();
   try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
   const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
   try { v.pause(); } catch(_){}
@@ -929,7 +1019,6 @@ async function exitPlayer(){
   wrap.style.display = "none";
   $("playlistPanel").classList.add("hidden");
   stopBgAdvanceGuard();
-  // 善后：若因为“第一次隐藏”曾静音 video，退出时恢复
   if (videoMutedByFirstHiddenFix){
     try{ v.muted = false; }catch(_){}
     videoMutedByFirstHiddenFix = false;
@@ -937,6 +1026,7 @@ async function exitPlayer(){
 }
 
 /* 框选 & 快捷键 */
+let rubberBound=false;
 function bindRubber(){
   if (rubberBound) return; rubberBound = true;
   const rb = $("rubber");

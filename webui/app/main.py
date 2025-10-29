@@ -1,5 +1,5 @@
-# app/main.py (fs-31 + moov@tail faststart cache + logging + probe + stronger CORS/info headers)
-import os, math, mimetypes, re, sqlite3, threading, io, hashlib, struct, subprocess, logging
+# app/main.py (fs-31 + inplace faststart on-demand, no moov detection)
+import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
@@ -23,11 +23,6 @@ from .we_scan import (
     collect_unassigned_items, find_node_by_path, all_ids_recursive, delete_id_dir
 )
 from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest
-
-# ---------- Logging ----------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("wallpaper-webui")
 
 # === 可配置路径 ===
 WORKSHOP_PATH = os.getenv("WORKSHOP_PATH", "/data/workshop/content/431960")
@@ -67,19 +62,6 @@ def _get_cache_lock(path: str) -> threading.Lock:
         if path not in _cache_locks:
             _cache_locks[path] = threading.Lock()
         return _cache_locks[path]
-
-# ========= faststart 转码缓存 =========
-TRANSCODE_CACHE_DIR = os.getenv("TRANSCODE_CACHE_DIR", os.path.join(DATA_DIR, "transcode_cache"))
-os.makedirs(TRANSCODE_CACHE_DIR, exist_ok=True)
-logger.info("TRANSCODE_CACHE_DIR = %s", TRANSCODE_CACHE_DIR)
-_transcode_locks = {}
-_transcode_global_lock = threading.Lock()
-
-def _get_transcode_lock(path: str) -> threading.Lock:
-    with _transcode_global_lock:
-        if path not in _transcode_locks:
-            _transcode_locks[path] = threading.Lock()
-        return _transcode_locks[path]
 
 # ========= FastAPI 应用 =========
 app = FastAPI(title="Wallpaper WebUI")
@@ -301,188 +283,93 @@ def api_playlist(req: PlaylistRequest):
   })
 
 # =======================
-# 工具：容器与编解码嗅探（+尾部扫描）
+# 无检测：按需就地 faststart 重封装并覆盖原文件
 # =======================
-def _sniff_container_mime(path: str) -> Tuple[str|None, str, str]:
-  try:
-    with open(path, "rb") as f:
-      b = f.read(4096)
-  except Exception:
-    return None, "unknown", "open-failed"
-  if len(b) < 12:
-    return None, "unknown", "too-short"
+_repair_locks = {}
+_repair_global_lock = threading.Lock()
 
-  # Matroska / WebM (EBML)
-  if b.startswith(b"\x1a\x45\xdf\xa3"):
-    low = b.lower()
-    if b"webm" in low:      return "video/webm", "webm", "ebml-webm"
-    if b"matroska" in low:  return "video/x-matroska", "matroska", "ebml-matroska"
-    return "video/x-matroska", "matroska", "ebml"
+def _get_repair_lock(path: str) -> threading.Lock:
+  with _repair_global_lock:
+    if path not in _repair_locks:
+      _repair_locks[path] = threading.Lock()
+    return _repair_locks[path]
 
-  # MP4 / QuickTime ('ftyp')
-  if b[4:8] == b"ftyp" or b"ftyp" in b[:64]:
-    brand = b[8:12]
-    if brand == b"qt  ":
-      return "video/quicktime", "mp4", "ftyp-qt"
-    return "video/mp4", "mp4", "ftyp"
-
-  if b.startswith(b"RIFF") and b[8:12] == b"AVI ": return "video/x-msvideo", "avi", "riff-avi"
-  if b.startswith(b"FLV"):                          return "video/x-flv", "flv", "flv"
-  if b.startswith(b"OggS"):                         return "video/ogg", "ogg", "ogg"
-  if b.startswith(b"\x47"):                         return "video/mp2t", "ts", "ts"
-  if b[:4] == b"\x00\x00\x01\xba":                  return "video/mpeg", "ps", "ps"
-
-  return mimetypes.guess_type(path)[0], "unknown", "guess-by-ext"
-
-def _sniff_mp4_codecs(path: str) -> str:
-  """扫 mp4 前/后 2MB 常见四字码，返回 'avc1;mp4a' / 'hvc1;ec-3' / 'av01;opus' 等，仅用于调试。"""
-  try:
-    size = os.path.getsize(path)
-    with open(path, "rb") as f:
-      head = f.read(min(2 * 1024 * 1024, size))
-      tail = b""
-      if size > 2 * 1024 * 1024:
-        f.seek(max(0, size - 2 * 1024 * 1024))
-        tail = f.read(2 * 1024 * 1024)
-      blob = head + tail
-  except Exception:
-    return ""
-  video_marks = [b"avc1", b"hvc1", b"hev1", b"av01", b"vp09", b"vp08"]
-  audio_marks = [b"mp4a", b"ac-3", b"ec-3", b"opus", b"alac", b"flac"]
-  vids = sorted({m.decode() for m in video_marks if m in blob})
-  auds = sorted({m.decode() for m in audio_marks if m in blob})
-  parts = []
-  if vids: parts.append(",".join(vids))
-  if auds: parts.append(",".join(auds))
-  return ";".join(parts)
-
-# =======================
-# MP4 moov 尾部检测 & faststart 缓存
-# =======================
-def _moov_atom_end_offset(path: str) -> int | None:
-  """返回 moov atom 的结束偏移（end-exclusive），遍历顶层 atoms（支持 32/64-bit size）。"""
-  try:
-    with open(path, "rb") as f:
-      file_size = os.path.getsize(path)
-      offset = 0
-      while offset + 8 <= file_size:
-        f.seek(offset)
-        header = f.read(8)
-        if len(header) < 8:
-          return None
-        size32, atype = struct.unpack(">I4s", header)
-        try:
-          atype = atype.decode("ascii")
-        except Exception:
-          atype = ""
-        if size32 == 0:
-          offset_next = file_size
-        elif size32 == 1:
-          ext = f.read(8)
-          if len(ext) < 8:
-            return None
-          (size64,) = struct.unpack(">Q", ext)
-          offset_next = offset + size64
-        else:
-          offset_next = offset + size32
-        if atype == "moov":
-          return offset_next
-        if offset_next <= offset or offset_next > file_size:
-          return None
-        offset = offset_next
-  except Exception:
-    return None
-  return None
-
-def _moov_at_end(path: str, tolerance: int = 4 * 1024 * 1024) -> bool:
+def _faststart_inplace(src_path: str) -> dict:
   """
-  True → moov 在尾部（EOF 前 <= tolerance 字节）。
-  False → moov 不在尾部 / 未能解析（不触发 faststart）。
+  无损重封装：-c copy -movflags +faststart
+  生成同目录临时文件，成功后 os.replace 覆盖原文件。
+  返回 {ok, before, after, tmp, out}
   """
-  moov_end = _moov_atom_end_offset(path)
-  if moov_end is None:
-    logger.debug("[faststart] moov not found/parse failed: %s", path)
-    return False
-  file_size = os.path.getsize(path)
-  tail = file_size - moov_end
-  logger.debug("[faststart] moov_end=%d, file=%d, tail=%d", moov_end, file_size, tail)
-  return tail >= 0 and tail <= tolerance
+  src_path = os.path.abspath(src_path)
+  if not os.path.isfile(src_path):
+    return {"ok": False, "error": "source-not-found", "path": src_path}
 
-def _faststart_cached_path(src_path: str) -> str | None:
-  """
-  若需 faststart（moov 在尾部）→ 生成/返回缓存路径；否则返回 None。
-  具备：并发互斥、双检、原子落盘、失败回退、详细日志。
-  """
-  low = src_path.lower()
-  if not (low.endswith(".mp4") or low.endswith(".m4v") or low.endswith(".mov") or low.endswith(".qt")):
-    logger.debug("[faststart] skip (ext not mp4/m4v/mov/qt): %s", src_path)
-    return None
+  before = os.path.getsize(src_path)
+  src = Path(src_path)
+  # 输出容器尽量与扩展名一致：.mp4/.m4v 用 -f mp4；其他交给 ffmpeg 根据扩展名判断
+  force_mp4 = src.suffix.lower() in (".mp4", ".m4v")
+  tmp_path = str(src.with_suffix(src.suffix + ".faststart.tmp"))
 
-  try:
-    need_faststart = _moov_at_end(src_path)  # True => 需要 faststart
-  except Exception as e:
-    logger.warning("[faststart] moov check error: %s [%s]", src_path, e)
-    return None
-
-  logger.info("[faststart] %s need_faststart=%s", src_path, need_faststart)
-  if not need_faststart:
-    return None
-
-  # 缓存 key
-  try:
-    st = os.stat(src_path)
-    key_raw = f"{os.path.basename(src_path)}|{st.st_ino}|{st.st_size}|{int(st.st_mtime)}"
-  except Exception:
-    key_raw = f"{os.path.basename(src_path)}|{os.path.getsize(src_path)}|{int(os.path.getmtime(src_path))}"
-  key = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:20]
-  cache_path = os.path.join(TRANSCODE_CACHE_DIR, f"{key}.mp4")
-  tmp_path = cache_path + ".tmp"
-
-  if os.path.isfile(cache_path):
-    logger.info("[faststart] cache hit: %s", cache_path)
-    return cache_path
-
-  lock = _get_transcode_lock(cache_path)
-  with lock:
-    if os.path.isfile(cache_path):
-      logger.info("[faststart] cache hit(after-lock): %s", cache_path)
-      return cache_path
-
-    # 检查 ffmpeg
-    try:
-      subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-      logger.warning("[faststart] ffmpeg not found; skip faststart for %s", src_path)
-      return None
-
-    Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
+  cmd = [
       "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
       "-i", src_path,
+      "-map", "0", "-dn",
       "-c", "copy",
       "-movflags", "+faststart",
-      tmp_path
-    ]
-    logger.info("[faststart] running: %s", " ".join(cmd))
+  ]
+  if force_mp4:
+      cmd += ["-f", "mp4"]
+  cmd += [tmp_path]
+
+  lock = _get_repair_lock(src_path)
+  with lock:
+    # 若存在上次失败残留的 tmp，先尝试删除
+    try:
+      if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    except Exception:
+      pass
+
     try:
       subprocess.run(cmd, check=True)
-      os.replace(tmp_path, cache_path)
-      logger.info("[faststart] success -> %s", cache_path)
-      return cache_path
+      # 成功：原子替换
+      os.replace(tmp_path, src_path)
+      after = os.path.getsize(src_path)
+      return {"ok": True, "before": before, "after": after, "out": src_path}
     except subprocess.CalledProcessError as e:
-      logger.error("[faststart] ffmpeg failed(code=%s) for %s", getattr(e, "returncode", "?"), src_path)
       try:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+          os.remove(tmp_path)
       except Exception:
         pass
-      return None
+      return {"ok": False, "error": f"ffmpeg-failed:{e}", "path": src_path}
     except Exception as e:
-      logger.error("[faststart] unexpected error: %s", e)
       try:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+          os.remove(tmp_path)
       except Exception:
         pass
-      return None
+      return {"ok": False, "error": f"exception:{e}", "path": src_path}
+
+@app.post("/api/faststart/{vid_id}")
+def api_faststart_inplace(vid_id: str):
+  """
+  前端在 <video> 触发 stalled（或手动点击“修复播放”）时调用：
+  1) 就地无损重封装为 faststart；
+  2) 覆盖原文件；
+  3) 返回结果，前端拿到 ok 后重新加载播放即可。
+  """
+  _, id_map, _ = _scan_state()
+  v = id_map.get(vid_id)
+  if not v:
+    raise HTTPException(404, detail="video-not-found")
+  res = _faststart_inplace(v.video_path)
+  status = 200 if res.get("ok") else 500
+  return Response(
+    content=(str(res).replace("'", '"')),
+    media_type="application/json",
+    status_code=status
+  )
 
 # =======================
 # 媒体传输（预览 & 视频）
@@ -526,7 +413,7 @@ def _parse_range_header(range_header: str, file_size: int):
     return None, "BAD"
   return (start, end), None
 
-# ======= 预览图（保持你原始逻辑，略） =======
+# ======= 预览图（新增：缩放/转码/缓存） =======
 def _client_supports_webp(request: Request) -> bool:
   accept = request.headers.get("accept", "")
   return "image/webp" in accept.lower()
@@ -544,17 +431,20 @@ def media_preview(vid_id: str, request: Request,
                   s: int | None = Query(default=None, ge=32, le=2048, description="方形缩略图边长"),
                   fmt: str | None = Query(default=None, description="webp|jpeg|png|auto"),
                   q: int = Query(default=80, ge=10, le=100)):
-  from PIL import Image, ImageSequence
+  # 构建原图信息
+  from PIL import Image, ImageSequence  # 需要 pillow
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
   if not v: raise HTTPException(404)
   src_path = v.preview_path
 
+  # 基础元数据
   src_mime, _ = mimetypes.guess_type(src_path)
   src_mime = src_mime or "image/gif"
   src_etag = _etag_for(src_path)
   last_mod = _last_modified_str(src_path)
 
+  # 如果未请求缩放/转码，就直接走原图（保持你之前的强缓存行为）
   want_auto = (fmt is None or fmt == "auto")
   target_fmt = None
   if want_auto:
@@ -562,12 +452,14 @@ def media_preview(vid_id: str, request: Request,
   else:
     f = (fmt or "").lower().strip()
     if f in ("webp","jpeg","jpg","png"): target_fmt = "jpg" if f=="jpg" else f
-    else: target_fmt = None
+    else: target_fmt = None  # 未知 → 不转码
 
+  # 是否需要处理
   need_resize = s is not None
   need_transcode = target_fmt is not None and not src_mime.endswith(target_fmt)
 
   if not need_resize and not need_transcode:
+    # 直接返回原图（带条件缓存）
     inm = request.headers.get("if-none-match")
     ims = request.headers.get("if-modified-since")
     if inm == src_etag:
@@ -593,6 +485,7 @@ def media_preview(vid_id: str, request: Request,
       "Vary": "Accept",
     })
 
+  # 生成缓存 key
   st = os.stat(src_path)
   key_raw = f"{vid_id}|{int(st.st_mtime)}|{st.st_size}|{s or 0}|{target_fmt or 'orig'}|{q}"
   key_hash = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:20]
@@ -600,6 +493,7 @@ def media_preview(vid_id: str, request: Request,
   cache_path = os.path.join(PREVIEW_CACHE_DIR, f"{vid_id}_{key_hash}{out_ext}")
   etag = f'W/"prev-{key_hash}"'
 
+  # 条件缓存（对加工品）
   inm = request.headers.get("if-none-match")
   if inm == etag and os.path.isfile(cache_path):
     return Response(status_code=304, headers={
@@ -608,6 +502,7 @@ def media_preview(vid_id: str, request: Request,
       "Vary": "Accept",
     })
 
+  # 命中文件缓存
   if os.path.isfile(cache_path):
     mime = mimetypes.guess_type(cache_path)[0] or "image/webp"
     return FileResponse(cache_path, media_type=mime, headers={
@@ -616,8 +511,10 @@ def media_preview(vid_id: str, request: Request,
       "Vary": "Accept",
     })
 
+  # 需要生成：加锁防并发
   lock = _get_cache_lock(cache_path)
   with lock:
+    # 双检：可能别的请求已生成
     if os.path.isfile(cache_path):
       mime = mimetypes.guess_type(cache_path)[0] or "image/webp"
       return FileResponse(cache_path, media_type=mime, headers={
@@ -626,52 +523,73 @@ def media_preview(vid_id: str, request: Request,
         "Vary": "Accept",
       })
 
+    # 处理图像
     try:
       im = Image.open(src_path)
     except Exception:
+      # 打不开 → 直接原图兜底
       return FileResponse(src_path, media_type=src_mime, headers={
         "ETag": src_etag, "Last-Modified": last_mod,
         "Cache-Control": "public, max-age=31536000, immutable",
         "Vary": "Accept",
       })
 
+    # 判断动图
     is_animated = getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1
 
     def _resize_square(img):
+      """等比缩到最短边>=s，然后居中裁切 s×s；若 s 未给则原尺寸"""
       if not s: return img
       w, h = img.size
       if w == 0 or h == 0: return img
+      # 先等比缩放使“短边”>= s（尽量少放大）
       scale = max(s / float(min(w, h)), 1.0)
       new_w, new_h = int(w * scale), int(h * scale)
       if (new_w, new_h) != (w, h):
         img = img.resize((new_w, new_h), Image.LANCZOS)
+      # 居中裁切为 s×s
       left = max((img.width - s) // 2, 0)
       top  = max((img.height - s) // 2, 0)
-      img = img.crop((left, top, left + s, top + s))
+      right = left + s
+      bottom = top + s
+      img = img.crop((left, top, right, bottom))
       return img
 
     tmp_path = cache_path + ".tmp"
 
     try:
       if is_animated and (target_fmt == "webp"):
-        from PIL import ImageSequence
-        frames = []; durations = []
+        # 转 WebP 动图
+        frames = []
+        durations = []
         try:
+          from PIL import ImageSequence
           for f in ImageSequence.Iterator(im):
-            frame = f.convert("RGBA"); frame = _resize_square(frame)
-            frames.append(frame); durations.append(f.info.get("duration", im.info.get("duration", 40)))
+            frame = f.convert("RGBA")
+            frame = _resize_square(frame)
+            frames.append(frame)
+            durations.append(f.info.get("duration", im.info.get("duration", 40)))
         except Exception:
-          frame = im.convert("RGBA"); frame = _resize_square(frame)
-          frames = [frame]; durations = [im.info.get("duration", 40)]
+          # 退化：取第一帧静态
+          frame = im.convert("RGBA")
+          frame = _resize_square(frame)
+          frames = [frame]
+          durations = [im.info.get("duration", 40)]
+        if not frames:
+          frames = [im.convert("RGBA")]
+          frames[0] = _resize_square(frames[0])
+          durations = [40]
         frames[0].save(tmp_path, format="WEBP", save_all=True,
                        append_images=frames[1:] if len(frames)>1 else None,
                        duration=durations, loop=0, quality=q, method=6)
       else:
+        # 静态图或不转码动图：导出为 webp/jpeg/png/或原格式
+        # 统一先转成 RGB(A) 以避免模式问题
         fmt_out = ("WEBP" if target_fmt == "webp" else
                    "JPEG" if target_fmt in ("jpg","jpeg") else
                    "PNG"  if target_fmt == "png" else None)
         base = im.convert("RGBA") if im.mode not in ("RGB","RGBA") else im
-        base = _resize_square(base) if s else base
+        base = _resize_square(base) if need_resize else base
         save_kwargs = {}
         if fmt_out == "JPEG":
           base = base.convert("RGB")
@@ -680,8 +598,11 @@ def media_preview(vid_id: str, request: Request,
           save_kwargs.update(dict(quality=q, method=6))
         elif fmt_out == "PNG":
           save_kwargs.update(dict(optimize=True))
+        # 未指定 fmt_out → 按原后缀导出（尽量保真）
         out_fmt_final = fmt_out or (im.format if im.format in ("PNG","JPEG","WEBP","GIF") else "PNG")
         base.save(tmp_path, format=out_fmt_final, **save_kwargs)
+
+      # 原子落盘
       os.replace(tmp_path, cache_path)
       mime = mimetypes.guess_type(cache_path)[0] or "image/webp"
       return FileResponse(cache_path, media_type=mime, headers={
@@ -690,8 +611,10 @@ def media_preview(vid_id: str, request: Request,
         "Vary": "Accept",
       })
     except Exception:
+      # 出错兜底：直接原图
       try:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+          os.remove(tmp_path)
       except Exception:
         pass
       return FileResponse(src_path, media_type=src_mime, headers={
@@ -700,135 +623,61 @@ def media_preview(vid_id: str, request: Request,
         "Vary": "Accept",
       })
 
-# ========== 调试接口 ==========
-@app.get("/__probe/{vid_id}")
-def probe_container(vid_id: str):
-  _, id_map, _ = _scan_state()
-  v = id_map.get(vid_id)
-  if not v: raise HTTPException(404)
-  p = v.video_path
-  sniff_mime, container, how = _sniff_container_mime(p)
-  st = os.stat(p)
-  return {
-    "id": vid_id,
-    "path": p,
-    "size": st.st_size,
-    "mtime": int(st.st_mtime),
-    "ext": os.path.splitext(p)[1].lower(),
-    "sniff_mime": sniff_mime,
-    "container": container,
-    "how": how,
-  }
-
-@app.get("/__probe_codecs/{vid_id}")
-def probe_codecs(vid_id: str):
-  _, id_map, _ = _scan_state()
-  v = id_map.get(vid_id)
-  if not v: raise HTTPException(404)
-  p = v.video_path
-  codecs = _sniff_mp4_codecs(p)
-  return {"id": vid_id, "codecs": codecs}
-
-@app.get("/__faststart_status/{vid_id}")
-def faststart_status(vid_id: str):
-  _, id_map, _ = _scan_state()
-  v = id_map.get(vid_id)
-  if not v: raise HTTPException(404)
-  p = v.video_path
-  try:
-    need = _moov_at_end(p)
-  except Exception:
-    need = False
-  cache = _faststart_cached_path(p) if need else None
-  return {"id": vid_id, "path": p, "need_faststart": bool(need), "cache_path": cache or ""}
-
-# ======= 视频：GET（含 faststart 缓存 + 统一头） =======
-def _video_common_heads(mime: str, extra: dict | None = None):
-  heads = {
-    "Cache-Control": "public, max-age=31536000, immutable",
-    "Accept-Ranges": "bytes",
-    "Cross-Origin-Resource-Policy": "cross-origin",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Range, Content-Disposition, ETag, Last-Modified, X-Video-Container, X-Video-Mime, X-Video-Codecs, Cross-Origin-Resource-Policy",
-    "Content-Type": mime,
-    "Vary": "Origin",
-  }
-  if extra: heads.update(extra)
-  return heads
-
 @app.get("/media/video/{vid_id}")
 def media_video(request: Request, vid_id: str):
-  """
-  1) 若 moov 在尾部 → 生成/命中 faststart 缓存并播放；
-  2) 统一返回 CORS/调试头；支持 304 / 416 / 200 / 206。
-  """
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
-  if not v:
-    raise HTTPException(404)
-  orig_path = v.video_path
-
-  path = _faststart_cached_path(orig_path) or orig_path
-  if path != orig_path:
-    logger.info("[media_video] using faststart cache for %s -> %s", orig_path, path)
-
+  if not v: raise HTTPException(404)
+  path = v.video_path
   file_size = os.path.getsize(path)
-  sniff_mime, container, _how = _sniff_container_mime(path)
-  mime = sniff_mime or (mimetypes.guess_type(path)[0]) or "application/octet-stream"
-  codecs_hint = _sniff_mp4_codecs(path)
+  mime, _ = mimetypes.guess_type(path)
+  mime = mime or "application/octet-stream"
 
   etag = _etag_for(path)
   last_mod = _last_modified_str(path)
 
-  # 304
   inm = request.headers.get("if-none-match")
   ims = request.headers.get("if-modified-since")
   if inm == etag:
-    heads = _video_common_heads(mime, {
-      "ETag": etag, "Last-Modified": last_mod,
-      "X-Video-Container": container, "X-Video-Mime": mime, "X-Video-Codecs": codecs_hint or "",
+    return Response(status_code=304, headers={
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=31536000, immutable",
     })
-    return Response(status_code=304, headers=heads)
   if ims:
     try:
       ims_dt = parsedate_to_datetime(ims)
       if int(os.stat(path).st_mtime) <= int(ims_dt.timestamp()):
-        heads = _video_common_heads(mime, {
-          "ETag": etag, "Last-Modified": last_mod,
-          "X-Video-Container": container, "X-Video-Mime": mime, "X-Video-Codecs": codecs_hint or "",
+        return Response(status_code=304, headers={
+          "ETag": etag,
+          "Last-Modified": last_mod,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "public, max-age=31536000, immutable",
         })
-        return Response(status_code=304, headers=heads)
     except Exception:
       pass
 
-  # Range
   range_header = request.headers.get("range")
   rng, err = _parse_range_header(range_header, file_size) if range_header else (None, None)
 
   if not rng:
-    if err in ("MULTI", "BAD", "OUT"):
-      heads = _video_common_heads(mime, {
-        "ETag": etag, "Last-Modified": last_mod,
+    if err == "MULTI" or err in ("BAD", "OUT"):
+      return Response(status_code=416, headers={
         "Content-Range": f"bytes */{file_size}",
-        "X-Video-Container": container, "X-Video-Mime": mime, "X-Video-Codecs": codecs_hint or "",
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Last-Modified": last_mod,
       })
-      return Response(status_code=416, headers=heads)
-
-    heads = _video_common_heads(mime, {
-      "ETag": etag, "Last-Modified": last_mod,
-      "X-Video-Container": container, "X-Video-Mime": mime, "X-Video-Codecs": codecs_hint or "",
+    return FileResponse(path, media_type=mime, headers={
+      "Accept-Ranges": "bytes",
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Cache-Control": "public, max-age=31536000, immutable",
     })
-    return FileResponse(path, media_type=mime, headers=heads)
 
-  # 206
   start, end = rng
   length = end - start + 1
-  heads = _video_common_heads(mime, {
-    "ETag": etag, "Last-Modified": last_mod,
-    "Content-Range": f"bytes {start}-{end}/{file_size}",
-    "Content-Length": str(length),
-    "X-Video-Container": container, "X-Video-Mime": mime, "X-Video-Codecs": codecs_hint or "",
-  })
 
   def iterfile():
     with open(path, "rb") as f:
@@ -840,18 +689,15 @@ def media_video(request: Request, vid_id: str):
         remaining -= len(data)
         yield data
 
-  return StreamingResponse(iterfile(), status_code=206, headers=heads, media_type=mime)
-
-# OPTIONS（调试）
-@app.options("/media/video/{vid_id}")
-def media_video_options(vid_id: str):
-  return PlainTextResponse("OK", headers={
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Accept, Accept-Encoding, Accept-Language, Content-Language, Content-Type, If-Modified-Since, If-None-Match, Origin, Range, User-Agent",
-    "Access-Control-Max-Age": "600",
-    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Range, Content-Disposition, ETag, Last-Modified, X-Video-Container, X-Video-Mime, X-Video-Codecs, Cross-Origin-Resource-Policy",
-  })
+  headers = {
+    "Content-Range": f"bytes {start}-{end}/{file_size}",
+    "Accept-Ranges": "bytes",
+    "Content-Length": str(length),
+    "ETag": etag,
+    "Last-Modified": last_mod,
+    "Cache-Control": "public, max-age=31536000, immutable",
+  }
+  return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=mime)
 
 @app.get("/go/workshop/{vid_id}")
 def go_workshop(vid_id: str):
@@ -870,7 +716,5 @@ def health():
     "config_json_exists": cfg_ok,
     "WORKSHOP_PATH": WORKSHOP_PATH,
     "workshop_exists": work_ok,
-    "workshop_has_digit_dirs": work_has_dirs,
-    "TRANSCODE_CACHE_DIR": TRANSCODE_CACHE_DIR,
-    "LOG_LEVEL": LOG_LEVEL,
+    "workshop_has_digit_dirs": work_has_dirs
   }
