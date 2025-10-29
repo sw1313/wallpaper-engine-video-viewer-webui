@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Video Direct-Play Deep Test</title>
+<style>
+  body { font: 14px/1.45 system-ui, -apple-system, Segoe UI, Arial, sans-serif; margin: 16px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  input[type="text"]{ width: 520px; max-width: 100%; padding:6px 8px; }
+  button { padding:6px 10px; }
+  video { width: 100%; max-width: 720px; background:#000; }
+  #log { white-space: pre-wrap; background:#111; color:#ddd; padding:8px; max-height: 320px; overflow:auto; }
+  .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#eef; margin: 4px 6px 0 0; }
+  .ok { background:#ccebd6; }
+  .maybe { background:#ffe5b4; }
+  .no { background:#ffd6d6; }
+  .sec { margin-top: 10px; margin-bottom: 6px; font-weight: 600; }
+  code { background:#f6f6f6; padding:1px 4px; border-radius:4px; }
+</style>
+</head>
+<body>
+  <h2>浏览器直播放测（URL / 本地文件）</h2>
+
+  <div class="row">
+    <input id="url" type="text" placeholder="粘贴视频 URL（如 /media/video/3594403203 或 http://...）" value="/media/video/3594403203"/>
+    <button id="loadUrl">加载并播放</button>
+    <input id="file" type="file" accept="video/*"/>
+    <button id="playBtn">播放/继续</button>
+    <button id="pauseBtn">暂停</button>
+    <button id="reloadBtn">重载</button>
+    <button id="clearBtn">清空日志</button>
+  </div>
+
+  <div class="row">
+    <button id="headBtn">HEAD 检测</button>
+    <button id="rangeBtn">Range(0-1) 检测</button>
+    <button id="probeBtn">Probe 服务器(__probe/+codecs)</button>
+    <button id="capsBtn">MediaCapabilities 检测</button>
+    <span id="env"></span>
+  </div>
+
+  <div id="support"></div>
+
+  <div class="sec">播放器</div>
+  <video id="v" controls playsinline webkit-playsinline preload="metadata" crossorigin="anonymous"></video>
+
+  <div class="sec">事件 / 状态</div>
+  <div id="log"></div>
+
+<script>
+const v = document.getElementById('v');
+const urlInp = document.getElementById('url');
+const fileInp = document.getElementById('file');
+const logEl = document.getElementById('log');
+const supportEl = document.getElementById('support');
+const envEl = document.getElementById('env');
+
+function log(msg){
+  const ts = new Date().toLocaleTimeString();
+  logEl.textContent += `[${ts}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function kv(k, v){ return `${k}: ${v ?? '(null)'}`; }
+
+function pill(label, cls){ const s=document.createElement('span'); s.className=`pill ${cls||''}`; s.textContent=label; return s; }
+
+function readyStateName(n){
+  return ({0:'HAVE_NOTHING',1:'HAVE_METADATA',2:'HAVE_CURRENT_DATA',3:'HAVE_FUTURE_DATA',4:'HAVE_ENOUGH_DATA'})[n] || String(n);
+}
+function networkStateName(n){
+  return ({0:'NETWORK_EMPTY',1:'NETWORK_IDLE',2:'NETWORK_LOADING',3:'NETWORK_NO_SOURCE'})[n] || String(n);
+}
+
+function showSupportHints(){
+  const tests = [
+    'video/mp4',
+    'video/webm',
+    'video/ogg',
+    'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', // H.264 + AAC
+    'video/webm; codecs="vp9, opus"',               // VP9 + Opus
+    'video/mp4; codecs="av01.0.05M.08, mp4a.40.2"', // AV1 + AAC
+    'video/mp4; codecs="hvc1.1.6.L93.B0"',          // HEVC/H.265
+  ];
+  supportEl.innerHTML = '<div class="sec">canPlayType（仅供参考）</div>';
+  tests.forEach(t=>{
+    const res = v.canPlayType(t); // '', 'maybe', 'probably'
+    const cls = res === 'probably' ? 'ok' : (res === 'maybe' ? 'maybe' : 'no');
+    supportEl.appendChild(pill(`${t} → ${res||'""'}`, cls));
+  });
+}
+
+function showEnv(u){
+  try{
+    const page = location.origin;
+    const same = u.startsWith('/') || u.startsWith(page);
+    envEl.textContent = `页面: ${page} | 资源同源: ${same ? '是' : '否'} | crossorigin=${v.getAttribute('crossorigin')}`;
+  }catch{}
+}
+
+function bindLoggers(){
+  const evs = [
+    'loadedmetadata','loadeddata','durationchange','canplay','canplaythrough',
+    'play','playing','pause','waiting','stalled','suspend','progress','seeking','seeked',
+    'timeupdate','ratechange','volumechange','emptied','abort','ended','error'
+  ];
+  evs.forEach(ev=>{
+    v.addEventListener(ev, (e)=>{
+      if (e.type === 'progress'){
+        try {
+          const b = v.buffered, parts=[];
+          for (let i=0;i<b.length;i++) parts.push(`[${b.start(i).toFixed(2)} ~ ${b.end(i).toFixed(2)}]`);
+          log(`progress buffered=${parts.join(' ')||'[]'}`);
+        } catch { log('progress'); }
+        return;
+      }
+      if (e.type === 'timeupdate') {
+        if (!v._lastTU || (performance.now()-v._lastTU)>500){
+          v._lastTU = performance.now();
+          log(`timeupdate t=${v.currentTime.toFixed(2)} / ${isFinite(v.duration)?v.duration.toFixed(2):'∞'}s rs=${readyStateName(v.readyState)} ns=${networkStateName(v.networkState)}`);
+        }
+        return;
+      }
+      if (e.type === 'error'){
+        const er = v.error;
+        const map = {1:'MEDIA_ERR_ABORTED',2:'MEDIA_ERR_NETWORK',3:'MEDIA_ERR_DECODE',4:'MEDIA_ERR_SRC_NOT_SUPPORTED'};
+        log(`error: code=${er && er.code} (${map[er && er.code] || 'UNKNOWN'}) currentSrc=${v.currentSrc}`);
+        try {
+          const q = v.getVideoPlaybackQuality?.();
+          if (q) log(`PlaybackQuality: total=${q.totalVideoFrames} dropped=${q.droppedVideoFrames} corrupted=${q.corruptedVideoFrames}`);
+        } catch{}
+      } else {
+        log(e.type);
+      }
+    });
+  });
+}
+bindLoggers();
+showSupportHints();
+
+async function loadUrl(u){
+  v.src = u;
+  showEnv(u);
+  log(`设置 src=${u}`);
+  try { v.load(); } catch {}
+  try { await v.play(); log('play() 已调用'); }
+  catch(e){ log('play() 被拦截或失败：'+ e.message); }
+}
+
+document.getElementById('loadUrl').onclick = ()=> {
+  const u = urlInp.value.trim();
+  if (!u){ alert('请输入 URL'); return; }
+  loadUrl(u);
+};
+
+fileInp.onchange = ()=>{
+  const f = fileInp.files && fileInp.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  v.src = url;
+  showEnv(url);
+  showSupportHints();
+  log(`选择文件: name=${f.name}, size=${f.size} type=${f.type||'(unknown)'} → objectURL 已设置`);
+  v.play().then(()=> log('play() 已调用')).catch(e=> log('play() 失败：'+e.message));
+};
+
+document.getElementById('playBtn').onclick = ()=> v.play().catch(e=>log('play() 失败：'+e.message));
+document.getElementById('pauseBtn').onclick = ()=> v.pause();
+document.getElementById('reloadBtn').onclick = ()=> { try { v.load(); log('执行 load()'); v.play(); } catch(e){ log('load() 失败：'+e.message); } };
+document.getElementById('clearBtn').onclick = ()=> { logEl.textContent=''; };
+
+async function dumpHeaders(resp){
+  const keys = [
+    'status','content-type','content-length','accept-ranges','content-range',
+    'etag','last-modified','access-control-allow-origin','access-control-expose-headers',
+    'cross-origin-resource-policy','x-video-container','x-video-mime','x-video-codecs'
+  ];
+  log(`HTTP ${resp.status} ${resp.statusText}`);
+  keys.forEach(k=> log(`${k}: ${resp.headers.get(k)}`));
+}
+
+document.getElementById('headBtn').onclick = async ()=>{
+  const u = urlInp.value.trim();
+  if (!u) return alert('请输入 URL');
+  try{
+    const resp = await fetch(u, { method:'HEAD', cache:'no-store', mode:'cors' });
+    await dumpHeaders(resp);
+  }catch(e){ log('HEAD 失败：'+e.message); }
+};
+
+document.getElementById('rangeBtn').onclick = async ()=>{
+  const u = urlInp.value.trim();
+  if (!u) return alert('请输入 URL');
+  try{
+    const resp = await fetch(u, { method:'GET', headers:{Range:'bytes=0-1'}, cache:'no-store', mode:'cors' });
+    await dumpHeaders(resp);
+    const buf = await resp.arrayBuffer();
+    log(`Range 载入字节数: ${buf.byteLength}`);
+  }catch(e){ log('Range 失败：'+e.message); }
+};
+
+document.getElementById('probeBtn').onclick = async ()=>{
+  const u = urlInp.value.trim();
+  const m = u.match(/\/media\/video\/(\d{6,})/);
+  if (!m){ return log('URL 不是 /media/video/{id} 形式，跳过 probe'); }
+  const id = m[1];
+  try{
+    const r1 = await fetch(`/__probe/${id}`, {cache:'no-store'});
+    const j1 = await r1.json();
+    log(`__probe: ${JSON.stringify(j1)}`);
+  }catch(e){ log('__probe 失败：'+e.message); }
+  try{
+    const r2 = await fetch(`/__probe_codecs/${id}`, {cache:'no-store'});
+    const j2 = await r2.json();
+    log(`__probe_codecs: ${JSON.stringify(j2)}`);
+  }catch(e){ log('__probe_codecs 失败：'+e.message); }
+};
+
+document.getElementById('capsBtn').onclick = async ()=>{
+  // 通过 MediaCapabilities 估算解码与播放特征（仅参考）
+  const combos = [
+    {contentType:'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', width:1280, height:720, bitrate:4_000_000, framerate:30},
+    {contentType:'video/mp4; codecs="avc1.640028, mp4a.40.2"', width:1920, height:1080, bitrate:8_000_000, framerate:30},
+  ];
+  const navmc = navigator.mediaCapabilities;
+  if (!navmc){ return log('MediaCapabilities API 不可用'); }
+  for (const c of combos){
+    try{
+      const r = await navmc.decodingInfo({type:'file', video:c, audio:{contentType:'audio/mp4; codecs="mp4a.40.2"', channels:2, bitrate:192000, samplerate:48000}});
+      log(`MediaCapabilities ${c.contentType} → supported=${r.supported} smooth=${r.smooth} powerEfficient=${r.powerEfficient}`);
+    }catch(e){ log('MediaCapabilities 失败：'+e.message); }
+  }
+};
+
+// 初始填充
+showEnv(urlInp.value.trim() || '(empty)');
+</script>
+</body>
+</html>
