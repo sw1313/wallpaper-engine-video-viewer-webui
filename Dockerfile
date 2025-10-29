@@ -7,8 +7,11 @@ WORKDIR /app
 
 COPY webui/app /app/app
 
-# 安装依赖
-RUN pip install --no-cache-dir fastapi uvicorn[standard] jinja2 pillow
+# 安装依赖和 ffmpeg
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    pip install --no-cache-dir fastapi uvicorn[standard] jinja2 pillow && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 运行时通过环境变量告诉容器真实路径（在 docker-compose 里挂载）
 ENV WORKSHOP_PATH=/data/workshop/content/431960
