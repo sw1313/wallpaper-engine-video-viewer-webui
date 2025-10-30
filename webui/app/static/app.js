@@ -1,8 +1,9 @@
-/* app/static/app.js (fs-36e-busy-and-mtime)
+/* app/static/app.js (fs-36f-faststart-once-8s)
  * 新增：全局“转圈加载”遮罩，播放启动阶段阻塞所有操作
  * 保留：后台音频 PTS 偏移修复（audioBias）
+ * 调整：faststart 触发阈值改为 8s；/api/faststart 响应 JSON & 已做过时提示
  */
-console.log("app.js version fs-36e-busy-and-mtime");
+console.log("app.js version fs-36f-faststart-once-8s");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -22,6 +23,9 @@ function clearUserPaused(){ _userPaused = false; }
 
 /* === 音频时间轴偏移（bias） === */
 let audioBias = 0;
+
+/* === 卡顿触发阈值（毫秒） === */
+const STALL_REPAIR_GRACE_MS = 8000;
 
 /* === 全局忙碌遮罩（转圈 + 阻塞） === */
 let busyShown = false, busyGuardsOn = false;
@@ -663,7 +667,7 @@ function updateMediaSessionPlaybackState(){
 }
 
 /* —— stalled/首帧修复 —— */
-const stallRepair = { inFlight:false, tried:new Set(), timer:null, detach:null };
+const stallRepair = { inFlight:false, tried:new Set(), timer:null, detach:null, startedAt:0 };
 function installStallListeners(v, a){
   if (!v._stallBound){
     const vh = async ()=> await maybeRepairFromEl('video', v);
@@ -683,17 +687,24 @@ async function maybeRepairFromEl(which, el){
   const early = (el.currentTime || 0) < 1.0;
   const starving = (el.readyState || 0) < 3;
   if (!(early || starving)) return;
+
+  // ★ 仅当播放已卡顿满 8s 才触发修复
+  if (!stallRepair.startedAt) stallRepair.startedAt = Date.now();
+  if (Date.now() - stallRepair.startedAt < STALL_REPAIR_GRACE_MS) return;
+
   await triggerRepair(id, el.currentTime || 0);
 }
 function armFirstPlayWatch(id, el){
   disarmFirstPlayWatch();
   let started = false;
+  stallRepair.startedAt = Date.now(); // ★ 从首帧观察开始计时
   const onPlaying = ()=>{ started = true; disarmFirstPlayWatch(); };
   const onProgress = ()=>{ if ((el.currentTime||0) >= 0.25){ started = true; disarmFirstPlayWatch(); } };
   el.addEventListener('playing', onPlaying, {once:true});
   el.addEventListener('timeupdate', onProgress);
   stallRepair.detach = ()=>{ try{ el.removeEventListener('timeupdate', onProgress); }catch(_){ } };
-  stallRepair.timer = setTimeout(()=>{ if (!started && !stallRepair.tried.has(String(id))) triggerRepair(id, el.currentTime||0); }, 3500);
+  // ★ 8s 未启动首帧 → 触发 faststart
+  stallRepair.timer = setTimeout(()=>{ if (!started && !stallRepair.tried.has(String(id))) triggerRepair(id, el.currentTime||0); }, STALL_REPAIR_GRACE_MS);
 }
 function disarmFirstPlayWatch(){ if (stallRepair.timer){ clearTimeout(stallRepair.timer); stallRepair.timer=null; } if (stallRepair.detach){ try{ stallRepair.detach(); }catch(_){ } } stallRepair.detach=null; }
 async function triggerRepair(id, resumeAt){
@@ -701,11 +712,20 @@ async function triggerRepair(id, resumeAt){
   showNotice("正在修复该视频（无损重封装）…");
   try{
     const r = await fetch(`/api/faststart/${id}`, { method:"POST" });
-    if (r && r.ok){
+    let j=null; try{ j = await r.json(); }catch(_){}
+    if (r && r.ok && (!j || j.ok !== false)){
+      const wasSkipped = !!(j && (j.skipped === true || j.reason === "already-done"));
       await playIndex(player.index, { cacheBust:true, resumeAt: resumeAt||0 });
-      showNotice("已修复，正在重新播放…"); setTimeout(clearNotice, 1200);
-    } else { showNotice("修复失败：无法完成 faststart"); setTimeout(clearNotice, 2000); }
-  }catch(_){ showNotice("修复失败：网络或权限问题"); setTimeout(clearNotice, 2000); }
+      showNotice(wasSkipped ? "该视频已做过 faststart，已尝试重载播放…" : "已修复，正在重新播放…");
+      setTimeout(clearNotice, 1200);
+    } else {
+      showNotice("修复失败：无法完成 faststart");
+      setTimeout(clearNotice, 2000);
+    }
+  }catch(_){
+    showNotice("修复失败：网络或权限问题");
+    setTimeout(clearNotice, 2000);
+  }
   finally{ stallRepair.inFlight = false; }
 }
 
@@ -830,6 +850,7 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   player.index = i;
   lastAdvanceId = null;
   disarmFirstPlayWatch();
+  stallRepair.startedAt = Date.now(); // ★ 每次切集重新计时
 
   const a0 = media.a || $("bgAudio");
   if (a0){ try{ a0.muted = true; a0.volume = 0; }catch(_){ } }

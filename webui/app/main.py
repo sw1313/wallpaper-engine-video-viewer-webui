@@ -13,6 +13,7 @@ from fastapi.responses import (
     HTMLResponse,
     RedirectResponse,
     Response,
+    JSONResponse,   # ★ 新增：用于 /api/faststart 返回标准 JSON
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -41,7 +42,13 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 _db_lock = threading.Lock()
 
 def _get_conn():
+    """
+    统一在同一个 SQLite 里维护：
+    - watched(id, watched)
+    - faststart(workshop_id, done)
+    """
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # watched 表（原有）
     conn.execute("""
     CREATE TABLE IF NOT EXISTS watched (
         id TEXT PRIMARY KEY,
@@ -49,7 +56,33 @@ def _get_conn():
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
+    # ★ faststart 表（新增）：记录某个创意工坊 ID 是否已 faststart 过
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS faststart (
+        workshop_id TEXT PRIMARY KEY,
+        done        INTEGER NOT NULL DEFAULT 0,
+        updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
     return conn
+
+def _faststart_is_done(vid_id: str) -> bool:
+    with _db_lock:
+        conn = _get_conn()
+        row = conn.execute("SELECT done FROM faststart WHERE workshop_id=? LIMIT 1", (str(vid_id),)).fetchone()
+        conn.close()
+    return bool(row and row[0])
+
+def _faststart_mark_done(vid_id: str):
+    with _db_lock:
+        conn = _get_conn()
+        conn.execute("""
+        INSERT INTO faststart(workshop_id, done, updated_at)
+        VALUES(?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(workshop_id) DO UPDATE SET done=1, updated_at=CURRENT_TIMESTAMP
+        """, (str(vid_id),))
+        conn.commit()
+        conn.close()
 
 class WatchedSet(BaseModel):
     ids: List[str]
@@ -378,22 +411,29 @@ def _faststart_inplace(src_path: str) -> dict:
 @app.post("/api/faststart/{vid_id}")
 def api_faststart_inplace(vid_id: str):
   """
-  前端在 <video> 触发 stalled（或手动点击“修复播放”）时调用：
-  1) 就地无损重封装为 faststart；
-  2) 覆盖原文件；
-  3) 返回结果，前端拿到 ok 后重新加载播放即可。
+  前端在「卡顿≥阈值」时调用：
+  1) 若该 ID 曾执行过 faststart → 直接跳过（ok=true, skipped=true）；
+  2) 否则就地无损重封装 + 覆盖原文件 + 恢复 mtime；
+  3) 成功后标记该 ID 为已完成，前端拿到 ok 后重新加载播放即可。
   """
+  # ★ 只运行一次：命中则跳过
+  if _faststart_is_done(vid_id):
+    return JSONResponse({"ok": True, "skipped": True, "reason": "already-done"})
+
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
   if not v:
     raise HTTPException(404, detail="video-not-found")
+
   res = _faststart_inplace(v.video_path)
-  status = 200 if res.get("ok") else 500
-  return Response(
-    content=(str(res).replace("'", '"')),
-    media_type="application/json",
-    status_code=status
-  )
+
+  if res.get("ok"):
+    _faststart_mark_done(vid_id)     # ★ 成功后标记“已执行过”
+    res["skipped"] = False
+    return JSONResponse(res, status_code=200)
+  else:
+    res["skipped"] = False
+    return JSONResponse(res, status_code=500)
 
 # =======================
 # 媒体传输（预览 & 视频）
