@@ -5,12 +5,17 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
   <meta name="theme-color" content="#ffffff"/>
   <title>Wallpaper WebUI</title>
-  <!-- 样式沿用 -->
+
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+  <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
+  <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
+
   <link rel="stylesheet" href="/static/style.css?v=fs-23"/>
 </head>
 <body>
   <header class="topbar">
-    <div class="crumb" id="crumb">当前位置：/</div>
+    <div class="crumb" id="crumb">当前位置：</div>
     <div class="controls">
       <select id="sort">
         <option value="0">修改日期降序</option>
@@ -40,7 +45,6 @@
 
   <!-- 全屏播放器容器 -->
   <div id="playerFS" class="playerfs" style="display:none;">
-    <!-- 前台用 video 播放；务必 playsinline / webkit-playsinline，避免 iOS 强制系统全屏 -->
     <video id="fsVideo" controls playsinline webkit-playsinline preload="metadata" crossorigin="anonymous"></video>
 
     <div id="overlay" class="overlay">
@@ -56,14 +60,13 @@
     </div>
   </div>
 
-  <!-- 🔊 后台/息屏专用的隐藏 audio（注意：不能 display:none；放到视口外、极小尺寸） -->
+  <!-- 🔊 后台/息屏专用的隐藏 audio（注意：不能 display:none） -->
   <audio id="bgAudio"
          preload="auto" autoplay playsinline
          crossorigin="anonymous"
          style="position:fixed; left:-9999px; top:-9999px; width:1px; height:1px; opacity:0.001; pointer-events:none;">
   </audio>
 
-  <!-- 升级 JS 版本，强制缓存刷新 -->
-  <script src="/static/app.js?v=fs-32-faststart"></script>
+  <script src="/static/app.js?v=fs-36d-audio-bias-fix"></script>
 </body>
 </html>
