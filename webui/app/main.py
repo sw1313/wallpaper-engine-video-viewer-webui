@@ -1,5 +1,5 @@
-# app/main.py (fs-31 + inplace faststart on-demand, no moov detection)
-import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess
+# app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart)
+import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
@@ -30,6 +30,10 @@ WE_PATH       = os.getenv("WE_PATH", "/data/wallpaper_engine")
 APP_DIR       = os.path.dirname(__file__)
 DATA_DIR      = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# === 新增：纯音频缓存目录 ===
+AUDIO_CACHE_DIR = os.getenv("AUDIO_CACHE_DIR", os.path.join(DATA_DIR, "audio_cache"))
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 # ========= watched（服务器端“已播放”持久化） =========
 DB_PATH = os.getenv("WATCHED_DB", os.path.join(DATA_DIR, "watched.db"))
@@ -298,6 +302,7 @@ def _faststart_inplace(src_path: str) -> dict:
   """
   无损重封装：-c copy -movflags +faststart
   生成同目录临时文件，成功后 os.replace 覆盖原文件。
+  覆盖后恢复原文件的 atime/mtime，避免“修改时间”被刷新。
   返回 {ok, before, after, tmp, out}
   """
   src_path = os.path.abspath(src_path)
@@ -306,7 +311,14 @@ def _faststart_inplace(src_path: str) -> dict:
 
   before = os.path.getsize(src_path)
   src = Path(src_path)
-  # 输出容器尽量与扩展名一致：.mp4/.m4v 用 -f mp4；其他交给 ffmpeg 根据扩展名判断
+  # 记录原始时间戳（纳秒）以便恢复
+  try:
+    st_old = os.stat(src_path)
+    at_ns, mt_ns = st_old.st_atime_ns, st_old.st_mtime_ns
+  except Exception:
+    st_old = None
+    at_ns = mt_ns = None
+
   force_mp4 = src.suffix.lower() in (".mp4", ".m4v")
   tmp_path = str(src.with_suffix(src.suffix + ".faststart.tmp"))
 
@@ -323,7 +335,6 @@ def _faststart_inplace(src_path: str) -> dict:
 
   lock = _get_repair_lock(src_path)
   with lock:
-    # 若存在上次失败残留的 tmp，先尝试删除
     try:
       if os.path.exists(tmp_path):
         os.remove(tmp_path)
@@ -332,8 +343,21 @@ def _faststart_inplace(src_path: str) -> dict:
 
     try:
       subprocess.run(cmd, check=True)
-      # 成功：原子替换
+      # 原子替换
       os.replace(tmp_path, src_path)
+
+      # 恢复时间戳（若可用）
+      try:
+        if at_ns is not None and mt_ns is not None:
+          os.utime(src_path, ns=(at_ns, mt_ns))
+      except Exception:
+        # 回退到秒精度
+        try:
+          if st_old is not None:
+            os.utime(src_path, (st_old.st_atime, st_old.st_mtime))
+        except Exception:
+          pass
+
       after = os.path.getsize(src_path)
       return {"ok": True, "before": before, "after": after, "out": src_path}
     except subprocess.CalledProcessError as e:
@@ -681,6 +705,185 @@ def media_video(request: Request, vid_id: str):
 
   def iterfile():
     with open(path, "rb") as f:
+      f.seek(start)
+      remaining = length
+      while remaining > 0:
+        data = f.read(min(CHUNK, remaining))
+        if not data: break
+        remaining -= len(data)
+        yield data
+
+  headers = {
+    "Content-Range": f"bytes {start}-{end}/{file_size}",
+    "Accept-Ranges": "bytes",
+    "Content-Length": str(length),
+    "ETag": etag,
+    "Last-Modified": last_mod,
+    "Cache-Control": "public, max-age=31536000, immutable",
+  }
+  return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=mime)
+
+# =======================
+# 新增：/media/audio/{vid_id} 纯音频直出（缓存 + Range）
+# =======================
+
+_audio_locks = {}
+_audio_global_lock = threading.Lock()
+def _get_audio_lock(key: str) -> threading.Lock:
+  with _audio_global_lock:
+    if key not in _audio_locks:
+      _audio_locks[key] = threading.Lock()
+    return _audio_locks[key]
+
+def _audio_cache_file(vid: str, src_path: str) -> str:
+  st = os.stat(src_path)
+  key = f"{vid}_{int(st.st_mtime)}_{st.st_size}"
+  # 统一导出 mp4/m4a 容器；mime 使用 audio/mp4
+  return os.path.join(AUDIO_CACHE_DIR, f"{key}.m4a")
+
+def _cleanup_old_audio_caches(vid: str, keep_path: str):
+  try:
+    kp = os.path.abspath(keep_path)
+    for p in glob.glob(os.path.join(AUDIO_CACHE_DIR, f"{vid}_*.m4a")):
+      try:
+        if os.path.abspath(p) != kp:
+          os.remove(p)
+      except Exception:
+        pass
+  except Exception:
+    pass
+
+def _ensure_audio_cached(vid: str, src_path: str) -> Tuple[str, str]:
+    """
+    返回 (cached_path, mime)。
+    优先 -c:a copy 无损抽轨，失败则回落 AAC 编码。
+    强制将时间轴对齐至 0，避免前端显示的 position 偏移。
+    """
+    out_path = _audio_cache_file(vid, src_path)
+    if os.path.isfile(out_path):
+        return out_path, "audio/mp4"
+
+    lock = _get_audio_lock(vid)
+    with lock:
+        if os.path.isfile(out_path):
+            return out_path, "audio/mp4"
+
+        tmp_path = out_path + ".tmp"
+
+        # 通用前置参数：生成缺失 PTS、起点对齐 0
+        common_pre = ["-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-ss", "0"]
+        # 容器参数：faststart + 消除负时间戳
+        common_post = ["-movflags", "+faststart", "-avoid_negative_ts", "make_zero", "-f", "mp4", tmp_path]
+
+        # 1) 无损 copy：优雅失败
+        cmd_copy = ["ffmpeg"] + common_pre + [
+            "-i", src_path,
+            "-vn", "-sn", "-dn",
+            "-map", "0:a:0",
+            "-c:a", "copy",
+        ] + common_post
+
+        # 2) 转码兜底（把时间线归零）
+        cmd_transcode = ["ffmpeg"] + common_pre + [
+            "-i", src_path,
+            "-vn", "-sn", "-dn",
+            "-map", "0:a:0",
+            "-c:a", "aac", "-b:a", "192k",
+            "-af", "asetpts=PTS-STARTPTS",
+        ] + common_post
+
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+        ok = False
+        try:
+            subprocess.run(cmd_copy, check=True)
+            ok = True
+        except Exception:
+            try:
+                subprocess.run(cmd_transcode, check=True)
+                ok = True
+            except Exception:
+                ok = False
+
+        if not ok:
+            raise RuntimeError("audio-extract-failed")
+
+        os.replace(tmp_path, out_path)
+        _cleanup_old_audio_caches(vid, out_path)
+        return out_path, "audio/mp4"
+
+@app.get("/media/audio/{vid_id}")
+def media_audio(request: Request, vid_id: str):
+  """
+  纯音频直出端点：前端 <audio> 指向这里，支持 Range/ETag/强缓存。
+  首次命中会抽出音轨并缓存；后续直接走缓存文件，后台切集稳定出声。
+  """
+  _, id_map, _ = _scan_state()
+  v = id_map.get(vid_id)
+  if not v: raise HTTPException(404)
+  src_path = v.video_path
+
+  try:
+    cache_path, mime = _ensure_audio_cached(vid_id, src_path)
+  except Exception:
+    # 兜底：返回原视频（audio 标签也能播，但某些机型后台可能受限）
+    cache_path = src_path
+    mime, _ = mimetypes.guess_type(src_path)
+    mime = mime or "application/octet-stream"
+
+  file_size = os.path.getsize(cache_path)
+  etag = _etag_for(cache_path)
+  last_mod = _last_modified_str(cache_path)
+
+  inm = request.headers.get("if-none-match")
+  ims = request.headers.get("if-modified-since")
+  if inm == etag:
+    return Response(status_code=304, headers={
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    })
+  if ims:
+    try:
+      ims_dt = parsedate_to_datetime(ims)
+      if int(os.stat(cache_path).st_mtime) <= int(ims_dt.timestamp()):
+        return Response(status_code=304, headers={
+          "ETag": etag,
+          "Last-Modified": last_mod,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "public, max-age=31536000, immutable",
+        })
+    except Exception:
+      pass
+
+  range_header = request.headers.get("range")
+  rng, err = _parse_range_header(range_header, file_size) if range_header else (None, None)
+
+  if not rng:
+    if err == "MULTI" or err in ("BAD", "OUT"):
+      return Response(status_code=416, headers={
+        "Content-Range": f"bytes */{file_size}",
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Last-Modified": last_mod,
+      })
+    return FileResponse(cache_path, media_type=mime, headers={
+      "Accept-Ranges": "bytes",
+      "ETag": etag,
+      "Last-Modified": last_mod,
+      "Cache-Control": "public, max-age=31536000, immutable",
+    })
+
+  start, end = rng
+  length = end - start + 1
+
+  def iterfile():
+    with open(cache_path, "rb") as f:
       f.seek(start)
       remaining = length
       while remaining > 0:

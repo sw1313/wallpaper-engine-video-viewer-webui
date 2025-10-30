@@ -1,30 +1,82 @@
-/* app/static/app.js (fs-32+repair-3)
-   - 最小化修复：避免 bgAudio 与 video 并发拉同一媒体导致首帧变慢
-     * playIndex(): 不再给 audio 设 src/load
-     * switchToAudio(): 才给 audio 设置 src，并将 preload="metadata"
-     * 启动时将 bgAudio.preload="none"
-   - 兼容：保留 faststart 成功后统一 playIndex({cacheBust,resumeAt})
-   - 顺手修复：上一版误写的 initial长度 → initial.length
-*/
-console.log("app.js version fs-32+repair-3");
+/* app/static/app.js (fs-36e-busy-and-mtime)
+ * 新增：全局“转圈加载”遮罩，播放启动阶段阻塞所有操作
+ * 保留：后台音频 PTS 偏移修复（audioBias）
+ */
+console.log("app.js version fs-36e-busy-and-mtime");
 
-/* ---- 全局状态 ---- */
+/* ===================== 公共状态与工具 ===================== */
+
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
   selV:new Set(), selF:new Set(), lastIdx:null, tiles:[], dragging:false, dragStart:null, keepSelection:false,
   isLoading:false, hasMore:true, queryKey:"" };
 
 let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/" };
 
-/* —— 预取状态 —— */
+/* === missing globals (hotfix) === */
+let media = { v: null, a: null };
+let playbackMode = "video";
+let fsOverlayInHistory = false;
+let _userPaused = false;
+function markUserPaused(){ _userPaused = true; }
+function clearUserPaused(){ _userPaused = false; }
+
+/* === 音频时间轴偏移（bias） === */
+let audioBias = 0;
+
+/* === 全局忙碌遮罩（转圈 + 阻塞） === */
+let busyShown = false, busyGuardsOn = false;
+function ensureBusyStyles(){
+  if (document.getElementById("busy-style")) return;
+  const css = `
+  #screenBusy{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999999;display:none;align-items:center;justify-content:center}
+  #screenBusy .box{min-width:220px;display:flex;gap:12px;align-items:center;padding:14px 18px;border-radius:12px;background:rgba(20,20,20,.92);color:#fff;font:500 14px/1.2 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto}
+  #screenBusy .spin{width:22px;height:22px;border:3px solid #9aa0a6;border-top-color:transparent;border-radius:50%;animation:sbspin .9s linear infinite}
+  @keyframes sbspin{to{transform:rotate(360deg)}}`;
+  const s = document.createElement("style"); s.id="busy-style"; s.textContent = css; document.head.appendChild(s);
+}
+function ensureBusyEl(){
+  ensureBusyStyles();
+  if (document.getElementById("screenBusy")) return;
+  const d = document.createElement("div");
+  d.id = "screenBusy";
+  d.innerHTML = `<div class="box"><div class="spin"></div><div class="txt" id="busyText">正在准备播放器…</div></div>`;
+  document.body.appendChild(d);
+}
+function installBusyGuards(){
+  if (busyGuardsOn) return;
+  busyGuardsOn = true;
+  const f = (e)=>{ e.preventDefault(); e.stopPropagation(); };
+  const opts = { capture:true, passive:false };
+  const types = ["pointerdown","pointermove","pointerup","click","contextmenu","touchstart","touchmove","wheel","keydown","keyup"];
+  types.forEach(t=> document.addEventListener(t, f, opts));
+  installBusyGuards._f = f;
+  installBusyGuards._types = types;
+}
+function removeBusyGuards(){
+  if (!busyGuardsOn) return;
+  busyGuardsOn = false;
+  const f = installBusyGuards._f, types = installBusyGuards._types||[];
+  types.forEach(t=> document.removeEventListener(t, f, {capture:true}));
+}
+function showBusy(text="正在加载…"){
+  ensureBusyEl();
+  const el = document.getElementById("screenBusy");
+  const txt = document.getElementById("busyText");
+  if (txt) txt.textContent = text;
+  el.style.display = "flex";
+  installBusyGuards();
+  busyShown = true;
+}
+function hideBusy(){
+  const el = document.getElementById("screenBusy");
+  if (el) el.style.display = "none";
+  removeBusyGuards();
+  busyShown = false;
+}
+
 let prefetchState = { key:"", page:0, opts:null, data:null, controller:null, inflight:false };
-
-/* —— 渐进播放 —— */
 let progressive = { key:"", running:false, cancel:false, seen:new Set() };
-
-/* —— 模态锁 —— */
 let uiLock = { byPlaylist:false };
-
-/* —— 事件守卫 —— */
 const modalGuards = [];
 function addModalGuard(type, handler, opts){ document.addEventListener(type, handler, opts); modalGuards.push([type, handler, opts]); }
 function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.removeEventListener(t,h,o); } modalGuards.length = 0; }
@@ -32,7 +84,6 @@ function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.remove
 const $ = (id) => document.getElementById(id);
 const grid = () => $("grid");
 
-/* ======== UA 识别 ======== */
 function detectByUA(){
   const ua = navigator.userAgent || navigator.vendor || window.opera || "";
   try { const o = localStorage.getItem("uaMode");
@@ -45,7 +96,6 @@ function detectByUA(){
 const UA = detectByUA();
 const IS_MOBILE_UA = UA.isMobile;
 
-/* ====== 服务端“已观看”缓存 & API ====== */
 const watchedCache = new Map();
 function isWatched(id){ return watchedCache.get(String(id)) === true; }
 function paintWatchedButton(btn, on){
@@ -107,7 +157,6 @@ async function setWatchedOptimistic(id, on){
 async function markWatched(id){ return setWatchedOptimistic(id, true); }
 async function unmarkWatched(id){ return setWatchedOptimistic(id, false); }
 
-/* ===== 通用工具 ===== */
 document.addEventListener("dragstart", e => e.preventDefault());
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
@@ -119,9 +168,8 @@ function isSel(t){ return t.type==="video" ? state.selV.has(t.vid) : state.selF.
 function setSel(t,on){ if(t.type==="video"){on?state.selV.add(t.vid):state.selV.delete(t.vid);} else {on?state.selF.add(t.path):state.selF.delete(t.path);} t.el.classList.toggle("selected",on); }
 function clearSel(){ state.tiles.forEach(t=>t.el.classList.remove("selected")); state.selV.clear(); state.selF.clear(); }
 
-/* ======================
-   Hash 路由
-   ====================== */
+/* ====================== 路由/列表/分页 ====================== */
+
 function pathFromHash(){
   let h = window.location.hash || "";
   if (!h || h === "#") return "/";
@@ -141,7 +189,6 @@ function onHashChange(){
 }
 window.addEventListener("hashchange", onHashChange);
 
-/* 骨架屏 */
 function renderSkeleton(nextBreadcrumb) {
   if (nextBreadcrumb) $("crumb").innerHTML = "当前位置：" + nextBreadcrumb;
   const g = grid(); g.innerHTML = "";
@@ -152,20 +199,16 @@ function renderSkeleton(nextBreadcrumb) {
     g.appendChild(el);
   }
 }
-
-/* 查询 key & 快照 */
 function makeQueryKey(){ return `${state.path}|${state.sort_idx}|${state.mature_only?'1':'0'}|${state.q}`; }
 function snapshotOpts(){ return { path:state.path, sort_idx:state.sort_idx, mature_only:state.mature_only, q:state.q, per_page:state.per_page }; }
 
-/* REST：scan（分页） */
 async function apiScan(opts, page, signal){
-  const params = new URLSearchParams({ path:opts.path, page, per_page:opts.per_page, sort_idx:opts.sort_idx, mature_only:opts.mature_only, q:opts.q });
+  const params = new URLSearchParams({ path:opts.path, page, per_page:opts.per_page, sort_idx:opts.sort_idx, mature_only:String(opts.mature_only), q:opts.q });
   const res = await fetch(`/api/scan?${params.toString()}`, { signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-/* 预取下一页 */
 function resetPrefetch(){ if (prefetchState.controller) try{ prefetchState.controller.abort(); }catch(_){}
   prefetchState = { key:"", page:0, opts:null, data:null, controller:null, inflight:false };
 }
@@ -184,7 +227,6 @@ async function schedulePrefetch(){
   }catch{ prefetchState.data=null; } finally{ prefetchState.inflight=false; }
 }
 
-/* 自动补页 */
 let autoFillRunning = false;
 async function autoFillViewport(maxLoops=3){
   if (autoFillRunning) return; autoFillRunning = true;
@@ -200,7 +242,6 @@ async function autoFillViewport(maxLoops=3){
   } finally { autoFillRunning=false; }
 }
 
-/* 加载一页并渲染 */
 let io=null, rubberBound=false;
 async function loadNextPage(){
   if (state.isLoading || !state.hasMore) return;
@@ -230,7 +271,6 @@ async function loadNextPage(){
   finally{ state.isLoading=false; queueMicrotask(()=>autoFillViewport(3)); }
 }
 
-/* 追加 tiles：返回新增视频 id 列表 */
 function appendTiles(data){
   let idx = state.tiles.length;
   const batchVideoIds = [];
@@ -272,15 +312,40 @@ function appendTiles(data){
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"video", vid:v.id, idx, title:v.title}); idx++;
     batchVideoIds.push(String(v.id));
+
+    const img = el.querySelector("img");
+    if (isPlayerActive()) deferImage(img);
   });
 
   return batchVideoIds;
 }
 
-/* 状态条 */
+/* —— 封面图延迟载入 —— */
+function deferImage(img){
+  if (!img || img.dataset.deferred === "1") return;
+  img.dataset.deferred = "1";
+  img.dataset.deferSrc = img.getAttribute("src") || "";
+  img.dataset.deferSrcset = img.getAttribute("srcset") || "";
+  img.dataset.deferSizes = img.getAttribute("sizes") || "";
+  try{ img.removeAttribute("srcset"); }catch(_){}
+  try{ img.removeAttribute("src"); }catch(_){}
+}
+function resumeImage(img){
+  if (!img || img.dataset.deferred !== "1") return;
+  const { deferSrc, deferSrcset, deferSizes } = img.dataset;
+  if (deferSizes) img.setAttribute("sizes", deferSizes);
+  if (deferSrcset) img.setAttribute("srcset", deferSrcset);
+  if (deferSrc) img.setAttribute("src", deferSrc);
+  delete img.dataset.deferred;
+  delete img.dataset.deferSrc;
+  delete img.dataset.deferSrcset;
+  delete img.dataset.deferSizes;
+}
+function suspendGridImageLoads(){ document.querySelectorAll("#grid img").forEach(img=>{ if (!img.complete) deferImage(img); }); }
+function resumeGridImageLoads(){ document.querySelectorAll("#grid img").forEach(resumeImage); }
+
 function setInfStatus(text){ const el=$("infiniteStatus"); if(el) el.textContent = text || ""; }
 
-/* 切换上下文 */
 function changeContext({path, sort_idx, mature_only, q}={}){
   if (path!==undefined) state.path = path;
   if (sort_idx!==undefined) state.sort_idx = sort_idx;
@@ -296,7 +361,6 @@ function changeContext({path, sort_idx, mature_only, q}={}){
   loadNextPage();
 }
 
-/* 面包屑 html */
 function buildCrumbHtml(pathStr){
   const html = ["<a class='link' href=\"#/\">/</a>"];
   const segs = pathStr.split("/").filter(Boolean);
@@ -304,198 +368,543 @@ function buildCrumbHtml(pathStr){
   return "当前位置：" + html.join(" / ");
 }
 
-/* ===============================
-   播放解锁与“Muted Hack”
-   =============================== */
-async function playWithMutedHack(el, {force=false} = {}){
-  try{
-    if (!force) { await el.play(); return true; }
-  }catch(_){ /* ignore */ }
-  const prevMuted = el.muted;
-  try{
-    el.muted = true;
-    const p = el.play(); if (p && typeof p.then==="function") await p;
-    el.muted = prevMuted;
-    if (typeof el.volume === "number" && el.volume === 0) el.volume = 1;
-    if (el.muted !== prevMuted){
-      const onPlaying = ()=>{ try{ el.muted = prevMuted; el.removeEventListener("playing", onPlaying); }catch(_){ } };
-      el.addEventListener("playing", onPlaying, { once:true });
+/* =================== 播放控制（无 MSE） =================== */
+
+/* --- 用户手势预解锁 --- */
+let userGestureUnlocked = false;
+async function unlockPlaybackOnUserGesture(){
+  if (userGestureUnlocked) return;
+  const a = $("bgAudio"), v = $("fsVideo");
+  try { await a.play(); a.pause(); userGestureUnlocked = true; }
+  catch { try { await v.play(); v.pause(); userGestureUnlocked = true; } catch{} }
+}
+function installUserGestureUnlock(){
+  const once = async ()=>{
+    await unlockPlaybackOnUserGesture();
+    document.removeEventListener("pointerdown", once);
+    document.removeEventListener("touchstart", once);
+    document.removeEventListener("click", once);
+    document.removeEventListener("keydown", once);
+  };
+  document.addEventListener("pointerdown", once, {passive:true});
+  document.addEventListener("touchstart", once, {passive:true});
+  document.addEventListener("click", once, {passive:true});
+  document.addEventListener("keydown", once, {passive:true});
+}
+window.addEventListener("load", installUserGestureUnlock);
+
+/* --- 全屏返回栈 --- */
+function installPopStateGuard(){
+  window.addEventListener("popstate", () => {
+    if (isPlayerActive()){
+      fsOverlayInHistory = false;
+      exitPlayer();
     }
-    return true;
-  }catch(_){
-    try{ el.muted = prevMuted; }catch(_){}
-    return false;
-  }
+  });
+}
+installPopStateGuard();
+
+/* --- 禁用 PIP --- */
+function enforceNoPIP(v){
+  if (!v) return;
+  try{ v.disablePictureInPicture = true; v.setAttribute("disablepictureinpicture",""); }catch(_){}
+  try{ v.disableRemotePlayback = true; }catch(_){}
+  v.addEventListener("enterpictureinpicture", async ()=>{
+    try{ if (document.pictureInPictureElement) await document.exitPictureInPicture(); }catch(_){}
+  });
 }
 
-/* —— 事件委托（含 watched 按钮） —— */
-function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
+/* --- play 封装 --- */
+async function safePlay(el){ try { await el.play(); return true; } catch { return false; } }
 
-function bindDelegatedEvents(){
-  const el = grid(); if (el._allBound) return; el._allBound = true;
+/* ---------- 源地址 ---------- */
+function mediaVideoSrcOf(id, cacheBust=false){ return `/media/video/${id}` + (cacheBust ? `?v=${Date.now()}` : ""); }
+function audioSrcOf(id, cacheBust=false){ return `/media/audio/${id}` + (cacheBust ? `?v=${Date.now()}` : ""); }
 
-  el.addEventListener("click", async (ev)=>{
-    const wbtn = ev.target.closest(".watched-btn");
-    if (wbtn){
-      ev.preventDefault(); ev.stopPropagation();
-      const t = getTile(wbtn); if (!t || t.type!=="video") return;
-      const id = String(t.vid);
-      const next = !isWatched(id);
-      paintWatchedButton(wbtn, next);
-      await setWatchedOptimistic(id, next);
-      return;
+/* === 计算并应用 audio 偏移（bias） === */
+function computeAudioBias(a){
+  let b = 0;
+  try{
+    if (a.seekable && a.seekable.length > 0){
+      const s = a.seekable.start(0);
+      if (Number.isFinite(s) && s > 0) b = s;
     }
+  }catch(_){}
+  return b;
+}
 
-    const menuBtn = ev.target.closest(".tile-menu");
-    if (menuBtn) {
-      const t = getTile(menuBtn); if (!t) return;
-      clearSel(); setSel(t, true); state.lastIdx = t.idx;
-      const b = menuBtn.getBoundingClientRect();
-      openContextMenu(b.left + b.width/2, b.top + b.height);
-      ev.stopPropagation(); return;
-    }
+async function attachVideoSrc(src, resumeAt){
+  const v = media.v || $("fsVideo");
+  if (!v) return;
+  enforceNoPIP(v);
+  v.src = src; try{ v.load(); }catch(_){}
+  setCurrentTimeWhenReady(v, resumeAt||0);
+}
 
-    const t = getTile(ev.target); if (!t) return;
-    if (ev.ctrlKey) { setSel(t, !isSel(t)); state.lastIdx=t.idx; ev.preventDefault(); return; }
-    if (ev.shiftKey) {
-      const start = state.lastIdx==null ? t.idx : state.lastIdx;
-      const [a,b] = [start, t.idx].sort((x,y)=>x-y);
-      if (!ev.ctrlKey) clearSel(); for (let i=a;i<=b;i++) setSel(state.tiles[i], true);
-      ev.preventDefault(); return;
+async function attachAudioSrc(src, resumeAt, {muted=true, ensurePlay=true}={}){
+  const a = media.a || $("bgAudio");
+  if (!a) return;
+  try{
+    const needReload = (a.getAttribute("src") !== src);
+    if (needReload){ a.src = src; a.load(); }
+    a.muted = !!muted; a.volume = muted ? 0 : Math.max(0.6, a.volume||0.6);
+
+    const applyBias = ()=>{
+      audioBias = computeAudioBias(a);
+      if (Number.isFinite(resumeAt)) {
+        try{ a.currentTime = Math.max(0, (resumeAt||0) + (audioBias||0)); }catch(_){}
+      }
+    };
+    if (a.readyState >= 1) applyBias();
+    else a.addEventListener("loadedmetadata", function once(){ a.removeEventListener("loadedmetadata", once); applyBias(); });
+
+    if (ensurePlay){ try{ await a.play(); }catch(_){ } }
+  }catch(_){}
+}
+
+async function detachVideoSrc(){
+  const v = media.v || $("fsVideo");
+  if (!v) return;
+  try{ v.pause(); }catch(_){}
+  try{ v.removeAttribute("src"); v.load(); }catch(_){}
+}
+
+/* —— 前台音频预热（静音，不阻塞） —— */
+function prewarmAudio(srcUrl, resumeAt){
+  queueMicrotask(async ()=>{
+    try{ await attachAudioSrc(srcUrl, resumeAt||0, { muted:true, ensurePlay:true }); }catch(_){}
+  });
+}
+
+/* —— 前台对齐 —— */
+let fgSyncTimer = null;
+function startFgSync(){
+  if (fgSyncTimer) return;
+  const v = media.v||$("fsVideo"), a = media.a||$("bgAudio");
+  if (!v || !a) return;
+  fgSyncTimer = setInterval(()=>{
+    if (document.visibilityState !== "visible") return;
+    if (a.paused) return;
+    if (a.muted && Number.isFinite(v.currentTime)) {
+      const target = (v.currentTime||0) + (audioBias||0);
+      const dv = Math.abs((a.currentTime||0) - target);
+      if (dv > 0.5) { try{ a.currentTime = target; }catch(_){} }
     }
-    t.el.classList.add("pulse"); setTimeout(()=> t.el.classList.remove("pulse"), 200);
-    clearSel(); setSel(t,true); state.lastIdx=t.idx;
-    if (t.type === "folder") navigateToPath(t.path);
-    else await startPlaylist([{id:t.vid, title:t.title}], 0, state.path);
+  }, 1500);
+}
+function stopFgSync(){ if (fgSyncTimer){ clearInterval(fgSyncTimer); fgSyncTimer=null; } }
+
+/* —— 后台 near-end 兜底 —— */
+const bgAdvanceGuard = { timer:null };
+function startBgAdvanceGuard(){
+  if (bgAdvanceGuard.timer) return;
+  const a = media.a || $("bgAudio");
+  if (!a) return;
+  bgAdvanceGuard.timer = setInterval(()=>{
+    if (!isPlayerActive() || playbackMode !== "audio") return;
+    if (a.paused) return;
+    const dur = a.duration, t = a.currentTime || 0;
+    const finite = Number.isFinite(dur) && dur > 0;
+    if (a.ended || (finite && (dur - t) <= 0.4)) advanceToNextOnce();
+  }, 1000);
+}
+function stopBgAdvanceGuard(){ if (bgAdvanceGuard.timer){ clearInterval(bgAdvanceGuard.timer); bgAdvanceGuard.timer=null; } }
+
+/* —— Media Session 进度同步（归一化） —— */
+let posTicker = null;
+function getActiveEl(){ return (playbackMode==="video" ? (media.v||$("fsVideo")) : (media.a||$("bgAudio"))); }
+function updatePositionState(){
+  if (!("mediaSession" in navigator)) return;
+  const el = getActiveEl(); if (!el) return;
+
+  let dur = Number.isFinite(el.duration) && el.duration>0 ? el.duration : undefined;
+  let pos = Number.isFinite(el.currentTime) && el.currentTime>=0 ? el.currentTime : undefined;
+
+  if (playbackMode === "audio"){
+    if (pos !== undefined) pos = Math.max(0, pos - (audioBias||0));
+    if (dur !== undefined) dur = Math.max(0, dur - (audioBias||0));
+  }
+
+  const rate = (!el.paused && Number.isFinite(el.playbackRate)) ? el.playbackRate : 0;
+  try{
+    if (dur !== undefined && pos !== undefined)
+      navigator.mediaSession.setPositionState({ duration: dur, position: pos, playbackRate: rate });
+  }catch(_){}
+}
+function startPosTicker(){ if (posTicker) return; updatePositionState(); posTicker = setInterval(updatePositionState, 1000); }
+function stopPosTicker(){ if (posTicker){ clearInterval(posTicker); posTicker=null; } }
+
+/* —— 可见性切换 —— */
+let switchLock = false;
+function withSwitchLock(fn){ return async (...args)=>{ if (switchLock) return; switchLock = true; try{ await fn(...args); } finally { setTimeout(()=>{ switchLock=false; }, 200); } }; }
+
+const switchToAudio = withSwitchLock(async function(){
+  if (!isPlayerActive() || playbackMode==="audio") return;
+  const v = media.v || $("fsVideo");
+  const id = player.ids[player.index];
+  const src = audioSrcOf(id);
+  const resumeAt = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+
+  audioBias = 0;
+  try{ await attachAudioSrc(src, resumeAt, { muted:false, ensurePlay:true }); }catch(_){}
+  await detachVideoSrc();
+
+  clearUserPaused();
+  playbackMode = "audio";
+  updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
+  startBgAdvanceGuard();
+});
+
+const switchToVideo = withSwitchLock(async function(){
+  if (!isPlayerActive() || playbackMode==="video") return;
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  const id = player.ids[player.index];
+  const vSrc = mediaVideoSrcOf(id);
+  const resumeAt = Number.isFinite(a.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : 0;
+
+  await attachVideoSrc(vSrc, resumeAt);
+  const ok = await safePlay(v);
+  if (!ok){ showNotice("恢复前台播放被阻止，点一下屏幕继续"); installUserGestureUnlock(); }
+
+  prewarmAudio(audioSrcOf(id), resumeAt);
+  clearUserPaused();
+  playbackMode = "video";
+  updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
+  stopBgAdvanceGuard();
+});
+
+document.addEventListener("visibilitychange", async ()=>{
+  if (!isPlayerActive()) return;
+  if (document.visibilityState === "hidden") await switchToAudio();
+  else await switchToVideo();
+});
+window.addEventListener("pagehide", ()=> { if (isPlayerActive()) switchToAudio(); });
+document.addEventListener("freeze",   ()=> { if (isPlayerActive()) switchToAudio(); });
+
+/* —— 结束→下一集 —— */
+let lastAdvanceId = null;
+function advanceToNextOnce(){
+  const curId = player.ids[player.index];
+  if (lastAdvanceId === curId) return;
+  lastAdvanceId = curId;
+  markWatched(curId);
+  nextInPlaylist();
+}
+function handleEndedFromAny(){ advanceToNextOnce(); }
+function installAudioNearEndDetector(a){
+  if (a._nearEndBound) return; a._nearEndBound = true;
+  const check = ()=>{
+    if (!isPlayerActive()) return;
+    if (playbackMode !== "audio") return;
+    if (!isFinite(a.duration) || a.seeking || a.paused) return;
+    const remain = a.duration - a.currentTime;
+    if (a.ended || remain <= 0.4) advanceToNextOnce();
+  };
+  a.addEventListener("timeupdate", check);
+  a.addEventListener("progress",   check);
+}
+
+/* —— Media Session 元数据/动作（seek 归一化） —— */
+function setMediaSessionMeta(id){
+  if (!("mediaSession" in navigator)) return;
+  const title = player.titles[id] || `视频 ${id}`;
+  const origin = location.origin;
+  const artwork = [
+    { src: `${origin}/media/preview/${id}?s=512`, sizes:"512x512", type:"image/png" },
+    { src: `${origin}/media/preview/${id}?s=128`, sizes:"128x128", type:"image/png" },
+  ];
+  try { navigator.mediaSession.metadata = new MediaMetadata({ title, artist:"Wallpaper Engine", album: state.path, artwork }); } catch(_){}
+  if (!setMediaSessionMeta._installed){
+    const both = ()=>({ v: (media.v||$("fsVideo")), a: (media.a||$("bgAudio")) });
+    navigator.mediaSession.setActionHandler("play", async ()=>{
+      clearUserPaused();
+      const {v,a} = both();
+      if (document.visibilityState==="hidden"){
+        const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : (Number.isFinite(a?.currentTime) ? Math.max(0,a.currentTime-(audioBias||0)) : 0);
+        try{ await attachAudioSrc(audioSrcOf(player.ids[player.index]), resumeAt, { muted:false, ensurePlay:true }); }catch(_){}
+        playbackMode = "audio";
+      } else {
+        const id = player.ids[player.index];
+        const resumeAt = Number.isFinite(a?.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : v.currentTime||0;
+        await attachVideoSrc(mediaVideoSrcOf(id), resumeAt);
+        const ok = await safePlay(v); if (!ok) installUserGestureUnlock();
+        prewarmAudio(audioSrcOf(id), resumeAt);
+        playbackMode = "video";
+      }
+      updateMediaSessionPlaybackState(); startPosTicker(); updatePositionState();
+    });
+    navigator.mediaSession.setActionHandler("pause", async ()=>{
+      markUserPaused();
+      const {v,a} = both();
+      try{ v.pause(); }catch(_){}
+      try{ a.pause(); }catch(_){}
+      updateMediaSessionPlaybackState(); updatePositionState(); stopPosTicker();
+    });
+    navigator.mediaSession.setActionHandler("previoustrack", async ()=>{ if (player.index>0) await playIndex(player.index-1, {resumeAt:0}); });
+    navigator.mediaSession.setActionHandler("nexttrack", async ()=>{ await nextInPlaylist(); });
+    navigator.mediaSession.setActionHandler("seekbackward", (d)=>{ const el=getActiveEl(); el.currentTime=Math.max(0, el.currentTime-(d?.seekOffset||10)); if (playbackMode==="audio") updatePositionState(); });
+    navigator.mediaSession.setActionHandler("seekforward", (d)=>{ const el=getActiveEl(); el.currentTime=Math.min((el.duration||1e9), el.currentTime+(d?.seekOffset||10)); if (playbackMode==="audio") updatePositionState(); });
+    navigator.mediaSession.setActionHandler("seekto", async (d)=>{
+      const el=getActiveEl();
+      const t = d.seekTime||0;
+      if (playbackMode==="audio"){ try{ el.currentTime = Math.max(0, t + (audioBias||0)); }catch(_){}
+      }else{ try{ el.currentTime = t; }catch(_){} }
+      updatePositionState();
+    });
+    setMediaSessionMeta._installed = true;
+  }
+  updateMediaSessionPlaybackState(); updatePositionState();
+}
+function updateMediaSessionPlaybackState(){
+  if (!("mediaSession" in navigator)) return;
+  const el = getActiveEl(); if (!el) return;
+  try { navigator.mediaSession.playbackState = el.paused ? "paused" : "playing"; } catch(_){}
+}
+
+/* —— stalled/首帧修复 —— */
+const stallRepair = { inFlight:false, tried:new Set(), timer:null, detach:null };
+function installStallListeners(v, a){
+  if (!v._stallBound){
+    const vh = async ()=> await maybeRepairFromEl('video', v);
+    v.addEventListener('stalled', vh); v.addEventListener('waiting', vh); v.addEventListener('error',   vh);
+    v._stallBound = true;
+  }
+  if (!a._stallBound){
+    const ah = async ()=> await maybeRepairFromEl('audio', a);
+    a.addEventListener('stalled', ah); a.addEventListener('waiting', ah); a.addEventListener('error',   ah);
+    a._stallBound = true;
+  }
+}
+async function maybeRepairFromEl(which, el){
+  if (!isPlayerActive()) return;
+  const id = player.ids[player.index];
+  if (!id || stallRepair.inFlight || stallRepair.tried.has(String(id))) return;
+  const early = (el.currentTime || 0) < 1.0;
+  const starving = (el.readyState || 0) < 3;
+  if (!(early || starving)) return;
+  await triggerRepair(id, el.currentTime || 0);
+}
+function armFirstPlayWatch(id, el){
+  disarmFirstPlayWatch();
+  let started = false;
+  const onPlaying = ()=>{ started = true; disarmFirstPlayWatch(); };
+  const onProgress = ()=>{ if ((el.currentTime||0) >= 0.25){ started = true; disarmFirstPlayWatch(); } };
+  el.addEventListener('playing', onPlaying, {once:true});
+  el.addEventListener('timeupdate', onProgress);
+  stallRepair.detach = ()=>{ try{ el.removeEventListener('timeupdate', onProgress); }catch(_){ } };
+  stallRepair.timer = setTimeout(()=>{ if (!started && !stallRepair.tried.has(String(id))) triggerRepair(id, el.currentTime||0); }, 3500);
+}
+function disarmFirstPlayWatch(){ if (stallRepair.timer){ clearTimeout(stallRepair.timer); stallRepair.timer=null; } if (stallRepair.detach){ try{ stallRepair.detach(); }catch(_){ } } stallRepair.detach=null; }
+async function triggerRepair(id, resumeAt){
+  stallRepair.inFlight = true; stallRepair.tried.add(String(id));
+  showNotice("正在修复该视频（无损重封装）…");
+  try{
+    const r = await fetch(`/api/faststart/${id}`, { method:"POST" });
+    if (r && r.ok){
+      await playIndex(player.index, { cacheBust:true, resumeAt: resumeAt||0 });
+      showNotice("已修复，正在重新播放…"); setTimeout(clearNotice, 1200);
+    } else { showNotice("修复失败：无法完成 faststart"); setTimeout(clearNotice, 2000); }
+  }catch(_){ showNotice("修复失败：网络或权限问题"); setTimeout(clearNotice, 2000); }
+  finally{ stallRepair.inFlight = false; }
+}
+
+/* —— 元数据就绪再设 currentTime —— */
+function setCurrentTimeWhenReady(el, t){
+  try{
+    if (isFinite(el.duration) && el.readyState >= 1) { el.currentTime = Math.max(0, t||0); updatePositionState(); return; }
+  }catch(_){}
+  const set = ()=>{ try{ el.currentTime = Math.max(0, t||0); }catch(_){ } updatePositionState(); cleanup(); };
+  const cleanup = ()=>{
+    try{ el.removeEventListener("loadedmetadata", set); }catch(_){}
+    try{ el.removeEventListener("durationchange", set); }catch(_){}
+    try{ el.removeEventListener("canplay", set); }catch(_){}
+  };
+  el.addEventListener("loadedmetadata", set, {once:true});
+  el.addEventListener("durationchange", set, {once:true});
+  el.addEventListener("canplay", set, {once:true});
+}
+
+/* —— 预加载提升 —— */
+function injectVideoPreload(src){
+  try{
+    const l = document.createElement("link");
+    l.rel = "preload"; l.as = "video"; l.href = src; l.fetchPriority = "high";
+    document.head.appendChild(l);
+    setTimeout(()=>{ try{ l.remove(); }catch(_){ } }, 8000);
+  }catch(_){}
+}
+
+/* ===== 播放入口 ===== */
+async function startPlaylist(items, startIndex=0, returnPath=null){
+  cancelProgressive();
+
+  // 显示全局忙碌遮罩并阻塞交互
+  showBusy("正在准备播放器…");
+
+  player.ids = items.map(x=>x.id);
+  player.titles = {}; items.forEach(x=> player.titles[x.id] = x.title || `视频 ${x.id}`);
+  player.index = Math.max(0, Math.min(startIndex, player.ids.length-1));
+  player.returnPath = returnPath || state.path;
+
+  const wrap = $("playerFS");
+  const v = $("fsVideo");
+  const a = $("bgAudio");
+  media.v = v; media.a = a;
+  playbackMode = "video";
+
+  wrap.style.display = "flex";
+  enforceNoPIP(v);
+
+  if (!v._bound) {
+    v.addEventListener("ended", ()=> handleEndedFromAny(v));
+    a.addEventListener("ended", ()=> handleEndedFromAny(a));
+    installAudioNearEndDetector(a);
+    installStallListeners(v, a);
+
+    const bindPos = (el)=>{
+      el.addEventListener("timeupdate", updatePositionState);
+      el.addEventListener("loadedmetadata", updatePositionState);
+      el.addEventListener("durationchange", updatePositionState);
+      el.addEventListener("seeking", updatePositionState);
+      el.addEventListener("seeked", updatePositionState);
+      el.addEventListener("playing", ()=>{ updatePositionState(); startPosTicker(); });
+      el.addEventListener("pause",   ()=>{ updatePositionState(); });
+    };
+    bindPos(v); bindPos(a);
+
+    v._bound = a._bound = true;
+  }
+
+  try{
+    a.autoplay = false; a.preload = "auto";
+    a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline","");
+    a.disableRemotePlayback = true;
+    a.muted = true; a.volume = 0;
+  }catch(_){}
+
+  try{
+    if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" });
+    else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen();
+  }catch(_){}
+  try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
+
+  $("btnBack").onclick = async ()=>{
+    if (uiLock.byPlaylist) return;
+    await exitPlayer();
+    if (fsOverlayInHistory){ fsOverlayInHistory = false; try{ history.back(); }catch(_){ } }
+    if (state.path !== player.returnPath) navigateToPath(player.returnPath);
+  };
+  $("btnMenu").onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
+
+  const waitReady = new Promise(res=>{
+    let done=false;
+    const finish=()=>{ if(done) return; done=true; res(); };
+    const vPlaying = ()=> finish();
+    const aPlaying = ()=> finish();
+    const killTimer = setTimeout(finish, 2000); // 最多转圈2秒，避免卡死
+    const cleanup = ()=>{
+      clearTimeout(killTimer);
+      try{ v.removeEventListener("playing", vPlaying); }catch(_){}
+      try{ a.removeEventListener("playing", aPlaying); }catch(_){}
+    };
+    v.addEventListener("playing", ()=>{ cleanup(); finish(); }, {once:true});
+    a.addEventListener("playing", ()=>{ cleanup(); finish(); }, {once:true});
   });
 
-  try { el.oncontextmenu = null; } catch(_) {}
-  if (IS_MOBILE_UA) {
-    el.addEventListener("contextmenu", e => e.preventDefault(), { capture:true, passive:false });
-    return;
-  }
-  const openFrom = (ev)=>{
-    const t = getTile(ev.target); if (!t) return false;
-    ev.preventDefault();
-    if (!isSel(t)) { clearSel(); setSel(t,true); state.lastIdx=t.idx; }
-    openContextMenu(ev.clientX, ev.clientY);
-    return true;
-  };
-  el.addEventListener("contextmenu", (ev)=>{ openFrom(ev); }, { capture:true });
-  el.addEventListener("mouseup", (ev)=>{ if (ev.button===2) openFrom(ev); });
-  el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
+  wrap.addEventListener("mousemove", wakeOverlay);
+  wrap.addEventListener("touchstart", wakeOverlay);
+  wakeOverlay();
+
+  suspendGridImageLoads();
+  unlockPlaybackOnUserGesture();
+  await playIndex(player.index);
+
+  // 等待“开始播放”或短超时，然后关闭遮罩
+  await waitReady;
+  hideBusy();
 }
 
-/* 右键/⋮菜单 */
-async function deleteByIds(ids){ await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) }); }
-function openContextMenu(x,y){
-  const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
-  const selCount = state.selV.size + state.selF.size;
-  const onlyOne = selCount === 1;
-  const oneVideo = onlyOne && state.selV.size === 1;
-  const oneFolder = onlyOne && state.selF.size === 1;
-  function add(text, fn){ const d=document.createElement("div"); d.className="item"; d.textContent=text; d.onclick=()=>{ hideMenu(); fn(); }; menu.appendChild(d); }
-  function sep(){ const s=document.createElement("div"); s.className="sep"; menu.appendChild(s); }
-  if (oneVideo) {
-    const vid = [...state.selV][0];
-    const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
-    add("播放此视频（全屏）", ()=> startPlaylist([{id:vid, title}], 0, state.path));
-    add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
-    add("打开创意工坊链接", ()=> window.open(`/go/workshop/${vid}`, "_blank"));
-    sep();
-    add("删除（不可恢复）", async ()=>{
-      if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
-      await deleteByIds([vid]); clearSel(); changeContext({});
-    });
-  } else if (oneFolder) {
-    const path = [...state.selF][0];
-    add("打开此文件夹", ()=> navigateToPath(path));
-    add("播放此文件夹（全屏顺序播放）", async ()=>{ await progressivePlayFolder(path); });
+/* ★ 切集 / 首次播放 */
+async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
+  player.index = i;
+  lastAdvanceId = null;
+  disarmFirstPlayWatch();
+
+  const a0 = media.a || $("bgAudio");
+  if (a0){ try{ a0.muted = true; a0.volume = 0; }catch(_){ } }
+
+  const id = player.ids[i];
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  const vSrc = mediaVideoSrcOf(id, cacheBust);
+  const aSrc = audioSrcOf(id, cacheBust);
+  injectVideoPreload(vSrc);
+
+  setMediaSessionMeta(id);
+  updatePositionState(); startPosTicker();
+
+  if (document.visibilityState === "hidden") {
+    audioBias = 0;
+    try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true }); }catch(_){}
+    await detachVideoSrc();
+    clearUserPaused();
+    playbackMode = "audio";
+    startBgAdvanceGuard();
+    armFirstPlayWatch(id, a);
   } else {
-    add("批量播放（全屏顺序播放）", async ()=>{ await progressivePlaySelection(); });
-    sep();
-    add("删除所选（不可恢复）", async ()=>{
-      const items = await expandSelectionToItems();
-      if (!items.length) return alert("所选没有可删除的视频");
-      if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
-      await deleteByIds(items.map(x=>x.id)); clearSel(); changeContext({});
-    });
+    await attachVideoSrc(vSrc, resumeAt||0);
+    const ok = await safePlay(v);
+    if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
+    prewarmAudio(aSrc, resumeAt||0);
+    clearUserPaused();
+    stopBgAdvanceGuard();
+    armFirstPlayWatch(id, v);
+    playbackMode = "video";
   }
-  const vw=window.innerWidth,vh=window.innerHeight;
-  menu.style.left = Math.min(x, vw-220)+"px"; menu.style.top = Math.min(y, vh-240)+"px";
-  setTimeout(()=> document.addEventListener("click", hideMenu, {once:true}), 0);
-}
-function hideMenu(){ $("ctxmenu").style.display="none"; }
-
-/* —— 递归列出某路径全部视频 —— */
-async function getFolderItems(path){
-  const params = new URLSearchParams({ path, sort_idx: state.sort_idx, mature_only: state.mature_only, with_meta: "1" });
-  const r = await fetch(`/api/folder_videos?${params.toString()}`);
-  const j = await r.json();
-  return (j.items || []).map(it => ({id: String(it.id), title: it.title || `视频 ${it.id}`}));
-}
-async function expandSelectionToItems(){
-  const list = [];
-  state.selV.forEach(id => list.push({id: String(id), title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}`}));
-  for (const p of state.selF) list.push(...await getFolderItems(p));
-  const seen = new Set(); const out=[];
-  for (const it of list) if(!seen.has(String(it.id))){ seen.add(String(it.id)); out.push(it); }
-  return out;
+  startFgSync();
+  renderPlaylistPanel();
 }
 
-/* ===== 抽屉模态 / 播放清单 ===== */
-function showPlaylistPanel(){
-  uiLock.byPlaylist = true;
-  $("playerFS").classList.add("locked");
-  $("playlistPanel").classList.remove("hidden");
-  const shade = $("shade");
-  shade.classList.remove("hidden");
-
-  const closeOnShade = (e)=>{ e.preventDefault(); hidePlaylistPanel(); };
-  const blockScroll = (e)=>{ e.preventDefault(); };
-  shade._closeOnShade = closeOnShade;
-  shade._blockScroll = blockScroll;
-  shade.addEventListener("click", closeOnShade);
-  shade.addEventListener("wheel", blockScroll, { passive:false });
-  shade.addEventListener("touchmove", blockScroll, { passive:false });
-
-  const allowInPanel = (el)=> !!(el && (el.closest("#playlistPanel") || el.closest("#btnMenu")));
-  const allowShadeClick = (type, el)=> (type==="click" && el && el.id==="shade");
-
-  const guard = (e)=>{
-    const el = e.target;
-    if (allowInPanel(el) || allowShadeClick(e.type, el)) return;
-    if (e.type==="touchmove" || e.type==="pointermove" || e.type==="wheel") { e.preventDefault(); e.stopPropagation(); return; }
-    if (e.type==="pointerdown" || e.type==="touchstart") { if (el && el.id==="shade") return; e.preventDefault(); e.stopPropagation(); return; }
-    e.preventDefault(); e.stopPropagation();
-  };
-
-  addModalGuard("touchstart", guard, { capture:true, passive:false });
-  addModalGuard("touchmove",  guard, { capture:true, passive:false });
-  addModalGuard("pointerdown",guard, { capture:true, passive:false });
-  addModalGuard("pointermove",guard, { capture:true, passive:false });
-  addModalGuard("wheel",      guard, { capture:true, passive:false });
-
-  const escToClose = (e)=>{ if (uiLock.byPlaylist && e.key==="Escape"){ e.preventDefault(); hidePlaylistPanel(); } };
-  addModalGuard("keydown", escToClose, true);
+function wakeOverlay(){
+  const wrap = $("playerFS");
+  wrap.classList.remove("idle");
+  if (player.idleTimer) clearTimeout(player.idleTimer);
+  player.idleTimer = setTimeout(()=> wrap.classList.add("idle"), 1500);
 }
-function hidePlaylistPanel(){
-  uiLock.byPlaylist = false;
+
+function renderPlaylistPanel(){
+  const ul = $("plist"); ul.innerHTML = "";
+  player.ids.forEach((id, i)=>{
+    const li = document.createElement("li");
+    li.className = (i===player.index) ? "active" : "";
+    li.innerHTML = `<span class="dot"></span><span>${player.titles[id] || ("视频 "+id)}</span>`;
+    li.onclick = ()=> playIndex(i);
+    ul.appendChild(li);
+  });
+}
+async function nextInPlaylist(){ if (player.index < player.ids.length - 1) await playIndex(player.index + 1, { resumeAt: 0 }); }
+
+async function exitPlayer(){
+  cancelProgressive();
+  hidePlaylistPanel();
+  disarmFirstPlayWatch();
+  try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
+  const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
+  try { v.pause(); } catch(_){}
+  try { a.pause(); } catch(_){}
+  try { v.removeAttribute("src"); v.load(); } catch(_){}
+  try { a.removeAttribute("src"); a.load(); } catch(_){}
+  wrap.style.display = "none";
   $("playlistPanel").classList.add("hidden");
-  $("playerFS").classList.remove("locked");
-
-  const shade = $("shade");
-  shade.classList.add("hidden");
-  if (shade._closeOnShade){ shade.removeEventListener("click", shade._closeOnShade); shade._closeOnShade=null; }
-  if (shade._blockScroll){
-    shade.removeEventListener("wheel", shade._blockScroll);
-    shade.removeEventListener("touchmove", shade._blockScroll);
-    shade._blockScroll=null;
-  }
-  removeModalGuards();
+  stopBgAdvanceGuard(); stopPosTicker(); stopFgSync();
+  resumeGridImageLoads();
 }
 
-/* ===== 渐进追加器 / 播放逻辑 ===== */
+function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
+
+/* ============== 渐进选择/批量播放 ============== */
+
 function cancelProgressive(){ progressive.cancel=true; progressive.running=false; progressive.key=""; progressive.seen.clear(); }
 function appendToPlaylist(items){
   let added=0;
@@ -589,7 +998,7 @@ async function progressivePlaySelection(){
     if (!firstFolderItems.length){ alert("所选文件夹没有可播放视频"); return; }
     initial = firstFolderItems.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, firstFolderItems.length));
   }
-  if (!initial.length){ alert("所选没有未完成的视频"); return; }  // ← 修正了 initial长度 的手误
+  if (!initial.length){ alert("所选没有未完成的视频"); return; }
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
   const BATCH = 200;
@@ -607,423 +1016,169 @@ async function progressivePlaySelection(){
   };
   progressiveAppendFrom(producer, "批量后台加载");
 }
+async function getFolderItems(path){
+  const params = new URLSearchParams({ path, sort_idx: state.sort_idx, mature_only: state.mature_only, with_meta: "1" });
+  const r = await fetch(`/api/folder_videos?${params.toString()}`);
+  const j = await r.json();
+  return (j.items || []).map(it => ({id: String(it.id), title: it.title || `视频 ${it.id}`}));
+}
 function getCurrentlyLoadedVideoItems(){
   const out = []; for (const t of state.tiles){ if (t.type === "video") out.push({ id:String(t.vid), title:t.title || `视频 ${t.vid}` }); }
   return out;
 }
 
-/* =========================
-   播放器（全屏 & 后台音频）
-   ========================= */
-let fsOverlayInHistory = false;
-let playbackMode = "video";
-const media = { v:null, a:null };
+/* ============== 事件委托 & 菜单 ============== */
 
-/* === 关键：脚本加载即刻减少 bgAudio 影响 === */
-(function disableBgAutoplayEarly(){
-  const a = $("bgAudio");
-  if (a){
-    try{ a.autoplay = false; a.removeAttribute && a.removeAttribute("autoplay"); }catch(_){}
-    try{ a.preload = "none"; }catch(_){}
-    try{ a.pause(); }catch(_){}
-  }
-})();
+function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
 
-/* ---- 用户手势解锁 ---- */
-let userGestureUnlocked = false;
-async function unlockPlaybackOnUserGesture(){
-  if (userGestureUnlocked) return;
-  const a = $("bgAudio"), v = $("fsVideo");
-  try { await a.play(); a.pause(); userGestureUnlocked = true; }
-  catch { try { await v.play(); v.pause(); userGestureUnlocked = true; } catch{} }
-}
-function installUserGestureUnlock(){
-  const once = async ()=>{
-    await unlockPlaybackOnUserGesture();
-    document.removeEventListener("pointerdown", once);
-    document.removeEventListener("touchstart", once);
-    document.removeEventListener("click", once);
-    document.removeEventListener("keydown", once);
-  };
-  document.addEventListener("pointerdown", once, {passive:true});
-  document.addEventListener("touchstart", once, {passive:true});
-  document.addEventListener("click", once, {passive:true});
-  document.addEventListener("keydown", once, {passive:true});
-}
-window.addEventListener("load", installUserGestureUnlock);
+function bindDelegatedEvents(){
+  const el = grid(); if (el._allBound) return; el._allBound = true;
 
-/* 返回键仅退出全屏 */
-function installPopStateGuard(){
-  window.addEventListener("popstate", () => {
-    if (isPlayerActive()){
-      fsOverlayInHistory = false;
-      exitPlayer();
+  el.addEventListener("click", async (ev)=>{
+    const wbtn = ev.target.closest(".watched-btn");
+    if (wbtn){
+      ev.preventDefault(); ev.stopPropagation();
+      const t = getTile(wbtn); if (!t || t.type!=="video") return;
+      const id = String(t.vid);
+      const next = !isWatched(id);
+      paintWatchedButton(wbtn, next);
+      await setWatchedOptimistic(id, next);
+      return;
     }
+
+    const menuBtn = ev.target.closest(".tile-menu");
+    if (menuBtn) {
+      const t = getTile(menuBtn); if (!t) return;
+      clearSel(); setSel(t, true); state.lastIdx = t.idx;
+      const b = menuBtn.getBoundingClientRect();
+      openContextMenu(b.left + b.width/2, b.top + b.height);
+      ev.stopPropagation(); return;
+    }
+
+    const t = getTile(ev.target); if (!t) return;
+    if (ev.ctrlKey) { setSel(t, !isSel(t)); state.lastIdx=t.idx; ev.preventDefault(); return; }
+    if (ev.shiftKey) {
+      const start = state.lastIdx==null ? t.idx : state.lastIdx;
+      const [a,b] = [start, t.idx].sort((x,y)=>x-y);
+      if (!ev.ctrlKey) clearSel(); for (let i=a;i<=b;i++) setSel(state.tiles[i], true);
+      ev.preventDefault(); return;
+    }
+    t.el.classList.add("pulse"); setTimeout(()=> t.el.classList.remove("pulse"), 200);
+    clearSel(); setSel(t,true); state.lastIdx=t.idx;
+    if (t.type === "folder") navigateToPath(t.path);
+    else await startPlaylist([{id:t.vid, title:t.title}], 0, state.path);
   });
-}
-installPopStateGuard();
 
-/* 播放封装 */
-async function safePlay(el){ try { await el.play(); return true; } catch { return false; } }
-
-/* ====== 后台“看门狗”：防止 ended/timeupdate 被节流 ====== */
-const bgAdvanceGuard = { timer:null };
-function startBgAdvanceGuard(){
-  if (bgAdvanceGuard.timer) return;
-  const a = media.a || $("bgAudio");
-  if (!a) return;
-  bgAdvanceGuard.timer = setInterval(()=>{
-    if (!isPlayerActive() || playbackMode !== "audio") return;
-    if (!a.duration || a.paused || !isFinite(a.duration)) return;
-    const remain = a.duration - a.currentTime;
-    if (remain <= 2) advanceToNextOnce();
-  }, 1000);
-}
-function stopBgAdvanceGuard(){
-  if (bgAdvanceGuard.timer){ clearInterval(bgAdvanceGuard.timer); bgAdvanceGuard.timer = null; }
-}
-
-/* —— 切换前后台 —— */
-async function switchToAudio(){
-  if (!isPlayerActive() || playbackMode === "audio") return;
-  const v = media.v || $("fsVideo");
-  const a = media.a || $("bgAudio");
-  media.v = v; media.a = a;
-
-  const src = v.src || `/media/video/${player.ids[player.index]}`;
-  if (a.src !== src) {
-    try{ a.preload = "metadata"; }catch(_){}
-    a.src = src;
-    try{ a.load(); }catch(_){}
+  try { el.oncontextmenu = null; } catch(_) {}
+  if (IS_MOBILE_UA) {
+    el.addEventListener("contextmenu", e => e.preventDefault(), { capture:true, passive:false });
+    return;
   }
-  try { if (!isNaN(v.currentTime)) a.currentTime = v.currentTime; } catch(_){}
-  const ok = await playWithMutedHack(a, {force: document.visibilityState === "hidden"});
-  if (ok){
-    try{ v.pause(); }catch(_){}
-    playbackMode = "audio"; updateMediaSessionPlaybackState();
-    startBgAdvanceGuard();
-  } else { showNotice("后台播放被阻止，点一下屏幕以继续"); installUserGestureUnlock(); }
-}
-async function switchToVideo(){
-  if (!isPlayerActive() || playbackMode === "video") return;
-  const v = media.v || $("fsVideo");
-  const a = media.a || $("bgAudio");
-  media.v = v; media.a = a;
-  try { if (!isNaN(a.currentTime)) v.currentTime = a.currentTime; } catch(_){}
-  const ok = await safePlay(v);
-  if (ok){
-    try{ a.pause(); }catch(_){}
-    playbackMode = "video"; updateMediaSessionPlaybackState();
-    stopBgAdvanceGuard();
-  } else { showNotice("恢复前台播放被阻止，点一下屏幕"); installUserGestureUnlock(); }
-}
-
-/* === 仅第一次隐藏时静音 video 的并发播放去重处理 === */
-let firstHiddenHandled = false;
-let videoMutedByFirstHiddenFix = false;
-
-/* 可见性监听：隐藏→音频；可见→视频 */
-document.addEventListener("visibilitychange", async ()=>{
-  if (!isPlayerActive()) return;
-
-  if (document.visibilityState === "hidden") {
-    const a0 = $("bgAudio"); if (a0){ try{ a0.autoplay=false; a0.removeAttribute && a0.removeAttribute("autoplay"); a0.preload="metadata"; }catch(_){ } }
-
-    await switchToAudio();
-    const ok = await playWithMutedHack(media.a||$("bgAudio"), {force:true});
-    if (!ok){ showNotice("后台播放被阻止，需要点击以继续"); installUserGestureUnlock(); }
-    startBgAdvanceGuard();
-
-    if (!firstHiddenHandled){
-      const v = media.v || $("fsVideo");
-      const a = media.a || $("bgAudio");
-      if (a && v && !a.paused && !v.paused){
-        try{ v.muted = true; videoMutedByFirstHiddenFix = true; }catch(_){}
-      }
-      firstHiddenHandled = true;
-    }
-
-  } else {
-    try{ const a=$("bgAudio"); a.autoplay=false; a.pause(); }catch(_){}
-    await switchToVideo();
-    const ok = await safePlay(media.v||$("fsVideo"));
-    if (!ok){ showNotice("恢复前台播放被阻止，点击屏幕继续"); installUserGestureUnlock(); }
-    stopBgAdvanceGuard();
-
-    if (videoMutedByFirstHiddenFix){
-      const v = media.v || $("fsVideo");
-      try{ v.muted = false; }catch(_){}
-      videoMutedByFirstHiddenFix = false;
-    }
-  }
-});
-window.addEventListener("pagehide", ()=> { if (isPlayerActive()) switchToAudio(); });
-document.addEventListener("freeze",   ()=> { if (isPlayerActive()) switchToAudio(); });
-
-/* —— “结束→下一集”更稳的处理 —— */
-let lastAdvanceId = null;
-function advanceToNextOnce(){
-  const curId = player.ids[player.index];
-  if (lastAdvanceId === curId) return;
-  lastAdvanceId = curId;
-  markWatched(curId);
-  nextInPlaylist();
-}
-function handleEndedFromAny(){ advanceToNextOnce(); }
-function installAudioNearEndDetector(a){
-  if (a._nearEndBound) return; a._nearEndBound = true;
-  const check = ()=>{
-    if (!isPlayerActive()) return;
-    if (playbackMode !== "audio") return;
-    if (!isFinite(a.duration) || a.seeking || a.paused) return;
-    const remain = a.duration - a.currentTime;
-    if (remain <= 2) advanceToNextOnce();
+  const openFrom = (ev)=>{
+    const t = getTile(ev.target); if (!t) return false;
+    ev.preventDefault();
+    if (!isSel(t)) { clearSel(); setSel(t,true); state.lastIdx=t.idx; }
+    openContextMenu(ev.clientX, ev.clientY);
+    return true;
   };
-  a.addEventListener("timeupdate", check);
-  a.addEventListener("progress",   check);
+  el.addEventListener("contextmenu", (ev)=>{ openFrom(ev); }, { capture:true });
+  el.addEventListener("mouseup", (ev)=>{ if (ev.button===2) openFrom(ev); });
+  el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
 }
 
-/* Media Session 元数据 */
-function setMediaSessionMeta(id){
-  if (!("mediaSession" in navigator)) return;
-  const title = player.titles[id] || `视频 ${id}`;
-  const origin = location.origin;
-  const artwork = [
-    { src: `${origin}/media/preview/${id}?s=512`, sizes:"512x512", type:"image/png" },
-    { src: `${origin}/media/preview/${id}?s=128`, sizes:"128x128", type:"image/png" },
-  ];
-  try {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title, artist:"Wallpaper Engine", album: state.path, artwork
+async function deleteByIds(ids){ await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) }); }
+function openContextMenu(x,y){
+  const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
+  const selCount = state.selV.size + state.selF.size;
+  const onlyOne = selCount === 1;
+  const oneVideo = onlyOne && state.selV.size === 1;
+  const oneFolder = onlyOne && state.selF.size === 1;
+  function add(text, fn){ const d=document.createElement("div"); d.className="item"; d.textContent=text; d.onclick=()=>{ hideMenu(); fn(); }; menu.appendChild(d); }
+  function sep(){ const s=document.createElement("div"); s.className="sep"; menu.appendChild(s); }
+  if (oneVideo) {
+    const vid = [...state.selV][0];
+    const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
+    add("播放此视频（全屏）", ()=> startPlaylist([{id:vid, title}], 0, state.path));
+    add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
+    add("打开创意工坊链接", ()=> window.open(`/go/workshop/${vid}`, "_blank"));
+    sep();
+    add("删除（不可恢复）", async ()=>{
+      if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
+      await deleteByIds([vid]); clearSel(); changeContext({});
     });
-  } catch(_){}
-  if (!setMediaSessionMeta._installed){
-    const getActive = ()=> (playbackMode==="video" ? (media.v||$("fsVideo")) : (media.a||$("bgAudio")));
-    navigator.mediaSession.setActionHandler("play", async ()=>{ const el=getActive(); await playWithMutedHack(el); });
-    navigator.mediaSession.setActionHandler("pause", ()=>{ try{ getActive().pause(); }catch(_){ } });
-    navigator.mediaSession.setActionHandler("previoustrack", async ()=>{ if (player.index>0) await playIndex(player.index-1); });
-    navigator.mediaSession.setActionHandler("nexttrack", async ()=>{ await nextInPlaylist(); });
-    navigator.mediaSession.setActionHandler("seekbackward", (d)=>{ const el=getActive(); el.currentTime=Math.max(0, el.currentTime-(d?.seekOffset||10)); });
-    navigator.mediaSession.setActionHandler("seekforward", (d)=>{ const el=getActive(); el.currentTime=Math.min((el.duration||1e9), el.currentTime+(d?.seekOffset||10)); });
-    navigator.mediaSession.setActionHandler("seekto", (d)=>{ const el=getActive(); if (d.fastSeek && "fastSeek" in el) el.fastSeek(d.seekTime); else el.currentTime = d.seekTime; });
-    setMediaSessionMeta._installed = true;
-  }
-  updateMediaSessionPlaybackState();
-}
-function updateMediaSessionPlaybackState(){
-  if (!("mediaSession" in navigator)) return;
-  const el = (playbackMode==="video" ? (media.v||$("fsVideo")) : (media.a||$("bgAudio")));
-  try { navigator.mediaSession.playbackState = el.paused ? "paused" : "playing"; } catch(_){}
-}
-
-/* =========================================================
-   🔧 stalled/首帧超时 → 调 /api/faststart/{vid} 的自动修复模块
-   ========================================================= */
-const stallRepair = {
-  inFlight: false,
-  tried: new Set(),    // 每个视频只尝试一次
-  timer: null,
-  detach: null,
-};
-function installStallListeners(v, a){
-  if (!v._stallBound){
-    const vh = async ()=> await maybeRepairFromEl('video', v);
-    v.addEventListener('stalled', vh);
-    v.addEventListener('waiting', vh);
-    v.addEventListener('error',   vh);
-    v._stallBound = true;
-  }
-  if (!a._stallBound){
-    const ah = async ()=> await maybeRepairFromEl('audio', a);
-    a.addEventListener('stalled', ah);
-    a.addEventListener('waiting', ah);
-    a.addEventListener('error',   ah);
-    a._stallBound = true;
-  }
-}
-async function maybeRepairFromEl(which, el){
-  if (!isPlayerActive()) return;
-  const id = player.ids[player.index];
-  if (!id || stallRepair.inFlight || stallRepair.tried.has(String(id))) return;
-
-  const early = (el.currentTime || 0) < 1.0;
-  const starving = (el.readyState || 0) < 3; // < HAVE_FUTURE_DATA
-  if (!(early || starving)) return;
-
-  await triggerRepair(id, el.currentTime || 0);
-}
-function armFirstPlayWatch(id, el){
-  disarmFirstPlayWatch();
-  let started = false;
-  const onPlaying = ()=>{ started = true; disarmFirstPlayWatch(); };
-  const onProgress = ()=>{ if ((el.currentTime||0) >= 0.25){ started = true; disarmFirstPlayWatch(); } };
-  el.addEventListener('playing', onPlaying, {once:true});
-  el.addEventListener('timeupdate', onProgress);
-  stallRepair.detach = ()=>{
-    try{ el.removeEventListener('timeupdate', onProgress); }catch(_){}
-  };
-  stallRepair.timer = setTimeout(()=>{
-    if (!started && !stallRepair.tried.has(String(id))) triggerRepair(id, el.currentTime||0);
-  }, 3500); // 首帧 3.5s 超时即修复
-}
-function disarmFirstPlayWatch(){
-  if (stallRepair.timer){ clearTimeout(stallRepair.timer); stallRepair.timer=null; }
-  if (stallRepair.detach){ try{ stallRepair.detach(); }catch(_){ } stallRepair.detach=null; }
-}
-async function triggerRepair(id, resumeAt){
-  stallRepair.inFlight = true;
-  stallRepair.tried.add(String(id));
-  showNotice("正在修复该视频（无损重封装）…");
-  try{
-    const r = await fetch(`/api/faststart/${id}`, { method:"POST" });
-    if (r && r.ok){
-      // faststart 成功后统一走 playIndex，强制 cache bust 并续播
-      await playIndex(player.index, { cacheBust:true, resumeAt: resumeAt||0 });
-      showNotice("已修复，正在重新播放…");
-      setTimeout(clearNotice, 1200);
-    } else {
-      showNotice("修复失败：无法完成 faststart");
-      setTimeout(clearNotice, 2000);
-    }
-  }catch(_){
-    showNotice("修复失败：网络或权限问题");
-    setTimeout(clearNotice, 2000);
-  }finally{
-    stallRepair.inFlight = false;
-  }
-}
-
-/* ===== 全屏播放器 ===== */
-function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
-
-async function startPlaylist(items, startIndex=0, returnPath=null){
-  cancelProgressive();
-
-  player.ids = items.map(x=>x.id);
-  player.titles = {}; items.forEach(x=> player.titles[x.id] = x.title || `视频 ${x.id}`);
-  player.index = Math.max(0, Math.min(startIndex, player.ids.length-1));
-  player.returnPath = returnPath || state.path;
-
-  const wrap = $("playerFS");
-  const v = $("fsVideo");
-  const a = $("bgAudio");
-  media.v = v; media.a = a;
-  playbackMode = "video";
-
-  wrap.style.display = "flex";
-
-  if (!v._bound) {
-    v.addEventListener("ended", ()=> handleEndedFromAny(v));
-    a.addEventListener("ended", ()=> handleEndedFromAny(a));
-    installAudioNearEndDetector(a);
-    // 绑定 stalled 修复监听
-    installStallListeners(v, a);
-    v._bound = a._bound = true;
-  }
-
-  try{ a.autoplay = false; a.pause(); }catch(_){}
-
-  try { 
-    if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" });
-    else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen();
-  } catch(_){}
-  try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
-
-  $("btnBack").onclick = async ()=>{
-    if (uiLock.byPlaylist) return;
-    await exitPlayer();
-    if (fsOverlayInHistory){ fsOverlayInHistory = false; try{ history.back(); }catch(_){ } }
-    if (state.path !== player.returnPath) navigateToPath(player.returnPath);
-  };
-
-  $("btnMenu").onclick = ()=>{
-    if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel();
-    else hidePlaylistPanel();
-  };
-
-  wrap.addEventListener("mousemove", wakeOverlay);
-  wrap.addEventListener("touchstart", wakeOverlay);
-  wakeOverlay();
-
-  unlockPlaybackOnUserGesture();
-
-  await playIndex(player.index);
-}
-function wakeOverlay(){
-  const wrap = $("playerFS");
-  wrap.classList.remove("idle");
-  if (player.idleTimer) clearTimeout(player.idleTimer);
-  player.idleTimer = setTimeout(()=> wrap.classList.add("idle"), 1500);
-}
-
-/* ★ 扩展 playIndex：支持 { cacheBust, resumeAt }，且不再给 audio 预设 src */
-async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
-  player.index = i;
-  lastAdvanceId = null;
-  disarmFirstPlayWatch();
-
-  const id = player.ids[i];
-  const v = media.v || $("fsVideo");
-  const a = media.a || $("bgAudio");
-
-  const src = `/media/video/${id}` + (cacheBust ? `?v=${Date.now()}` : "");
-  v.src = src;
-
-  // 不再在这里给 audio 设 src/load，避免并发抢带宽
-  try{ a.autoplay=false; a.pause(); }catch(_){}
-
-  if (resumeAt > 0){
-    try{ v.currentTime = resumeAt; }catch(_){}
-  }
-
-  setMediaSessionMeta(id);
-
-  if (document.visibilityState === "hidden") {
-    playbackMode = "audio";
-    try{ v.pause(); }catch(_){}
-    // 切到音频时再真正建立 audio 的连接
-    await switchToAudio();
-    startBgAdvanceGuard();
-    armFirstPlayWatch(id, a);
+  } else if (oneFolder) {
+    const path = [...state.selF][0];
+    add("打开此文件夹", ()=> navigateToPath(path));
+    add("播放此文件夹（全屏顺序播放）", async ()=>{ await progressivePlayFolder(path); });
   } else {
-    playbackMode = "video";
-    const ok = await safePlay(v);
-    if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
-    stopBgAdvanceGuard();
-    armFirstPlayWatch(id, v);
+    add("批量播放（全屏顺序播放）", async ()=>{ await progressivePlaySelection(); });
+    sep();
+    add("删除所选（不可恢复）", async ()=>{
+      const items = await expandSelectionToItems();
+      if (!items.length) return alert("所选没有可删除的视频");
+      if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
+      await deleteByIds(items.map(x=>x.id)); clearSel(); changeContext({});
+    });
   }
-  renderPlaylistPanel();
+  const vw=window.innerWidth,vh=window.innerHeight;
+  menu.style.left = Math.min(x, vw-220)+"px"; menu.style.top = Math.min(y, vh-240)+"px";
+  setTimeout(()=> document.addEventListener("click", hideMenu, {once:true}), 0);
 }
-function renderPlaylistPanel(){
-  const ul = $("plist"); ul.innerHTML = "";
-  player.ids.forEach((id, i)=>{
-    const li = document.createElement("li");
-    li.className = (i===player.index) ? "active" : "";
-    li.innerHTML = `<span class="dot"></span><span>${player.titles[id] || ("视频 "+id)}</span>`;
-    li.onclick = ()=> playIndex(i);
-    ul.appendChild(li);
-  });
+function hideMenu(){ $("ctxmenu").style.display="none"; }
+
+/* ============== 抽屉/遮罩/框选 ============== */
+
+function showPlaylistPanel(){
+  uiLock.byPlaylist = true;
+  $("playerFS").classList.add("locked");
+  $("playlistPanel").classList.remove("hidden");
+  const shade = $("shade");
+  shade.classList.remove("hidden");
+
+  const closeOnShade = (e)=>{ e.preventDefault(); hidePlaylistPanel(); };
+  const blockScroll = (e)=>{ e.preventDefault(); };
+  shade._closeOnShade = closeOnShade;
+  shade._blockScroll = blockScroll;
+  shade.addEventListener("click", closeOnShade);
+  shade.addEventListener("wheel", blockScroll, { passive:false });
+  shade.addEventListener("touchmove", blockScroll, { passive:false });
+
+  const allowInPanel = (el)=> !!(el && (el.closest("#playlistPanel") || el.closest("#btnMenu")));
+  const allowShadeClick = (type, el)=> (type==="click" && el && el.id==="shade");
+
+  const guard = (e)=>{
+    const el = e.target;
+    if (allowInPanel(el) || allowShadeClick(e.type, el)) return;
+    if (e.type==="touchmove" || e.type==="pointermove" || e.type==="wheel") { e.preventDefault(); e.stopPropagation(); return; }
+    if (e.type==="pointerdown" || e.type==="touchstart") { if (el && el.id==="shade") return; e.preventDefault(); e.stopPropagation(); return; }
+    e.preventDefault(); e.stopPropagation();
+  };
+
+  addModalGuard("touchstart", guard, { capture:true, passive:false });
+  addModalGuard("touchmove",  guard, { capture:true, passive:false });
+  addModalGuard("pointerdown",guard, { capture:true, passive:false });
+  addModalGuard("pointermove",guard, { capture:true, passive:false });
+  addModalGuard("wheel",      guard, { capture:true, passive:false });
+
+  const escToClose = (e)=>{ if (uiLock.byPlaylist && e.key==="Escape"){ e.preventDefault(); hidePlaylistPanel(); } };
+  addModalGuard("keydown", escToClose, true);
 }
-async function nextInPlaylist(){ if (player.index < player.ids.length - 1) await playIndex(player.index + 1); }
-async function exitPlayer(){
-  cancelProgressive();
-  hidePlaylistPanel();
-  disarmFirstPlayWatch();
-  try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
-  const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
-  try { v.pause(); } catch(_){}
-  try { a.pause(); } catch(_){}
-  try { v.removeAttribute("src"); v.load(); } catch(_){}
-  wrap.style.display = "none";
+function hidePlaylistPanel(){
+  uiLock.byPlaylist = false;
   $("playlistPanel").classList.add("hidden");
-  stopBgAdvanceGuard();
-  if (videoMutedByFirstHiddenFix){
-    try{ v.muted = false; }catch(_){}
-    videoMutedByFirstHiddenFix = false;
+  $("playerFS").classList.remove("locked");
+
+  const shade = $("shade");
+  shade.classList.add("hidden");
+  if (shade._closeOnShade){ shade.removeEventListener("click", shade._closeOnShade); shade._closeOnShade=null; }
+  if (shade._blockScroll){
+    shade.removeEventListener("wheel", shade._blockScroll);
+    shade.removeEventListener("touchmove", shade._blockScroll);
+    shade._blockScroll=null;
   }
+  removeModalGuards();
 }
 
-/* 框选 & 快捷键 */
 function bindRubber(){
   if (rubberBound) return; rubberBound = true;
   const rb = $("rubber");
@@ -1051,25 +1206,43 @@ function bindRubber(){
     };
     document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
   });
-
   window.addEventListener("keydown", (e)=>{
     if ((e.key==="a"||e.key==="A") && (e.ctrlKey||e.metaKey)) { e.preventDefault(); state.tiles.forEach(t=> setSel(t,true)); }
   });
 }
 
-/* 顶部控件绑定 */
+/* ============== 顶部控件绑定 & 首次进入 ============== */
+
+(function bootstrapAudioEarly(){
+  const a = $("bgAudio");
+  if (!a) return;
+  try{ a.autoplay = false; a.removeAttribute && a.removeAttribute("autoplay"); }catch(_){}
+  try{ a.preload = "auto"; }catch(_){}
+  try{ a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline",""); }catch(_){}
+  try{ a.muted = true; a.volume = 0; }catch(_){}
+  try{ a.disableRemotePlayback = true; }catch(_){}
+})();
+
 $("sort").onchange = ()=> changeContext({sort_idx: parseInt($("sort").value,10)});
 $("mature").onchange = ()=> changeContext({mature_only: $("mature").checked});
 $("refresh").onclick = ()=> changeContext({});
 let qTimer=null;
 $("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContext({q:$("q").value.trim()}), 250); };
-
-/* 顶部“播放未完成” */
 $("playUnwatched").onclick = handlePlayUnwatched;
 
-/* 首次进入 */
 window.addEventListener("load", ()=>{
   const initPath = pathFromHash();
   renderSkeleton(buildCrumbHtml(initPath));
   changeContext({path: initPath});
 });
+
+/* ====== 选择展开到视频（供删除批量用） ====== */
+async function expandSelectionToItems(){
+  const items = [];
+  for (const id of state.selV) items.push({ id:String(id) });
+  for (const path of state.selF){
+    const arr = await getFolderItems(path);
+    for (const it of arr) items.push({ id:String(it.id) });
+  }
+  return items;
+}
