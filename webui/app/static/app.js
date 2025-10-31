@@ -1,10 +1,12 @@
-/* app/static/app.js (fs-42a-keepalive-busy-prime)
- * 新增：
- * 1) 后台保活：后台音频播放时启用 WebAudio 常量源 + 45s keepalive 心跳
- * 2) Busy 提前显示：在所有播放入口“点击瞬间”就出现“正在启动播放器…”
- * 继续保留：前后台同集同步、双声消除、二次暂停后不回跳、拖动保护、8s 卡顿兜底、faststart 一次性修复
+/* app/static/app.js (fs-42a-keepalive-busy-prime+beacon-release+vis-watch+ui-minfix)
+ * 变更（最小化）：
+ * - 去掉返回按钮：不再绑定，若存在直接移除
+ * - 播放列表项点击：不显示转圈，点击后自动收起
+ * - 进入播放器禁用页面滚动；退出恢复
+ * - 绑定全屏高度到 window.innerHeight，适配安卓地址栏，防止底部控件出屏
+ * - 在播放器层拦截滚动手势，防止上下滑动
  */
-console.log("app.js version fs-42a-keepalive-busy-prime");
+console.log("app.js version fs-42a-keepalive-busy-prime+beacon-release+vis-watch+ui-minfix");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -458,7 +460,7 @@ function computeAudioBias(a){
   return b;
 }
 
-/* ========== 后台保活（best-effort） ========== */
+/* ========== 后台保活（best-effort：sendBeacon 优先） ========== */
 const keepAlive = { ctx:null, gain:null, src:null, pingTimer:null, active:false };
 async function startBgKeepAlive(){
   if (keepAlive.active) return;
@@ -470,7 +472,7 @@ async function startBgKeepAlive(){
     await keepAlive.ctx.resume().catch(()=>{});
     if (!keepAlive.gain){
       keepAlive.gain = keepAlive.ctx.createGain();
-      keepAlive.gain.gain.value = 1e-7; // 极低电平，实际不可闻
+      keepAlive.gain.gain.value = 1e-7; // 极低电平，不可闻
       keepAlive.gain.connect(keepAlive.ctx.destination);
     }
     if (!keepAlive.src){
@@ -485,14 +487,26 @@ async function startBgKeepAlive(){
       keepAlive.src.connect(keepAlive.gain);
       try{ keepAlive.src.start(); }catch(_){}
     }
+
+    // 45s 心跳 —— 优先 sendBeacon，无连接占用；仅在后台时发
     if (keepAlive.pingTimer) clearInterval(keepAlive.pingTimer);
     keepAlive.pingTimer = setInterval(()=>{
       if (document.visibilityState === "hidden"){
         try{
-          fetch("/api/keepalive", { method:"POST", body:"1", keepalive:true, cache:"no-store", headers:{ "Content-Type":"text/plain" } }).catch(()=>{});
+          if (navigator.sendBeacon){
+            navigator.sendBeacon("/api/keepalive", "1");
+          } else {
+            fetch("/api/keepalive", {
+              method:"POST",
+              body:"1",
+              keepalive:true,
+              cache:"no-store",
+              headers:{ "Content-Type":"text/plain", "Connection":"close" }
+            }).catch(()=>{});
+          }
         }catch(_){}
       }
-    }, 45000); // 45s 心跳
+    }, 45000);
   }catch(_){
     keepAlive.active = false;
   }
@@ -500,9 +514,22 @@ async function startBgKeepAlive(){
 function stopBgKeepAlive(){
   keepAlive.active = false;
   if (keepAlive.pingTimer){ clearInterval(keepAlive.pingTimer); keepAlive.pingTimer = null; }
-  if (keepAlive.ctx){
-    try{ keepAlive.ctx.suspend(); }catch(_){}
-  }
+
+  try{
+    if (keepAlive.src){
+      try{ keepAlive.src.stop(); }catch(_){}
+      try{ keepAlive.src.disconnect(); }catch(_){}
+      keepAlive.src = null;
+    }
+    if (keepAlive.gain){
+      try{ keepAlive.gain.disconnect(); }catch(_){}
+      keepAlive.gain = null;
+    }
+    if (keepAlive.ctx){
+      try{ keepAlive.ctx.close(); }catch(_){}
+      keepAlive.ctx = null;
+    }
+  }catch(_){}
 }
 
 /* === 附加/预热（带 seek 策略） === */
@@ -693,26 +720,87 @@ const switchToVideo = withSwitchLock(async function(){
   await promoteToVideoNow("visibility");
 });
 
-/* —— 切换触发 —— */
+/* ==== 可见性看门狗：回前台时把视频强制晋升，并唤醒控制条 ==== */
+let visWatchTimer = null;
+function kickVisWatch(reason="return"){
+  if (visWatchTimer) clearInterval(visWatchTimer);
+  let tries = 0;
+  visWatchTimer = setInterval(async ()=>{
+    tries++;
+    if (!isPlayerActive()){ clearInterval(visWatchTimer); visWatchTimer=null; return; }
+    if (document.visibilityState !== "visible") return;
+
+    // 确保控件可见
+    try{ wakeOverlay(); }catch(_){}
+
+    const v = media.v || $("fsVideo");
+    const a = media.a || $("bgAudio");
+    if (!a){ clearInterval(visWatchTimer); visWatchTimer=null; return; }
+
+    // 如果仍处于音频模式（或视频没流动），就晋升到视频
+    if (playbackMode === "audio" && !a.paused){
+      // 第一步：常规晋升
+      await promoteToVideoNow("vis-watch");
+      await sleep(60);
+
+      // 若仍未晋升成功，则带 cache bust 重挂一次视频源（安卓上常见需要重建解码管线）
+      if (playbackMode !== "video"){
+        try{
+          const id = player.ids[player.index];
+          const resumeAt = Number.isFinite(a.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : 0;
+          await attachVideoSrc(mediaVideoSrcOf(id, /*cacheBust*/ true), resumeAt);
+        }catch(_){}
+        await promoteToVideoNow("vis-watch-bust");
+        await sleep(60);
+      }
+    }
+
+    // 确保前台视频在播放（有些 ROM 会把它暂停）
+    if (playbackMode === "video" && v){
+      const ok = await safePlay(v);
+      if (!ok){
+        showNotice("播放被系统暂停，点一下屏幕继续");
+        installUserGestureUnlock();
+      }
+      clearInterval(visWatchTimer); visWatchTimer=null; return;
+    }
+
+    // 最多尝试 ~1.5s（10 * 150ms）
+    if (tries >= 10){ clearInterval(visWatchTimer); visWatchTimer=null; }
+  }, 150);
+}
+
+/* —— 切换触发（加入可见性看门狗） —— */
 document.addEventListener("visibilitychange", async ()=>{
   if (!isPlayerActive()) return;
   if (scrubGuard.active) return;
-  if (document.visibilityState === "hidden") await switchToAudio();
-  else await switchToVideo();
+  if (document.visibilityState === "hidden"){
+    await switchToAudio();
+  }else{
+    await switchToVideo();
+    setTimeout(()=> kickVisWatch("visible"), 50);
+  }
 });
-window.addEventListener("focus", async ()=>{
+window.addEventListener("focus", ()=>{
   if (!isPlayerActive()) return;
   if (document.visibilityState !== "visible") return;
-  await switchToVideo();
+  // 有些安卓只发 focus，不发 visibilitychange
+  setTimeout(()=> kickVisWatch("focus"), 50);
 });
-window.addEventListener("pageshow", async ()=>{
+window.addEventListener("pageshow", ()=>{
   if (!isPlayerActive()) return;
   if (document.visibilityState !== "visible") return;
-  await switchToVideo();
+  setTimeout(()=> kickVisWatch("pageshow"), 50);
 });
+// Page Lifecycle（部分安卓/ROM 会发）
+document.addEventListener("resume", ()=> kickVisWatch("resume"));
 
 window.addEventListener("pagehide", ()=> { if (isPlayerActive() && !scrubGuard.active) switchToAudio(); });
-document.addEventListener("freeze",   ()=> { if (isPlayerActive() && !scrubGuard.active) switchToAudio(); });
+// ★ 页面真正销毁时立即停保活（避免退出后仍发心跳）
+window.addEventListener("beforeunload", stopBgKeepAlive);
+window.addEventListener("unload", stopBgKeepAlive);
+window.addEventListener("pagehide", (e)=>{ if (!e.persisted) stopBgKeepAlive(); });
+document.addEventListener("freeze", stopBgKeepAlive);
 
 /* —— 结束→下一集 —— */
 let lastAdvanceId = null;
@@ -788,7 +876,7 @@ function setMediaSessionMeta(id){
       const el=getActiveEl();
       const t = d.seekTime||0;
       beginScrubGuard();
-      if (playbackMode==="audio"){ try{ el.currentTime = Math.max(0, t + (audioBias||0)); }catch(_){}
+      if (playbackMode==="audio"){ try{ el.currentTime = Math.max(0, t + (audioBias||0)); }catch(_){ }
       }else{ try{ el.currentTime = t; }catch(_){} }
       endScrubGuardSoon();
       updatePositionState();
@@ -899,10 +987,68 @@ function injectVideoPreload(src){
 }
 
 /* ===== 播放入口 ===== */
+
+/* ★ 视口高度自适应 & 滚动拦截（进入/退出时安装/卸载） */
+function adjustFSViewport(){
+  const wrap = $("playerFS");
+  if (!wrap) return;
+  const h = window.innerHeight; // 避免安卓地址栏影响
+  wrap.style.height = h + "px";
+  const v = $("fsVideo"); const ov = $("overlay");
+  if (v) v.style.height = h + "px";
+  if (ov) ov.style.height = h + "px";
+}
+const _fsGuards = { installed:false, wheel:null, touch:null, vv:null, resize:null, orient:null, vvResize:null, vvScroll:null };
+function installFsGuards(){
+  if (_fsGuards.installed) return;
+  const wrap = $("playerFS");
+  if (!wrap) return;
+  // 拦截滚动（防上下滑动）
+  _fsGuards.wheel = (e)=>{ e.preventDefault(); };
+  _fsGuards.touch = (e)=>{ e.preventDefault(); };
+  wrap.addEventListener("wheel", _fsGuards.wheel, { passive:false });
+  wrap.addEventListener("touchmove", _fsGuards.touch, { passive:false });
+
+  // 绑定高度
+  adjustFSViewport();
+  _fsGuards.resize = ()=> adjustFSViewport();
+  _fsGuards.orient = ()=> adjustFSViewport();
+  window.addEventListener("resize", _fsGuards.resize);
+  window.addEventListener("orientationchange", _fsGuards.orient);
+  if (window.visualViewport){
+    _fsGuards.vvResize = ()=> adjustFSViewport();
+    _fsGuards.vvScroll = ()=> adjustFSViewport();
+    window.visualViewport.addEventListener("resize", _fsGuards.vvResize);
+    window.visualViewport.addEventListener("scroll", _fsGuards.vvScroll);
+  }
+
+  _fsGuards.installed = true;
+}
+function removeFsGuards(){
+  if (!_fsGuards.installed) return;
+  const wrap = $("playerFS");
+  if (wrap){
+    if (_fsGuards.wheel) wrap.removeEventListener("wheel", _fsGuards.wheel, { passive:false });
+    if (_fsGuards.touch) wrap.removeEventListener("touchmove", _fsGuards.touch, { passive:false });
+    wrap.style.height = "";
+  }
+  const v = $("fsVideo"); const ov = $("overlay");
+  if (v) v.style.height = "";
+  if (ov) ov.style.height = "";
+  if (_fsGuards.resize) window.removeEventListener("resize", _fsGuards.resize);
+  if (_fsGuards.orient) window.removeEventListener("orientationchange", _fsGuards.orient);
+  if (window.visualViewport){
+    if (_fsGuards.vvResize) window.visualViewport.removeEventListener("resize", _fsGuards.vvResize);
+    if (_fsGuards.vvScroll) window.visualViewport.removeEventListener("scroll", _fsGuards.vvScroll);
+  }
+  _fsGuards.installed = false;
+}
+
+/* 进入播放器 */
 async function startPlaylist(items, startIndex=0, returnPath=null){
   cancelProgressive();
 
-  // Busy 此时应已被 primeBusy() 提前显示；这里仍兜底显示一次
+  // Busy 在首页/其他入口仍保留；但从播放列表内部点击不会再触发（见 renderPlaylistPanel）
   showBusy("正在准备播放器…");
 
   player.ids = items.map(x=>x.id);
@@ -917,6 +1063,18 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   playbackMode = "video";
 
   wrap.style.display = "flex";
+
+  // ★ 移除左上角返回按钮（若存在）
+  const backBtn = $("btnBack");
+  if (backBtn && backBtn.parentNode) backBtn.parentNode.removeChild(backBtn);
+
+  // ★ 禁用页面滚动
+  document.documentElement.classList.add("noscroll");
+  document.body.classList.add("noscroll");
+
+  // ★ 安装视口/滚动守卫
+  installFsGuards();
+
   enforceNoPIP(v);
 
   if (!v._bound) {
@@ -956,7 +1114,7 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
 
   try{
     a.autoplay = false; a.preload = "auto";
-    a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline","");
+    a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline",""); 
     a.disableRemotePlayback = true;
     a.muted = true; a.volume = 0;
   }catch(_){}
@@ -967,13 +1125,9 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   }catch(_){}
   try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
 
-  $("btnBack").onclick = async ()=>{
-    if (uiLock.byPlaylist) return;
-    await exitPlayer();
-    if (fsOverlayInHistory){ fsOverlayInHistory = false; try{ history.back(); }catch(_){ } }
-    if (state.path !== player.returnPath) navigateToPath(player.returnPath);
-  };
-  $("btnMenu").onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
+  // 仅保留菜单按钮
+  const btnMenu = $("btnMenu");
+  if (btnMenu) btnMenu.onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
 
   const waitReady = new Promise(res=>{
     let done=false;
@@ -1062,7 +1216,11 @@ function renderPlaylistPanel(){
     const li = document.createElement("li");
     li.className = (i===player.index) ? "active" : "";
     li.innerHTML = `<span class="dot"></span><span>${player.titles[id] || ("视频 "+id)}</span>`;
-    li.onclick = ()=> { primeBusy(); playIndex(i); };
+    li.onclick = async ()=>{
+      // ★ 最小化修复：不再显示转圈，且点击后自动收起
+      hidePlaylistPanel();
+      await playIndex(i);
+    };
     ul.appendChild(li);
   });
 }
@@ -1082,6 +1240,11 @@ async function exitPlayer(){
   $("playlistPanel").classList.add("hidden");
   stopBgAdvanceGuard(); stopPosTicker(); stopFgSync(); stopBgKeepAlive();
   resumeGridImageLoads();
+
+  // ★ 恢复页面滚动 & 卸载守卫
+  document.documentElement.classList.remove("noscroll");
+  document.body.classList.remove("noscroll");
+  removeFsGuards();
 }
 
 function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
@@ -1182,7 +1345,7 @@ async function progressivePlaySelection(){
   if (!initial.length && selFolders.length){
     const firstFolderItems = await getFolderItems(selFolders[0]);
     await syncWatched(firstFolderItems.map(x=>x.id));
-    if (!firstFolderItems.length){ hideBusy(); alert("所选文件夹没有可播放视频"); return; }
+    if (!firstFolderItems.length){ hideBusy(); alert("该文件夹没有可播放视频"); return; }
     initial = firstFolderItems.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, firstFolderItems.length));
   }
   if (!initial.length){ hideBusy(); alert("所选没有未完成的视频"); return; }
@@ -1326,13 +1489,13 @@ function showPlaylistPanel(){
   const blockScroll = (e)=>{ e.preventDefault(); };
   shade._closeOnShade = closeOnShade;
   shade._blockScroll = blockScroll;
-  shade.addEventListener("click", closeOnShade);
+  shade.addEventListener("click", closeOnShade);               // 点击外侧遮罩关闭
   shade.addEventListener("wheel", blockScroll, { passive:false });
   shade.addEventListener("touchmove", blockScroll, { passive:false });
 
+  // （其余 modal 守卫保留）
   const allowInPanel = (el)=> !!(el && (el.closest("#playlistPanel") || el.closest("#btnMenu")));
   const allowShadeClick = (type, el)=> (type==="click" && el && el.id==="shade");
-
   const guard = (e)=>{
     const el = e.target;
     if (allowInPanel(el) || allowShadeClick(e.type, el)) return;
@@ -1349,19 +1512,31 @@ function showPlaylistPanel(){
 
   const escToClose = (e)=>{ if (uiLock.byPlaylist && e.key==="Escape"){ e.preventDefault(); hidePlaylistPanel(); } };
   addModalGuard("keydown", escToClose, true);
+
+  // ★ 竖屏时加宽（JS 侧最小化处理，避免改动 CSS）
+  const panel = $("playlistPanel");
+  if (panel){
+    if (window.innerHeight > window.innerWidth){
+      panel.style.width = Math.min(Math.floor(window.innerWidth*0.92), 560) + "px";
+    } else {
+      panel.style.width = ""; // 使用默认样式
+    }
+  }
 }
 function hidePlaylistPanel(){
   uiLock.byPlaylist = false;
-  $("playlistPanel").classList.add("hidden");
   $("playerFS").classList.remove("locked");
-
+  const panel = $("playlistPanel");
+  if (panel) panel.classList.add("hidden");
   const shade = $("shade");
-  shade.classList.add("hidden");
-  if (shade._closeOnShade){ shade.removeEventListener("click", shade._closeOnShade); shade._closeOnShade=null; }
-  if (shade._blockScroll){
-    shade.removeEventListener("wheel", shade._blockScroll);
-    shade.removeEventListener("touchmove", shade._blockScroll);
-    shade._blockScroll=null;
+  if (shade){
+    shade.classList.add("hidden");
+    if (shade._closeOnShade){ shade.removeEventListener("click", shade._closeOnShade); shade._closeOnShade=null; }
+    if (shade._blockScroll){
+      shade.removeEventListener("wheel", shade._blockScroll);
+      shade.removeEventListener("touchmove", shade._blockScroll);
+      shade._blockScroll=null;
+    }
   }
   removeModalGuards();
 }

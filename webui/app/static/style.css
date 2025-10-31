@@ -1,6 +1,9 @@
-/* app/static/style.css  (fs-30)
-   - 全屏层级修复（保留）
-   - 新增：常显“已观看”按钮 .watched-btn（可点击切换）
+/* app/static/style.css  (fs-30 + 播放页 UI 修复)
+   - 去掉左上角返回按钮
+   - 竖屏播放列表加宽
+   - 全屏使用 100dvh，修复安卓地址栏导致的可视高度问题
+   - 底部控件安全区 padding，确保进度条不出屏
+   - 播放页阻止上下滑动；进入/退出通过 .noscroll 切换
 */
 
 :root { color-scheme: light; }
@@ -13,6 +16,9 @@ body {
 button { cursor:pointer; }
 a.link { color:#0059c9; text-decoration:none; }
 a.link:hover { text-decoration:underline; }
+
+/* 禁止滚动（由 app.js 在播放器打开时加上） */
+html.noscroll, body.noscroll { height:100%; overflow:hidden; position:relative; }
 
 /* ===== 顶部 ===== */
 .topbar {
@@ -76,7 +82,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .tile .tile-menu:hover{ background:rgba(255,255,255,.62); }
 
-/* ✅ 常显“已观看”按钮（左上） */
+/* 常显“已观看”按钮（左上） */
 .watched-btn{
   position:absolute; z-index:3;
   top:8px; left:8px;
@@ -86,23 +92,13 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   color:#888; font-weight:700; font-size:16px; line-height:1;
   display:flex; align-items:center; justify-content:center;
   box-shadow:0 2px 6px rgba(0,0,0,.10);
-  opacity:.35;                /* 未观看：高透明 */
+  opacity:.35;
   transition:opacity .15s ease, transform .12s ease, background .15s ease, color .15s ease, border-color .15s ease;
-  pointer-events:auto;        /* 一定要可点 */
+  pointer-events:auto;
 }
 .watched-btn:hover{ opacity:.9; transform:scale(1.05); }
-.watched-btn.off{               /* 未观看 */
-  background:rgba(255,255,255,.35);
-  color:#888;
-  border-color:rgba(0,0,0,.25);
-  opacity:.35;
-}
-.watched-btn.on{                /* 已观看：低透明 + 颜色 */
-  background:rgba(8,160,44,.12);
-  color:#0b7d0b;
-  border-color:rgba(8,160,44,.35);
-  opacity:.95;
-}
+.watched-btn.off{ background:rgba(255,255,255,.35); color:#888; border-color:rgba(0,0,0,.25); opacity:.35; }
+.watched-btn.on{  background:rgba(8,160,44,.12); color:#0b7d0b; border-color:rgba(8,160,44,.35); opacity:.95; }
 
 /* 选中/动画 */
 .tile.selected { border-color:#00aaff; box-shadow: 0 0 0 2px rgba(0,170,255,.35) inset; }
@@ -127,11 +123,20 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   background: rgba(0,170,255,.13); pointer-events:none;
 }
 
-/* ============ 全屏播放器容器 + 分层（关键修复） ============ */
+/* ============ 全屏播放器容器 + 分层 ============ */
 .playerfs{
   position:fixed; left:0; top:0; width:100vw; height:100vh; background:#000;
   z-index:1200; display:flex; align-items:center; justify-content:center;
+  /* ★ 防上下滑动、边界回弹 */
+  touch-action:none; overscroll-behavior:contain;
 }
+/* ★ 使用动态视口高度，修复安卓地址栏顶起导致的高度不足 */
+@supports (height: 100dvh){
+  .playerfs{ height:100dvh; }
+  .playerfs video{ height:100dvh; }
+  .overlay{ height:100dvh; }
+}
+
 .playerfs video{
   position:absolute; left:0; top:0; width:100vw; height:100vh;
   object-fit:contain; z-index:10; background:#000;
@@ -139,7 +144,11 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 .overlay{
   position:absolute; left:0; top:0; width:100vw; height:100vh;
   pointer-events:none; z-index:20;
+  /* ★ 为底部控件预留安全区，避免进度条被顶出屏外 */
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
 }
+
+/* 图标按钮（菜单保留，返回按钮隐藏） */
 .icon-btn{
   pointer-events:auto; position:fixed; top:14px; width:38px; height:38px; border-radius:38px;
   background:rgba(255,255,255,.75); color:#111; border:none; font-size:18px;
@@ -147,10 +156,11 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   opacity:.85; transition:opacity .2s ease; z-index:30;
 }
 .icon-btn:hover{ opacity:1; }
-.icon-btn.back{ left:14px; }
 .icon-btn.menu{ right:14px; }
+.icon-btn.back{ display:none !important; } /* ★ 去掉左上角返回按钮 */
 .playerfs.idle .icon-btn{ opacity:0; }
 
+/* 半透明遮罩：点击可收起播放列表 */
 .shade{
   position:fixed; left:0; top:0; width:100%; height:100%;
   background: rgba(0,0,0,.25);
@@ -161,9 +171,11 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .shade.hidden{ display:none; }
 
+/* 播放列表面板 */
 .playlist{
   position:fixed; left:50%; transform:translateX(-50%);
-  top:60px; bottom:14px;
+  top: max(56px, calc(12px + env(safe-area-inset-top, 0px)));
+  bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   width:28vw; max-width:420px;
   pointer-events:auto;
   background:rgba(255,255,255,.96); border:1px solid #ddd; border-radius:10px;
@@ -171,7 +183,19 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   z-index:33;
 }
 .playlist.hidden{ display:none; }
-@media (min-width: 1024px){ .playlist{ width:360px; } }
+
+/* ★ 竖屏下加宽（手机竖屏显著更宽） */
+@media (orientation: portrait){
+  .playlist{
+    width: min(92vw, 560px);
+    max-width: 560px;
+  }
+}
+/* 宽屏下的默认宽度 */
+@media (min-width: 1024px){
+  .playlist{ width:360px; max-width: 420px; }
+}
+
 .plist-header{ padding:10px 12px; font-weight:600; border-bottom:1px solid #eee; background:#fafafa; }
 #plist{ list-style:none; margin:0; padding:0; overflow:auto; }
 #plist li{ display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid #f1f1f1; cursor:pointer; }
@@ -180,7 +204,9 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 #plist .dot{ width:8px; height:8px; border-radius:8px; background:#bbb; }
 #plist li.active .dot{ background:#007fff; }
 
-.playerfs.locked{ touch-action:none; overscroll-behavior:contain; }
+.playerfs.locked{ /* 继续保留锁定行为（抽屉打开时） */
+  touch-action:none; overscroll-behavior:contain;
+}
 .playerfs.locked video{ pointer-events:none; }
 
 .inf-status{ text-align:center; padding:12px 10px; color:#666; font-size:13px; }
