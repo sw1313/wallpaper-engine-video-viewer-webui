@@ -1,9 +1,10 @@
-/* app/static/app.js (fs-36f-faststart-once-8s)
- * 新增：全局“转圈加载”遮罩，播放启动阶段阻塞所有操作
- * 保留：后台音频 PTS 偏移修复（audioBias）
- * 调整：faststart 触发阈值改为 8s；/api/faststart 响应 JSON & 已做过时提示
+/* app/static/app.js (fs-42a-keepalive-busy-prime)
+ * 新增：
+ * 1) 后台保活：后台音频播放时启用 WebAudio 常量源 + 45s keepalive 心跳
+ * 2) Busy 提前显示：在所有播放入口“点击瞬间”就出现“正在启动播放器…”
+ * 继续保留：前后台同集同步、双声消除、二次暂停后不回跳、拖动保护、8s 卡顿兜底、faststart 一次性修复
  */
-console.log("app.js version fs-36f-faststart-once-8s");
+console.log("app.js version fs-42a-keepalive-busy-prime");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -13,10 +14,10 @@ let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:""
 
 let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/" };
 
-/* === missing globals (hotfix) === */
 let media = { v: null, a: null };
 let playbackMode = "video";
 let fsOverlayInHistory = false;
+
 let _userPaused = false;
 function markUserPaused(){ _userPaused = true; }
 function clearUserPaused(){ _userPaused = false; }
@@ -26,6 +27,18 @@ let audioBias = 0;
 
 /* === 卡顿触发阈值（毫秒） === */
 const STALL_REPAIR_GRACE_MS = 8000;
+
+/* === 拖动进度保护（避免切换/重载） === */
+const scrubGuard = { active:false, timer:null };
+function beginScrubGuard(){
+  scrubGuard.active = true;
+  if (scrubGuard.timer) clearTimeout(scrubGuard.timer);
+  scrubGuard.timer = setTimeout(()=>{ scrubGuard.active = false; }, 1600);
+}
+function endScrubGuardSoon(){
+  if (scrubGuard.timer) clearTimeout(scrubGuard.timer);
+  scrubGuard.timer = setTimeout(()=>{ scrubGuard.active = false; }, 400);
+}
 
 /* === 全局忙碌遮罩（转圈 + 阻塞） === */
 let busyShown = false, busyGuardsOn = false;
@@ -77,6 +90,14 @@ function hideBusy(){
   removeBusyGuards();
   busyShown = false;
 }
+/* 让 Busy “更早出现”的工具：如果没显示就立刻显示 */
+function primeBusy(text="正在启动播放器…"){
+  if (!busyShown) showBusy(text);
+  else {
+    const t = document.getElementById("busyText");
+    if (t) t.textContent = text;
+  }
+}
 
 let prefetchState = { key:"", page:0, opts:null, data:null, controller:null, inflight:false };
 let progressive = { key:"", running:false, cancel:false, seen:new Set() };
@@ -90,7 +111,8 @@ const grid = () => $("grid");
 
 function detectByUA(){
   const ua = navigator.userAgent || navigator.vendor || window.opera || "";
-  try { const o = localStorage.getItem("uaMode");
+  try {
+    const o = localStorage.getItem("uaMode");
     if (o === "desktop") return { isMobile: false, ua };
     if (o === "mobile")  return { isMobile: true, ua };
   } catch(_) {}
@@ -374,7 +396,6 @@ function buildCrumbHtml(pathStr){
 
 /* =================== 播放控制（无 MSE） =================== */
 
-/* --- 用户手势预解锁 --- */
 let userGestureUnlocked = false;
 async function unlockPlaybackOnUserGesture(){
   if (userGestureUnlocked) return;
@@ -437,33 +458,101 @@ function computeAudioBias(a){
   return b;
 }
 
+/* ========== 后台保活（best-effort） ========== */
+const keepAlive = { ctx:null, gain:null, src:null, pingTimer:null, active:false };
+async function startBgKeepAlive(){
+  if (keepAlive.active) return;
+  keepAlive.active = true;
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return; // 老浏览器
+    if (!keepAlive.ctx) keepAlive.ctx = new AC({ latencyHint: "interactive" });
+    await keepAlive.ctx.resume().catch(()=>{});
+    if (!keepAlive.gain){
+      keepAlive.gain = keepAlive.ctx.createGain();
+      keepAlive.gain.gain.value = 1e-7; // 极低电平，实际不可闻
+      keepAlive.gain.connect(keepAlive.ctx.destination);
+    }
+    if (!keepAlive.src){
+      if (keepAlive.ctx.createConstantSource){
+        keepAlive.src = keepAlive.ctx.createConstantSource();
+        keepAlive.src.offset.value = 0.0;
+      } else {
+        // 兜底：1Hz 正弦
+        keepAlive.src = keepAlive.ctx.createOscillator();
+        keepAlive.src.frequency.value = 1;
+      }
+      keepAlive.src.connect(keepAlive.gain);
+      try{ keepAlive.src.start(); }catch(_){}
+    }
+    if (keepAlive.pingTimer) clearInterval(keepAlive.pingTimer);
+    keepAlive.pingTimer = setInterval(()=>{
+      if (document.visibilityState === "hidden"){
+        try{
+          fetch("/api/keepalive", { method:"POST", body:"1", keepalive:true, cache:"no-store", headers:{ "Content-Type":"text/plain" } }).catch(()=>{});
+        }catch(_){}
+      }
+    }, 45000); // 45s 心跳
+  }catch(_){
+    keepAlive.active = false;
+  }
+}
+function stopBgKeepAlive(){
+  keepAlive.active = false;
+  if (keepAlive.pingTimer){ clearInterval(keepAlive.pingTimer); keepAlive.pingTimer = null; }
+  if (keepAlive.ctx){
+    try{ keepAlive.ctx.suspend(); }catch(_){}
+  }
+}
+
+/* === 附加/预热（带 seek 策略） === */
 async function attachVideoSrc(src, resumeAt){
   const v = media.v || $("fsVideo");
   if (!v) return;
   enforceNoPIP(v);
-  v.src = src; try{ v.load(); }catch(_){}
+  const curAttr = v.getAttribute("src") || "";
+  const needReload = curAttr !== src;
+  if (needReload){ v.src = src; try{ v.load(); }catch(_){} }
   setCurrentTimeWhenReady(v, resumeAt||0);
 }
-
-async function attachAudioSrc(src, resumeAt, {muted=true, ensurePlay=true}={}){
+async function attachAudioSrc(src, resumeAt, {muted=true, ensurePlay=true, seek='smart'}={}){
   const a = media.a || $("bgAudio");
   if (!a) return;
   try{
-    const needReload = (a.getAttribute("src") !== src);
+    const prevSrc = a.getAttribute("src") || "";
+    const needReload = (prevSrc !== src);
     if (needReload){ a.src = src; a.load(); }
     a.muted = !!muted; a.volume = muted ? 0 : Math.max(0.6, a.volume||0.6);
 
-    const applyBias = ()=>{
+    const setTime = ()=>{
       audioBias = computeAudioBias(a);
       if (Number.isFinite(resumeAt)) {
-        try{ a.currentTime = Math.max(0, (resumeAt||0) + (audioBias||0)); }catch(_){}
+        const target = Math.max(0, (resumeAt||0) + (audioBias||0));
+        const diff = Math.abs((a.currentTime||0) - target);
+        const shouldSeek = (seek === 'force') || (seek === 'smart' && (needReload || diff > 0.5));
+        if (shouldSeek){ try{ a.currentTime = target; }catch(_){ } }
       }
     };
-    if (a.readyState >= 1) applyBias();
-    else a.addEventListener("loadedmetadata", function once(){ a.removeEventListener("loadedmetadata", once); applyBias(); });
 
-    if (ensurePlay){ try{ await a.play(); }catch(_){ } }
+    if (a.readyState >= 1) setTime();
+    else a.addEventListener("loadedmetadata", function once(){ a.removeEventListener("loadedmetadata", once); setTime(); });
+
+    if (ensurePlay){ try{ await a.play(); clearUserPaused(); }catch(_){ } }
   }catch(_){}
+}
+function prewarmVideo(srcUrl, resumeAt){
+  queueMicrotask(async ()=>{
+    try{
+      await attachVideoSrc(srcUrl, resumeAt||0);
+      const v = media.v || $("fsVideo");
+      if (v){ try{ v.pause(); }catch(_){ } }
+    }catch(_){}
+  });
+}
+function prewarmAudio(srcUrl, resumeAt){
+  queueMicrotask(async ()=>{
+    try{ await attachAudioSrc(srcUrl, resumeAt||0, { muted:true, ensurePlay:true, seek:'smart' }); }catch(_){}
+  });
 }
 
 async function detachVideoSrc(){
@@ -473,14 +562,7 @@ async function detachVideoSrc(){
   try{ v.removeAttribute("src"); v.load(); }catch(_){}
 }
 
-/* —— 前台音频预热（静音，不阻塞） —— */
-function prewarmAudio(srcUrl, resumeAt){
-  queueMicrotask(async ()=>{
-    try{ await attachAudioSrc(srcUrl, resumeAt||0, { muted:true, ensurePlay:true }); }catch(_){}
-  });
-}
-
-/* —— 前台对齐 —— */
+/* —— 前台对齐（视频前台、音频静音跟随时用） —— */
 let fgSyncTimer = null;
 function startFgSync(){
   if (fgSyncTimer) return;
@@ -492,7 +574,7 @@ function startFgSync(){
     if (a.muted && Number.isFinite(v.currentTime)) {
       const target = (v.currentTime||0) + (audioBias||0);
       const dv = Math.abs((a.currentTime||0) - target);
-      if (dv > 0.5) { try{ a.currentTime = target; }catch(_){} }
+      if (dv > 0.5) { try{ a.currentTime = target; }catch(_){ } }
     }
   }, 1500);
 }
@@ -538,53 +620,99 @@ function updatePositionState(){
 function startPosTicker(){ if (posTicker) return; updatePositionState(); posTicker = setInterval(updatePositionState, 1000); }
 function stopPosTicker(){ if (posTicker){ clearInterval(posTicker); posTicker=null; } }
 
-/* —— 可见性切换 —— */
+/* =================== 前后台切换 & 前台晋升 =================== */
+
 let switchLock = false;
 function withSwitchLock(fn){ return async (...args)=>{ if (switchLock) return; switchLock = true; try{ await fn(...args); } finally { setTimeout(()=>{ switchLock=false; }, 200); } }; }
 
-const switchToAudio = withSwitchLock(async function(){
-  if (!isPlayerActive() || playbackMode==="audio") return;
-  const v = media.v || $("fsVideo");
-  const id = player.ids[player.index];
-  const src = audioSrcOf(id);
-  const resumeAt = Number.isFinite(v.currentTime) ? v.currentTime : 0;
-
-  audioBias = 0;
-  try{ await attachAudioSrc(src, resumeAt, { muted:false, ensurePlay:true }); }catch(_){}
-  await detachVideoSrc();
-
-  clearUserPaused();
-  playbackMode = "audio";
-  updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
-  startBgAdvanceGuard();
-});
-
-const switchToVideo = withSwitchLock(async function(){
-  if (!isPlayerActive() || playbackMode==="video") return;
+/* 统一的前台晋升：以音频“当前集 + 进度”为准同步视频并秒开，避免双声 */
+async function promoteToVideoNow(reason="unknown"){
+  if (!isPlayerActive()) return;
+  if (scrubGuard.active) return;
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
   const id = player.ids[player.index];
+  if (!v || !a || !id) return;
+
   const vSrc = mediaVideoSrcOf(id);
   const resumeAt = Number.isFinite(a.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : 0;
 
   await attachVideoSrc(vSrc, resumeAt);
-  const ok = await safePlay(v);
-  if (!ok){ showNotice("恢复前台播放被阻止，点一下屏幕继续"); installUserGestureUnlock(); }
 
-  prewarmAudio(audioSrcOf(id), resumeAt);
-  clearUserPaused();
+  try{ a.pause(); a.muted = true; }catch(_){}
+
   playbackMode = "video";
+  stopBgKeepAlive();              // ← 前台视频时停止保活
   updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
   stopBgAdvanceGuard();
+
+  const ok = await safePlay(v);
+  if (!ok){ showNotice("前台播放被阻止，点一下屏幕继续"); installUserGestureUnlock(); }
+}
+
+/* 后台：根据用户是否暂停决定是否自动播放音频 */
+const switchToAudio = withSwitchLock(async function(){
+  if (!isPlayerActive() || playbackMode==="audio") return;
+  if (scrubGuard.active) return;
+
+  const v = media.v || $("fsVideo");
+  const id = player.ids[player.index];
+  const aSrc = audioSrcOf(id);
+  const vSrc = mediaVideoSrcOf(id);
+
+  const wasVideoPaused = !!(v && v.paused);
+  const autoPlay = !(wasVideoPaused || _userPaused); // 用户在前台暂停→后台不自动播
+
+  const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : 0;
+
+  // 附加音频（autoPlay 决定是否播放；首次对齐强制 seek）
+  try{
+    await attachAudioSrc(aSrc, resumeAt, {
+      muted: !autoPlay ? true : false,
+      ensurePlay: !!autoPlay,
+      seek: 'force'
+    });
+  }catch(_){}
+
+  // 视频保持 attach + 定位，但暂停（仅加载）
+  try{
+    await attachVideoSrc(vSrc, resumeAt);
+    try{ v.pause(); }catch(_){}
+  }catch(_){}
+
+  clearUserPaused();
+  playbackMode = "audio";
+  updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
+  if (autoPlay){ startBgAdvanceGuard(); startBgKeepAlive(); } else { stopBgAdvanceGuard(); stopBgKeepAlive(); }
 });
 
+/* 显式切回前台 → 统一用 promoteToVideoNow */
+const switchToVideo = withSwitchLock(async function(){
+  if (!isPlayerActive() || playbackMode==="video") return;
+  if (scrubGuard.active) return;
+  await promoteToVideoNow("visibility");
+});
+
+/* —— 切换触发 —— */
 document.addEventListener("visibilitychange", async ()=>{
   if (!isPlayerActive()) return;
+  if (scrubGuard.active) return;
   if (document.visibilityState === "hidden") await switchToAudio();
   else await switchToVideo();
 });
-window.addEventListener("pagehide", ()=> { if (isPlayerActive()) switchToAudio(); });
-document.addEventListener("freeze",   ()=> { if (isPlayerActive()) switchToAudio(); });
+window.addEventListener("focus", async ()=>{
+  if (!isPlayerActive()) return;
+  if (document.visibilityState !== "visible") return;
+  await switchToVideo();
+});
+window.addEventListener("pageshow", async ()=>{
+  if (!isPlayerActive()) return;
+  if (document.visibilityState !== "visible") return;
+  await switchToVideo();
+});
+
+window.addEventListener("pagehide", ()=> { if (isPlayerActive() && !scrubGuard.active) switchToAudio(); });
+document.addEventListener("freeze",   ()=> { if (isPlayerActive() && !scrubGuard.active) switchToAudio(); });
 
 /* —— 结束→下一集 —— */
 let lastAdvanceId = null;
@@ -621,30 +749,37 @@ function setMediaSessionMeta(id){
   try { navigator.mediaSession.metadata = new MediaMetadata({ title, artist:"Wallpaper Engine", album: state.path, artwork }); } catch(_){}
   if (!setMediaSessionMeta._installed){
     const both = ()=>({ v: (media.v||$("fsVideo")), a: (media.a||$("bgAudio")) });
+
     navigator.mediaSession.setActionHandler("play", async ()=>{
       clearUserPaused();
       const {v,a} = both();
       if (document.visibilityState==="hidden"){
-        const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : (Number.isFinite(a?.currentTime) ? Math.max(0,a.currentTime-(audioBias||0)) : 0);
-        try{ await attachAudioSrc(audioSrcOf(player.ids[player.index]), resumeAt, { muted:false, ensurePlay:true }); }catch(_){}
-        playbackMode = "audio";
-      } else {
+        // 后台优先用音频的当前时间，避免回跳
         const id = player.ids[player.index];
-        const resumeAt = Number.isFinite(a?.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : v.currentTime||0;
-        await attachVideoSrc(mediaVideoSrcOf(id), resumeAt);
-        const ok = await safePlay(v); if (!ok) installUserGestureUnlock();
-        prewarmAudio(audioSrcOf(id), resumeAt);
-        playbackMode = "video";
+        const aSrc = audioSrcOf(id);
+        const resumeAt =
+          Number.isFinite(a?.currentTime) ? Math.max(0, a.currentTime - (audioBias||0))
+          : Number.isFinite(v?.currentTime) ? v.currentTime
+          : 0;
+        await attachAudioSrc(aSrc, resumeAt, { muted:false, ensurePlay:true, seek:'smart' });
+        playbackMode = "audio";
+        startBgAdvanceGuard();
+        startBgKeepAlive();     // ← Media Session 后台播放时开启保活
+      } else {
+        await promoteToVideoNow("media-session-play");
       }
       updateMediaSessionPlaybackState(); startPosTicker(); updatePositionState();
     });
+
     navigator.mediaSession.setActionHandler("pause", async ()=>{
       markUserPaused();
       const {v,a} = both();
       try{ v.pause(); }catch(_){}
       try{ a.pause(); }catch(_){}
+      stopBgKeepAlive();        // ← 暂停时停止保活
       updateMediaSessionPlaybackState(); updatePositionState(); stopPosTicker();
     });
+
     navigator.mediaSession.setActionHandler("previoustrack", async ()=>{ if (player.index>0) await playIndex(player.index-1, {resumeAt:0}); });
     navigator.mediaSession.setActionHandler("nexttrack", async ()=>{ await nextInPlaylist(); });
     navigator.mediaSession.setActionHandler("seekbackward", (d)=>{ const el=getActiveEl(); el.currentTime=Math.max(0, el.currentTime-(d?.seekOffset||10)); if (playbackMode==="audio") updatePositionState(); });
@@ -652,8 +787,10 @@ function setMediaSessionMeta(id){
     navigator.mediaSession.setActionHandler("seekto", async (d)=>{
       const el=getActiveEl();
       const t = d.seekTime||0;
+      beginScrubGuard();
       if (playbackMode==="audio"){ try{ el.currentTime = Math.max(0, t + (audioBias||0)); }catch(_){}
       }else{ try{ el.currentTime = t; }catch(_){} }
+      endScrubGuardSoon();
       updatePositionState();
     });
     setMediaSessionMeta._installed = true;
@@ -672,23 +809,30 @@ function installStallListeners(v, a){
   if (!v._stallBound){
     const vh = async ()=> await maybeRepairFromEl('video', v);
     v.addEventListener('stalled', vh); v.addEventListener('waiting', vh); v.addEventListener('error',   vh);
+    v.addEventListener('seeking', ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); updatePositionState(); });
+    v.addEventListener('seeked',  ()=>{ endScrubGuardSoon(); updatePositionState(); });
+    v.addEventListener('playing', ()=> clearUserPaused());
+    v.addEventListener('pause',   ()=>{ if (document.visibilityState==='visible') markUserPaused(); updatePositionState(); });
     v._stallBound = true;
   }
   if (!a._stallBound){
     const ah = async ()=> await maybeRepairFromEl('audio', a);
     a.addEventListener('stalled', ah); a.addEventListener('waiting', ah); a.addEventListener('error',   ah);
+    a.addEventListener('playing', ()=> clearUserPaused());
     a._stallBound = true;
   }
 }
 async function maybeRepairFromEl(which, el){
   if (!isPlayerActive()) return;
+  if (scrubGuard.active) return;
+  if (playbackMode === "audio" && which === "video") return;
+
   const id = player.ids[player.index];
   if (!id || stallRepair.inFlight || stallRepair.tried.has(String(id))) return;
   const early = (el.currentTime || 0) < 1.0;
   const starving = (el.readyState || 0) < 3;
   if (!(early || starving)) return;
 
-  // ★ 仅当播放已卡顿满 8s 才触发修复
   if (!stallRepair.startedAt) stallRepair.startedAt = Date.now();
   if (Date.now() - stallRepair.startedAt < STALL_REPAIR_GRACE_MS) return;
 
@@ -697,14 +841,13 @@ async function maybeRepairFromEl(which, el){
 function armFirstPlayWatch(id, el){
   disarmFirstPlayWatch();
   let started = false;
-  stallRepair.startedAt = Date.now(); // ★ 从首帧观察开始计时
+  stallRepair.startedAt = Date.now();
   const onPlaying = ()=>{ started = true; disarmFirstPlayWatch(); };
   const onProgress = ()=>{ if ((el.currentTime||0) >= 0.25){ started = true; disarmFirstPlayWatch(); } };
   el.addEventListener('playing', onPlaying, {once:true});
   el.addEventListener('timeupdate', onProgress);
   stallRepair.detach = ()=>{ try{ el.removeEventListener('timeupdate', onProgress); }catch(_){ } };
-  // ★ 8s 未启动首帧 → 触发 faststart
-  stallRepair.timer = setTimeout(()=>{ if (!started && !stallRepair.tried.has(String(id))) triggerRepair(id, el.currentTime||0); }, STALL_REPAIR_GRACE_MS);
+  stallRepair.timer = setTimeout(()=>{ if (!started && !stallRepair.tried.has(String(id)) && !scrubGuard.active) triggerRepair(id, el.currentTime||0); }, STALL_REPAIR_GRACE_MS);
 }
 function disarmFirstPlayWatch(){ if (stallRepair.timer){ clearTimeout(stallRepair.timer); stallRepair.timer=null; } if (stallRepair.detach){ try{ stallRepair.detach(); }catch(_){ } } stallRepair.detach=null; }
 async function triggerRepair(id, resumeAt){
@@ -759,7 +902,7 @@ function injectVideoPreload(src){
 async function startPlaylist(items, startIndex=0, returnPath=null){
   cancelProgressive();
 
-  // 显示全局忙碌遮罩并阻塞交互
+  // Busy 此时应已被 primeBusy() 提前显示；这里仍兜底显示一次
   showBusy("正在准备播放器…");
 
   player.ids = items.map(x=>x.id);
@@ -782,16 +925,31 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
     installAudioNearEndDetector(a);
     installStallListeners(v, a);
 
-    const bindPos = (el)=>{
+    try{
+      v.preload = "auto";
+      v.playsInline = true; v.setAttribute("playsinline",""); v.setAttribute("webkit-playsinline","");
+      v.disableRemotePlayback = true;
+    }catch(_){}
+
+    const bindPos = (el, isVideo)=>{
       el.addEventListener("timeupdate", updatePositionState);
       el.addEventListener("loadedmetadata", updatePositionState);
       el.addEventListener("durationchange", updatePositionState);
-      el.addEventListener("seeking", updatePositionState);
-      el.addEventListener("seeked", updatePositionState);
-      el.addEventListener("playing", ()=>{ updatePositionState(); startPosTicker(); });
-      el.addEventListener("pause",   ()=>{ updatePositionState(); });
+      el.addEventListener("playing", ()=>{
+        clearUserPaused(); updatePositionState(); startPosTicker();
+        if (!isVideo && playbackMode==="audio") startBgKeepAlive();  // ← 音频真正播放时开启保活
+      });
+      el.addEventListener("pause",   ()=>{
+        if (document.visibilityState==='visible') markUserPaused();
+        updatePositionState();
+        if (!isVideo) stopBgKeepAlive();                             // ← 音频暂停时停止保活
+      });
+      if (isVideo){
+        el.addEventListener("seeking", ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); updatePositionState(); });
+        el.addEventListener("seeked",  ()=>{ endScrubGuardSoon(); updatePositionState(); });
+      }
     };
-    bindPos(v); bindPos(a);
+    bindPos(v, true); bindPos(a, false);
 
     v._bound = a._bound = true;
   }
@@ -822,7 +980,7 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
     const finish=()=>{ if(done) return; done=true; res(); };
     const vPlaying = ()=> finish();
     const aPlaying = ()=> finish();
-    const killTimer = setTimeout(finish, 2000); // 最多转圈2秒，避免卡死
+    const killTimer = setTimeout(finish, 2000);
     const cleanup = ()=>{
       clearTimeout(killTimer);
       try{ v.removeEventListener("playing", vPlaying); }catch(_){}
@@ -840,7 +998,6 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   unlockPlaybackOnUserGesture();
   await playIndex(player.index);
 
-  // 等待“开始播放”或短超时，然后关闭遮罩
   await waitReady;
   hideBusy();
 }
@@ -850,7 +1007,7 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   player.index = i;
   lastAdvanceId = null;
   disarmFirstPlayWatch();
-  stallRepair.startedAt = Date.now(); // ★ 每次切集重新计时
+  stallRepair.startedAt = Date.now();
 
   const a0 = media.a || $("bgAudio");
   if (a0){ try{ a0.muted = true; a0.volume = 0; }catch(_){ } }
@@ -866,20 +1023,25 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   updatePositionState(); startPosTicker();
 
   if (document.visibilityState === "hidden") {
+    // 后台启动或后台切集：attach 音频 + 预热视频（不播放），首次对齐强制 seek
     audioBias = 0;
-    try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true }); }catch(_){}
-    await detachVideoSrc();
-    clearUserPaused();
+    try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true, seek:'force' }); }catch(_){}
+    try{
+      await attachVideoSrc(vSrc, resumeAt||0);
+      try{ v.pause(); }catch(_){}
+    }catch(_){}
     playbackMode = "audio";
     startBgAdvanceGuard();
+    startBgKeepAlive();   // ← 后台开始播放时启动保活
     armFirstPlayWatch(id, a);
   } else {
+    // 前台启动：视频播放 + 预热音频
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
     prewarmAudio(aSrc, resumeAt||0);
-    clearUserPaused();
     stopBgAdvanceGuard();
+    stopBgKeepAlive();
     armFirstPlayWatch(id, v);
     playbackMode = "video";
   }
@@ -900,7 +1062,7 @@ function renderPlaylistPanel(){
     const li = document.createElement("li");
     li.className = (i===player.index) ? "active" : "";
     li.innerHTML = `<span class="dot"></span><span>${player.titles[id] || ("视频 "+id)}</span>`;
-    li.onclick = ()=> playIndex(i);
+    li.onclick = ()=> { primeBusy(); playIndex(i); };
     ul.appendChild(li);
   });
 }
@@ -918,7 +1080,7 @@ async function exitPlayer(){
   try { a.removeAttribute("src"); a.load(); } catch(_){}
   wrap.style.display = "none";
   $("playlistPanel").classList.add("hidden");
-  stopBgAdvanceGuard(); stopPosTicker(); stopFgSync();
+  stopBgAdvanceGuard(); stopPosTicker(); stopFgSync(); stopBgKeepAlive();
   resumeGridImageLoads();
 }
 
@@ -956,6 +1118,7 @@ async function progressiveAppendFrom(producer, label="后台加载"){
   finally{ progressive.running = false; }
 }
 async function handlePlayUnwatched(){
+  primeBusy("正在启动播放器…");
   cancelProgressive();
   const current = getCurrentlyLoadedVideoItems();
   await syncWatched(current.map(x=>x.id));
@@ -965,7 +1128,7 @@ async function handlePlayUnwatched(){
   const all = await getFolderItems(state.path);
   await syncWatched(all.map(x=>x.id));
   const pending = all.filter(x => !isWatched(x.id) && !exclude.has(String(x.id)));
-  if (!initial.length && !pending.length){ setInfStatus("当前路径下没有未完成的视频"); return; }
+  if (!initial.length && !pending.length){ hideBusy(); setInfStatus("当前路径下没有未完成的视频"); return; }
   const BATCH = 200;
   if (!initial.length){
     const first = pending.slice(0, 30);
@@ -980,6 +1143,7 @@ async function handlePlayUnwatched(){
   }
 }
 async function handlePlayFromHereProgressive(vid, title){
+  primeBusy("正在启动播放器…");
   cancelProgressive();
   const initial = [{ id: String(vid), title: title || `视频 ${vid}` }];
   await startPlaylist(initial, 0, state.path);
@@ -994,13 +1158,14 @@ async function handlePlayFromHereProgressive(vid, title){
   progressiveAppendFrom(producer, "从该处后台加载");
 }
 async function progressivePlayFolder(path){
+  primeBusy("正在启动播放器…");
   cancelProgressive();
   setInfStatus("准备读取文件夹…");
   const all = await getFolderItems(path);
   await syncWatched(all.map(x=>x.id));
-  if (!all.length){ alert("该文件夹没有可播放视频"); return; }
+  if (!all.length){ hideBusy(); alert("该文件夹没有可播放视频"); return; }
   const initial = all.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, all.length));
-  if (!initial.length){ alert("该文件夹没有未完成的视频"); return; }
+  if (!initial.length){ hideBusy(); alert("该文件夹没有未完成的视频"); return; }
   await startPlaylist(initial, 0, path);
   progressive.seen = new Set(player.ids);
   const rest = all.filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
@@ -1009,6 +1174,7 @@ async function progressivePlayFolder(path){
   progressiveAppendFrom(producer, "文件夹后台加载");
 }
 async function progressivePlaySelection(){
+  primeBusy("正在启动播放器…");
   cancelProgressive();
   const selVideos = [...state.selV].map(String), selFolders = [...state.selF];
   let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }));
@@ -1016,10 +1182,10 @@ async function progressivePlaySelection(){
   if (!initial.length && selFolders.length){
     const firstFolderItems = await getFolderItems(selFolders[0]);
     await syncWatched(firstFolderItems.map(x=>x.id));
-    if (!firstFolderItems.length){ alert("所选文件夹没有可播放视频"); return; }
+    if (!firstFolderItems.length){ hideBusy(); alert("所选文件夹没有可播放视频"); return; }
     initial = firstFolderItems.filter(x=>!isWatched(x.id)).slice(0, Math.min(30, firstFolderItems.length));
   }
-  if (!initial.length){ alert("所选没有未完成的视频"); return; }
+  if (!initial.length){ hideBusy(); alert("所选没有未完成的视频"); return; }
   await startPlaylist(initial, 0, state.path);
   progressive.seen = new Set(player.ids);
   const BATCH = 200;
@@ -1087,7 +1253,7 @@ function bindDelegatedEvents(){
     t.el.classList.add("pulse"); setTimeout(()=> t.el.classList.remove("pulse"), 200);
     clearSel(); setSel(t,true); state.lastIdx=t.idx;
     if (t.type === "folder") navigateToPath(t.path);
-    else await startPlaylist([{id:t.vid, title:t.title}], 0, state.path);
+    else { primeBusy("正在启动播放器…"); await startPlaylist([{id:t.vid, title:t.title}], 0, state.path); }
   });
 
   try { el.oncontextmenu = null; } catch(_) {}
@@ -1119,7 +1285,7 @@ function openContextMenu(x,y){
   if (oneVideo) {
     const vid = [...state.selV][0];
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
-    add("播放此视频（全屏）", ()=> startPlaylist([{id:vid, title}], 0, state.path));
+    add("播放此视频（全屏）", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
     add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
     add("打开创意工坊链接", ()=> window.open(`/go/workshop/${vid}`, "_blank"));
     sep();
