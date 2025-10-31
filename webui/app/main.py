@@ -1,5 +1,6 @@
-# app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart)
+# app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart + keepalive)
 import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil
+import time, logging  # ★ 新增：用于 /api/keepalive 时间与日志过滤
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
@@ -104,6 +105,32 @@ def _get_cache_lock(path: str) -> threading.Lock:
 app = FastAPI(title="Wallpaper WebUI")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+# ==== keepalive（极简心跳） ====
+# 可选：静音 keepalive 的 access log（避免 log 被心跳刷屏）
+if os.getenv("SILENCE_KEEPALIVE_LOGS", "1") == "1":
+    class _KAFilter(logging.Filter):
+        def filter(self, record):
+            msg = getattr(record, "msg", "")
+            return "/api/keepalive" not in str(msg)
+    logging.getLogger("uvicorn.access").addFilter(_KAFilter())
+
+_last_keepalive = {}  # 仅用于观察（内存），非必要
+
+@app.post("/api/keepalive")
+@app.get("/api/keepalive")
+def api_keepalive(request: Request):
+    # 记录一下来源（可观测）
+    try:
+        ip = request.client.host if request.client else "?"
+        _last_keepalive[ip] = int(time.time())
+    except Exception:
+        pass
+    # 204 + 明确告诉客户端“不要缓存；关闭连接”
+    return Response(status_code=204, headers={
+        "Cache-Control": "no-store, max-age=0",
+        "Connection": "close"
+    })
 
 def _sort_key(idx: int):
   if idx == 0: return (lambda v: v.mtime, True)
