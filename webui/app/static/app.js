@@ -1,12 +1,10 @@
-/* app/static/app.js (fs-42a-keepalive-busy-prime+beacon-release+vis-watch+ui-minfix)
- * 变更（最小化）：
- * - 去掉返回按钮：不再绑定，若存在直接移除
- * - 播放列表项点击：不显示转圈，点击后自动收起
- * - 进入播放器禁用页面滚动；退出恢复
- * - 绑定全屏高度到 window.innerHeight，适配安卓地址栏，防止底部控件出屏
- * - 在播放器层拦截滚动手势，防止上下滑动
+/* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard-FULL)
+ * 最小化修复点：
+ * [MIN-FIX#1] 在 doSilentRestart() 中用墙钟时间推算 resumeAtLogical = lastGoodLogical + elapsed*0.9
+ * [MIN-FIX#2] 维护 stallHB.lastWall：start/reset/tick/重启后更新
+ * [MIN-FIX#3] bgAdvanceGuard：若暂停且距结尾 < 5s 视为完成并切到下一集
  */
-console.log("app.js version fs-42a-keepalive-busy-prime+beacon-release+vis-watch+ui-minfix");
+console.log("app.js version fs-42d-stall-hb-wallclock-projection+end-guard-FULL");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -92,7 +90,6 @@ function hideBusy(){
   removeBusyGuards();
   busyShown = false;
 }
-/* 让 Busy “更早出现”的工具：如果没显示就立刻显示 */
 function primeBusy(text="正在启动播放器…"){
   if (!busyShown) showBusy(text);
   else {
@@ -467,43 +464,26 @@ async function startBgKeepAlive(){
   keepAlive.active = true;
   try{
     const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return; // 老浏览器
+    if (!AC) return;
     if (!keepAlive.ctx) keepAlive.ctx = new AC({ latencyHint: "interactive" });
     await keepAlive.ctx.resume().catch(()=>{});
     if (!keepAlive.gain){
       keepAlive.gain = keepAlive.ctx.createGain();
-      keepAlive.gain.gain.value = 1e-7; // 极低电平，不可闻
+      keepAlive.gain.gain.value = 1e-7;
       keepAlive.gain.connect(keepAlive.ctx.destination);
     }
     if (!keepAlive.src){
-      if (keepAlive.ctx.createConstantSource){
-        keepAlive.src = keepAlive.ctx.createConstantSource();
-        keepAlive.src.offset.value = 0.0;
-      } else {
-        // 兜底：1Hz 正弦
-        keepAlive.src = keepAlive.ctx.createOscillator();
-        keepAlive.src.frequency.value = 1;
-      }
+      keepAlive.src = keepAlive.ctx.createConstantSource ? keepAlive.ctx.createConstantSource() : keepAlive.ctx.createOscillator();
+      if (keepAlive.src.offset) keepAlive.src.offset.value = 0.0; else keepAlive.src.frequency.value = 1;
       keepAlive.src.connect(keepAlive.gain);
       try{ keepAlive.src.start(); }catch(_){}
     }
-
-    // 45s 心跳 —— 优先 sendBeacon，无连接占用；仅在后台时发
     if (keepAlive.pingTimer) clearInterval(keepAlive.pingTimer);
     keepAlive.pingTimer = setInterval(()=>{
       if (document.visibilityState === "hidden"){
         try{
-          if (navigator.sendBeacon){
-            navigator.sendBeacon("/api/keepalive", "1");
-          } else {
-            fetch("/api/keepalive", {
-              method:"POST",
-              body:"1",
-              keepalive:true,
-              cache:"no-store",
-              headers:{ "Content-Type":"text/plain", "Connection":"close" }
-            }).catch(()=>{});
-          }
+          if (navigator.sendBeacon) navigator.sendBeacon("/api/keepalive", "1");
+          else fetch("/api/keepalive",{method:"POST",body:"1",keepalive:true,cache:"no-store",headers:{"Content-Type":"text/plain","Connection":"close"}}).catch(()=>{});
         }catch(_){}
       }
     }, 45000);
@@ -514,21 +494,14 @@ async function startBgKeepAlive(){
 function stopBgKeepAlive(){
   keepAlive.active = false;
   if (keepAlive.pingTimer){ clearInterval(keepAlive.pingTimer); keepAlive.pingTimer = null; }
-
   try{
-    if (keepAlive.src){
-      try{ keepAlive.src.stop(); }catch(_){}
+    if (keepAlive.src){ try{ keepAlive.src.stop(); }catch(_){}
       try{ keepAlive.src.disconnect(); }catch(_){}
-      keepAlive.src = null;
-    }
-    if (keepAlive.gain){
-      try{ keepAlive.gain.disconnect(); }catch(_){}
-      keepAlive.gain = null;
-    }
-    if (keepAlive.ctx){
-      try{ keepAlive.ctx.close(); }catch(_){}
-      keepAlive.ctx = null;
-    }
+      keepAlive.src = null; }
+    if (keepAlive.gain){ try{ keepAlive.gain.disconnect(); }catch(_){}
+      keepAlive.gain = null; }
+    if (keepAlive.ctx){ try{ keepAlive.ctx.close(); }catch(_){}
+      keepAlive.ctx = null; }
   }catch(_){}
 }
 
@@ -615,10 +588,16 @@ function startBgAdvanceGuard(){
   if (!a) return;
   bgAdvanceGuard.timer = setInterval(()=>{
     if (!isPlayerActive() || playbackMode !== "audio") return;
-    if (a.paused) return;
+    if (!a) return;
     const dur = a.duration, t = a.currentTime || 0;
     const finite = Number.isFinite(dur) && dur > 0;
-    if (a.ended || (finite && (dur - t) <= 0.4)) advanceToNextOnce();
+    const remain = finite ? (dur - t) : Infinity;
+
+    // 原有 near-end 条件
+    if (a.ended || (finite && remain <= 0.4)) { advanceToNextOnce(); return; }
+
+    // [MIN-FIX#3] 结束保护：若已暂停且距离结尾很近（<5s），视为播放完成
+    if (finite && a.paused && remain < 5) { advanceToNextOnce(); return; }
   }, 1000);
 }
 function stopBgAdvanceGuard(){ if (bgAdvanceGuard.timer){ clearInterval(bgAdvanceGuard.timer); bgAdvanceGuard.timer=null; } }
@@ -652,7 +631,6 @@ function stopPosTicker(){ if (posTicker){ clearInterval(posTicker); posTicker=nu
 let switchLock = false;
 function withSwitchLock(fn){ return async (...args)=>{ if (switchLock) return; switchLock = true; try{ await fn(...args); } finally { setTimeout(()=>{ switchLock=false; }, 200); } }; }
 
-/* 统一的前台晋升：以音频“当前集 + 进度”为准同步视频并秒开，避免双声 */
 async function promoteToVideoNow(reason="unknown"){
   if (!isPlayerActive()) return;
   if (scrubGuard.active) return;
@@ -669,7 +647,7 @@ async function promoteToVideoNow(reason="unknown"){
   try{ a.pause(); a.muted = true; }catch(_){}
 
   playbackMode = "video";
-  stopBgKeepAlive();              // ← 前台视频时停止保活
+  stopBgKeepAlive();
   updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
   stopBgAdvanceGuard();
 
@@ -677,7 +655,6 @@ async function promoteToVideoNow(reason="unknown"){
   if (!ok){ showNotice("前台播放被阻止，点一下屏幕继续"); installUserGestureUnlock(); }
 }
 
-/* 后台：根据用户是否暂停决定是否自动播放音频 */
 const switchToAudio = withSwitchLock(async function(){
   if (!isPlayerActive() || playbackMode==="audio") return;
   if (scrubGuard.active) return;
@@ -688,11 +665,9 @@ const switchToAudio = withSwitchLock(async function(){
   const vSrc = mediaVideoSrcOf(id);
 
   const wasVideoPaused = !!(v && v.paused);
-  const autoPlay = !(wasVideoPaused || _userPaused); // 用户在前台暂停→后台不自动播
-
+  const autoPlay = !(wasVideoPaused || _userPaused);
   const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : 0;
 
-  // 附加音频（autoPlay 决定是否播放；首次对齐强制 seek）
   try{
     await attachAudioSrc(aSrc, resumeAt, {
       muted: !autoPlay ? true : false,
@@ -700,8 +675,6 @@ const switchToAudio = withSwitchLock(async function(){
       seek: 'force'
     });
   }catch(_){}
-
-  // 视频保持 attach + 定位，但暂停（仅加载）
   try{
     await attachVideoSrc(vSrc, resumeAt);
     try{ v.pause(); }catch(_){}
@@ -713,14 +686,13 @@ const switchToAudio = withSwitchLock(async function(){
   if (autoPlay){ startBgAdvanceGuard(); startBgKeepAlive(); } else { stopBgAdvanceGuard(); stopBgKeepAlive(); }
 });
 
-/* 显式切回前台 → 统一用 promoteToVideoNow */
 const switchToVideo = withSwitchLock(async function(){
   if (!isPlayerActive() || playbackMode==="video") return;
   if (scrubGuard.active) return;
   await promoteToVideoNow("visibility");
 });
 
-/* ==== 可见性看门狗：回前台时把视频强制晋升，并唤醒控制条 ==== */
+/* ==== 可见性看门狗 ==== */
 let visWatchTimer = null;
 function kickVisWatch(reason="return"){
   if (visWatchTimer) clearInterval(visWatchTimer);
@@ -729,33 +701,25 @@ function kickVisWatch(reason="return"){
     tries++;
     if (!isPlayerActive()){ clearInterval(visWatchTimer); visWatchTimer=null; return; }
     if (document.visibilityState !== "visible") return;
-
-    // 确保控件可见
     try{ wakeOverlay(); }catch(_){}
-
     const v = media.v || $("fsVideo");
     const a = media.a || $("bgAudio");
     if (!a){ clearInterval(visWatchTimer); visWatchTimer=null; return; }
 
-    // 如果仍处于音频模式（或视频没流动），就晋升到视频
     if (playbackMode === "audio" && !a.paused){
-      // 第一步：常规晋升
       await promoteToVideoNow("vis-watch");
       await sleep(60);
-
-      // 若仍未晋升成功，则带 cache bust 重挂一次视频源（安卓上常见需要重建解码管线）
       if (playbackMode !== "video"){
         try{
           const id = player.ids[player.index];
           const resumeAt = Number.isFinite(a.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : 0;
-          await attachVideoSrc(mediaVideoSrcOf(id, /*cacheBust*/ true), resumeAt);
+          await attachVideoSrc(mediaVideoSrcOf(id, true), resumeAt);
         }catch(_){}
         await promoteToVideoNow("vis-watch-bust");
         await sleep(60);
       }
     }
 
-    // 确保前台视频在播放（有些 ROM 会把它暂停）
     if (playbackMode === "video" && v){
       const ok = await safePlay(v);
       if (!ok){
@@ -764,13 +728,10 @@ function kickVisWatch(reason="return"){
       }
       clearInterval(visWatchTimer); visWatchTimer=null; return;
     }
-
-    // 最多尝试 ~1.5s（10 * 150ms）
     if (tries >= 10){ clearInterval(visWatchTimer); visWatchTimer=null; }
   }, 150);
 }
 
-/* —— 切换触发（加入可见性看门狗） —— */
 document.addEventListener("visibilitychange", async ()=>{
   if (!isPlayerActive()) return;
   if (scrubGuard.active) return;
@@ -784,7 +745,6 @@ document.addEventListener("visibilitychange", async ()=>{
 window.addEventListener("focus", ()=>{
   if (!isPlayerActive()) return;
   if (document.visibilityState !== "visible") return;
-  // 有些安卓只发 focus，不发 visibilitychange
   setTimeout(()=> kickVisWatch("focus"), 50);
 });
 window.addEventListener("pageshow", ()=>{
@@ -792,11 +752,9 @@ window.addEventListener("pageshow", ()=>{
   if (document.visibilityState !== "visible") return;
   setTimeout(()=> kickVisWatch("pageshow"), 50);
 });
-// Page Lifecycle（部分安卓/ROM 会发）
 document.addEventListener("resume", ()=> kickVisWatch("resume"));
 
 window.addEventListener("pagehide", ()=> { if (isPlayerActive() && !scrubGuard.active) switchToAudio(); });
-// ★ 页面真正销毁时立即停保活（避免退出后仍发心跳）
 window.addEventListener("beforeunload", stopBgKeepAlive);
 window.addEventListener("unload", stopBgKeepAlive);
 window.addEventListener("pagehide", (e)=>{ if (!e.persisted) stopBgKeepAlive(); });
@@ -842,7 +800,6 @@ function setMediaSessionMeta(id){
       clearUserPaused();
       const {v,a} = both();
       if (document.visibilityState==="hidden"){
-        // 后台优先用音频的当前时间，避免回跳
         const id = player.ids[player.index];
         const aSrc = audioSrcOf(id);
         const resumeAt =
@@ -852,7 +809,7 @@ function setMediaSessionMeta(id){
         await attachAudioSrc(aSrc, resumeAt, { muted:false, ensurePlay:true, seek:'smart' });
         playbackMode = "audio";
         startBgAdvanceGuard();
-        startBgKeepAlive();     // ← Media Session 后台播放时开启保活
+        startBgKeepAlive();
       } else {
         await promoteToVideoNow("media-session-play");
       }
@@ -864,7 +821,7 @@ function setMediaSessionMeta(id){
       const {v,a} = both();
       try{ v.pause(); }catch(_){}
       try{ a.pause(); }catch(_){}
-      stopBgKeepAlive();        // ← 暂停时停止保活
+      stopBgKeepAlive();
       updateMediaSessionPlaybackState(); updatePositionState(); stopPosTicker();
     });
 
@@ -992,7 +949,7 @@ function injectVideoPreload(src){
 function adjustFSViewport(){
   const wrap = $("playerFS");
   if (!wrap) return;
-  const h = window.innerHeight; // 避免安卓地址栏影响
+  const h = window.innerHeight; 
   wrap.style.height = h + "px";
   const v = $("fsVideo"); const ov = $("overlay");
   if (v) v.style.height = h + "px";
@@ -1003,13 +960,11 @@ function installFsGuards(){
   if (_fsGuards.installed) return;
   const wrap = $("playerFS");
   if (!wrap) return;
-  // 拦截滚动（防上下滑动）
   _fsGuards.wheel = (e)=>{ e.preventDefault(); };
   _fsGuards.touch = (e)=>{ e.preventDefault(); };
   wrap.addEventListener("wheel", _fsGuards.wheel, { passive:false });
   wrap.addEventListener("touchmove", _fsGuards.touch, { passive:false });
 
-  // 绑定高度
   adjustFSViewport();
   _fsGuards.resize = ()=> adjustFSViewport();
   _fsGuards.orient = ()=> adjustFSViewport();
@@ -1025,7 +980,7 @@ function installFsGuards(){
   _fsGuards.installed = true;
 }
 function removeFsGuards(){
-  if (!_fsGuards.installed) return;
+  if (_fsGuards.installed) return;
   const wrap = $("playerFS");
   if (wrap){
     if (_fsGuards.wheel) wrap.removeEventListener("wheel", _fsGuards.wheel, { passive:false });
@@ -1048,7 +1003,6 @@ function removeFsGuards(){
 async function startPlaylist(items, startIndex=0, returnPath=null){
   cancelProgressive();
 
-  // Busy 在首页/其他入口仍保留；但从播放列表内部点击不会再触发（见 renderPlaylistPanel）
   showBusy("正在准备播放器…");
 
   player.ids = items.map(x=>x.id);
@@ -1064,15 +1018,11 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
 
   wrap.style.display = "flex";
 
-  // ★ 移除左上角返回按钮（若存在）
   const backBtn = $("btnBack");
   if (backBtn && backBtn.parentNode) backBtn.parentNode.removeChild(backBtn);
 
-  // ★ 禁用页面滚动
   document.documentElement.classList.add("noscroll");
   document.body.classList.add("noscroll");
-
-  // ★ 安装视口/滚动守卫
   installFsGuards();
 
   enforceNoPIP(v);
@@ -1095,12 +1045,12 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
       el.addEventListener("durationchange", updatePositionState);
       el.addEventListener("playing", ()=>{
         clearUserPaused(); updatePositionState(); startPosTicker();
-        if (!isVideo && playbackMode==="audio") startBgKeepAlive();  // ← 音频真正播放时开启保活
+        if (!isVideo && playbackMode==="audio") startBgKeepAlive();  
       });
       el.addEventListener("pause",   ()=>{
         if (document.visibilityState==='visible') markUserPaused();
         updatePositionState();
-        if (!isVideo) stopBgKeepAlive();                             // ← 音频暂停时停止保活
+        if (!isVideo) stopBgKeepAlive();                             
       });
       if (isVideo){
         el.addEventListener("seeking", ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); updatePositionState(); });
@@ -1125,7 +1075,6 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   }catch(_){}
   try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
 
-  // 仅保留菜单按钮
   const btnMenu = $("btnMenu");
   if (btnMenu) btnMenu.onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
 
@@ -1177,7 +1126,6 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   updatePositionState(); startPosTicker();
 
   if (document.visibilityState === "hidden") {
-    // 后台启动或后台切集：attach 音频 + 预热视频（不播放），首次对齐强制 seek
     audioBias = 0;
     try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true, seek:'force' }); }catch(_){}
     try{
@@ -1186,10 +1134,9 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
     }catch(_){}
     playbackMode = "audio";
     startBgAdvanceGuard();
-    startBgKeepAlive();   // ← 后台开始播放时启动保活
+    startBgKeepAlive();
     armFirstPlayWatch(id, a);
   } else {
-    // 前台启动：视频播放 + 预热音频
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
@@ -1201,8 +1148,12 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   }
   startFgSync();
   renderPlaylistPanel();
+
+  // —— 重置“纯进度心跳”监测（切集视为重置）
+  resetStallHeartbeat(a);
 }
 
+/* —— 叠加 UI —— */
 function wakeOverlay(){
   const wrap = $("playerFS");
   wrap.classList.remove("idle");
@@ -1217,7 +1168,6 @@ function renderPlaylistPanel(){
     li.className = (i===player.index) ? "active" : "";
     li.innerHTML = `<span class="dot"></span><span>${player.titles[id] || ("视频 "+id)}</span>`;
     li.onclick = async ()=>{
-      // ★ 最小化修复：不再显示转圈，且点击后自动收起
       hidePlaylistPanel();
       await playIndex(i);
     };
@@ -1241,7 +1191,6 @@ async function exitPlayer(){
   stopBgAdvanceGuard(); stopPosTicker(); stopFgSync(); stopBgKeepAlive();
   resumeGridImageLoads();
 
-  // ★ 恢复页面滚动 & 卸载守卫
   document.documentElement.classList.remove("noscroll");
   document.body.classList.remove("noscroll");
   removeFsGuards();
@@ -1354,7 +1303,7 @@ async function progressivePlaySelection(){
   const BATCH = 200;
   const producer = async function* (){
     const extraVideos = selVideos
-      .map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }))
+      .map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }))
       .filter(x => !isWatched(x.id) && !progressive.seen.has(x.id));
     if (extraVideos.length) yield extraVideos;
     for (let i=0;i<selFolders.length;i++){
@@ -1489,11 +1438,10 @@ function showPlaylistPanel(){
   const blockScroll = (e)=>{ e.preventDefault(); };
   shade._closeOnShade = closeOnShade;
   shade._blockScroll = blockScroll;
-  shade.addEventListener("click", closeOnShade);               // 点击外侧遮罩关闭
+  shade.addEventListener("click", closeOnShade);
   shade.addEventListener("wheel", blockScroll, { passive:false });
   shade.addEventListener("touchmove", blockScroll, { passive:false });
 
-  // （其余 modal 守卫保留）
   const allowInPanel = (el)=> !!(el && (el.closest("#playlistPanel") || el.closest("#btnMenu")));
   const allowShadeClick = (type, el)=> (type==="click" && el && el.id==="shade");
   const guard = (e)=>{
@@ -1513,13 +1461,12 @@ function showPlaylistPanel(){
   const escToClose = (e)=>{ if (uiLock.byPlaylist && e.key==="Escape"){ e.preventDefault(); hidePlaylistPanel(); } };
   addModalGuard("keydown", escToClose, true);
 
-  // ★ 竖屏时加宽（JS 侧最小化处理，避免改动 CSS）
   const panel = $("playlistPanel");
   if (panel){
     if (window.innerHeight > window.innerWidth){
       panel.style.width = Math.min(Math.floor(window.innerWidth*0.92), 560) + "px";
     } else {
-      panel.style.width = ""; // 使用默认样式
+      panel.style.width = "";
     }
   }
 }
@@ -1558,7 +1505,7 @@ function bindRubber(){
       const rect={x1,y1,x2,y2};
       state.tiles.forEach(t=>{
         const r = t.el.getBoundingClientRect();
-        const hit = !(r.right<rect.x1 || r.left>rect.x2 || r.bottom<rect.y1 || r.top>rect.y2);
+        const hit = !(r.right<rect.x1 || r.left>rect.x2 || r.bottom<rect.y1 || r.top<rect.y1);
         setSel(t, hit || (state.keepSelection && isSel(t)));
       });
     };
@@ -1608,3 +1555,259 @@ async function expandSelectionToItems(){
   }
   return items;
 }
+
+/* ========================= 纯进度心跳检测 + 锚点缓存 + 稳定重启 ========================= */
+/*
+  - 舍弃能量检测，仅看 currentTime 前进；
+  - 每 1s 检测一次；连续 6 次（≈6s）几乎不前进（Δpos < 0.2s）→ 掐断；
+  - 掐断后的重启点使用“锚点时间缓存” lastGoodLogical（逻辑时间 = currentTime - audioBias）；
+  - 采用 doSilentRestart()：新建 Audio → 等 loadedmetadata → 计算 bias → seek 到 (lastGoodLogical + bias) → 替换元素 → 重绑事件 → play()；
+  - 掐断后进入 45s 冷却；暂停/切集/寻位/载入元数据 会重置计数和锚点；
+  - 仅在「后台 + 音频模式 + 正在播放」下运行。
+*/
+const stallHB = {
+  active:false,
+  timer:null,
+  intervalMs:1000,     // 1s 心跳
+  eps:0.2,             // 认为“几乎不动”的阈值（秒）
+  needCount:6,         // 连续 6 次（≈6s）
+  cooldownMs:45000,    // 掐断间隔 45s
+  lastPos:0,
+  stallCount:0,
+  cooldownUntil:0,
+  lastGoodLogical:0,   // ★ 锚点缓存（逻辑时间）
+  lastWall: 0          // [MIN-FIX#2] 上次墙钟心跳时间（ms, performance.now）
+};
+function _logicalAudioTime(aEl){
+  const t = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
+  return Math.max(0, t - (audioBias||0));
+}
+function resetStallHeartbeat(aEl){
+  stallHB.stallCount = 0;
+  stallHB.lastPos = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
+  stallHB.cooldownUntil = 0; 
+  stallHB.lastGoodLogical = _logicalAudioTime(aEl);
+  stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+}
+
+/* ★ 抽出：心跳模块音频事件（可在替换音频后重复绑定） */
+function bindAudioEventsForStallHBOn(a){
+  if (!a || a._stallHBBound) return;
+  a._stallHBBound = true;
+
+  a.addEventListener("playing", ()=>{
+    if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+      resetStallHeartbeat(a);
+      startStallHeartbeat();
+    }
+  });
+  a.addEventListener("pause", ()=>{
+    resetStallHeartbeat(a);
+    stopStallHeartbeat();
+  });
+  a.addEventListener("ended", ()=>{
+    resetStallHeartbeat(a);
+    stopStallHeartbeat();
+  });
+  a.addEventListener("seeking", ()=>{
+    resetStallHeartbeat(a);
+  });
+  a.addEventListener("loadedmetadata", ()=>{
+    resetStallHeartbeat(a);
+  });
+}
+
+/* ★ 替换后重绑：near-end、stalled、position、keepAlive、心跳等 */
+function bindAudioCoreEventsAfterReplace(a){
+  if (!a) return;
+  try{
+    a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline","");
+    a.disableRemotePlayback = true;
+    a.preload = "auto";
+  }catch(_){}
+
+  a.addEventListener("ended", ()=> handleEndedFromAny(a));
+  installAudioNearEndDetector(a);
+  installStallListeners(media.v||$("fsVideo"), a);
+
+  a.addEventListener("timeupdate", updatePositionState);
+  a.addEventListener("loadedmetadata", updatePositionState);
+  a.addEventListener("durationchange", updatePositionState);
+  a.addEventListener("playing", ()=>{
+    clearUserPaused(); updatePositionState(); startPosTicker();
+    if (playbackMode==="audio") startBgKeepAlive();
+  });
+  a.addEventListener("pause",   ()=>{
+    if (document.visibilityState==='visible') markUserPaused();
+    updatePositionState(); stopBgKeepAlive();
+  });
+
+  bindAudioEventsForStallHBOn(a);
+}
+
+/* —— 首次为现有 bgAudio 绑定心跳监听 —— */
+(function initialBindAudioHB(){
+  const a = $("bgAudio");
+  if (!a) return;
+  bindAudioEventsForStallHBOn(a);
+})();
+
+/* ★ 核心：稳定后台重启，避免回到开头（并用墙钟推算累计播放点） */
+async function doSilentRestart(oldAudio, phase="stallHB"){
+  const id = player.ids[player.index];
+  if (!id) return;
+
+  const wasPaused = !!oldAudio?.paused;
+  const wasMuted  = !!oldAudio?.muted;
+
+  // [MIN-FIX#1] —— 用墙钟时间推算 resumeAtLogical，避免锚点滞后累积
+  const nowMs = performance.now();
+  const elapsed = Math.max(0, (nowMs - (stallHB.lastWall || nowMs)) / 1000);
+  const predictedLogical = Math.max(0, (stallHB.lastGoodLogical || 0) + elapsed * 0.9);
+  const resumeAtLogical = predictedLogical;
+
+  console.log(`[StallHB] ${phase} restart → resume at ${resumeAtLogical.toFixed(3)}s (logical, +${elapsed.toFixed(2)}s*0.9)`);
+
+  try{
+    // 1) 只创建新元素与 src，不立即播放
+    const newSrc = audioSrcOf(id, /*cacheBust*/ true);
+    const newAudio = new Audio();
+    newAudio.src = newSrc;
+    newAudio.preload = "auto";
+    newAudio.muted = wasMuted;
+    newAudio.volume = wasMuted ? 0 : Math.max(0.6, oldAudio?.volume || 0.6);
+
+    // 2) 等待元数据（可安全 seek）
+    await new Promise((resolve, reject)=>{
+      const onMeta = ()=>{ newAudio.removeEventListener("loadedmetadata", onMeta); resolve(); };
+      const onErr  = (e)=>{ newAudio.removeEventListener("error", onErr); reject(e); };
+      newAudio.addEventListener("loadedmetadata", onMeta);
+      newAudio.addEventListener("error", onErr);
+      newAudio.load();
+    });
+
+    // 同步/计算新的 bias
+    audioBias = computeAudioBias(newAudio);
+
+    // 3) 目标 = 预测逻辑时间 + 新 bias
+    const target = Math.max(0, resumeAtLogical + (audioBias||0));
+    try { newAudio.currentTime = target; } catch (err) {
+      console.warn("[StallHB] initial seek failed, fallback to 0", err);
+      newAudio.currentTime = 0;
+    }
+
+    // 保险：首个 timeupdate 验证位置，不对则强制再 seek 一次
+    const verifyOnce = ()=>{
+      const cur = newAudio.currentTime || 0;
+      if (Math.abs(cur - target) > 1.5){
+        try{ newAudio.currentTime = target; }catch(_){}
+      }
+    };
+    newAudio.addEventListener("timeupdate", verifyOnce, { once:true });
+
+    // 4) 替换旧的 bgAudio 元素
+    const old = $("bgAudio");
+    if (old && old.parentNode) old.parentNode.replaceChild(newAudio, old);
+    newAudio.id = "bgAudio";
+    media.a = newAudio;
+
+    // 5) 重新绑定项目依赖的所有音频事件
+    bindAudioCoreEventsAfterReplace(newAudio);
+
+    // 6) 播放（如原先在播放）
+    if (!wasPaused){
+      try { await newAudio.play(); } catch (err) {
+        console.warn("[StallHB] play() failed:", err);
+      }
+    }
+
+    // 7) 刷新心跳基线与锚点 & 记下墙钟
+    stallHB.lastPos = Number.isFinite(newAudio.currentTime) ? newAudio.currentTime : 0;
+    stallHB.lastGoodLogical = resumeAtLogical;
+    stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+
+    console.log(`[StallHB] restart complete, playing from ${resumeAtLogical.toFixed(3)}s (logical), bias=${(audioBias||0).toFixed(3)}s`);
+  }catch(err){
+    console.warn("[StallHB] restart failed:", err);
+  }
+}
+
+function stopStallHeartbeat(){
+  stallHB.active = false;
+  if (stallHB.timer){ clearInterval(stallHB.timer); stallHB.timer = null; }
+}
+function startStallHeartbeat(){
+  if (stallHB.active) return;
+  const a = media.a || $("bgAudio");
+  if (!a) return;
+  if (document.visibilityState !== "hidden") return;
+  if (playbackMode !== "audio") return;
+  if (a.paused) return;
+
+  resetStallHeartbeat(a);
+  stallHB.active = true;
+
+  if (stallHB.timer) clearInterval(stallHB.timer);
+  stallHB.timer = setInterval(async ()=>{
+    const aEl = media.a || $("bgAudio");
+    if (!isPlayerActive() || playbackMode!=="audio" || !aEl){ stopStallHeartbeat(); return; }
+    if (document.visibilityState!=="hidden" || aEl.paused) return;
+    if (aEl.seeking) { resetStallHeartbeat(aEl); return; }
+    if (scrubGuard.active) return;
+    if (stallRepair.inFlight) return;
+
+    // [MIN-FIX#2] 每次 tick 更新 lastWall，用于墙钟推算
+    stallHB.lastWall = performance.now();
+
+    const pos = Number.isFinite(aEl.currentTime) ? aEl.currentTime : 0;
+    const advanced = (pos - stallHB.lastPos) >= stallHB.eps;
+    stallHB.lastPos = pos;
+
+    if (advanced){
+      // ★ 进度在向前，更新锚点为“最近一次可靠播放时间（逻辑）”
+      stallHB.lastGoodLogical = _logicalAudioTime(aEl);
+      stallHB.stallCount = 0;
+      return;
+    } else {
+      stallHB.stallCount++;
+    }
+
+    if (stallHB.stallCount >= stallHB.needCount){
+      if (performance.now() < stallHB.cooldownUntil){
+        stallHB.stallCount = 0;
+        return;
+      }
+      // ★ 改为“硬重启”以保证后台 seek 生效
+      await doSilentRestart(aEl, "stallHB");
+
+      // 进入冷却并刷新基线
+      const aa = media.a || $("bgAudio");
+      stallHB.cooldownUntil = performance.now() + stallHB.cooldownMs;
+      stallHB.stallCount = 0;
+      stallHB.lastPos = Number.isFinite(aa?.currentTime) ? aa.currentTime : 0;
+      stallHB.lastGoodLogical = _logicalAudioTime(aa);
+      stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+    }
+  }, stallHB.intervalMs);
+}
+
+/* —— 生命周期：仅在后台音频播放时运行 —— */
+document.addEventListener("visibilitychange", ()=>{
+  const a = media.a || $("bgAudio");
+  if (!a) return;
+  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && !a.paused){
+    startStallHeartbeat();
+  } else {
+    stopStallHeartbeat();
+  }
+});
+
+/* —— 兜底：极少设备不发 visibilitychange，这里每 5s 尝试一次 —— */
+setInterval(()=>{
+  const a = media.a || $("bgAudio");
+  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && a && !a.paused){
+    startStallHeartbeat();
+  }
+}, 5000);
+
+/* ========================= 纯进度心跳检测 + 稳定重启（完） ========================= */
