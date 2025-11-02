@@ -140,9 +140,9 @@ def _sort_key(idx: int):
   if idx == 4: return (lambda v: v.title.casefold(), True)
   return (lambda v: v.title.casefold(), False)
 
-# ======== ★ 新增：扫描结果内存缓存（TTL，默认 20s）========
-SCAN_CACHE_TTL = int(os.getenv("SCAN_CACHE_TTL", "20"))
-_SCAN_CACHE = {"ts": 0.0, "folder_roots": None, "id_map": None, "root_unassigned": None}
+# ======== ★ 新增：扫描结果内存缓存（TTL，默认 120s）========
+SCAN_CACHE_TTL = int(os.getenv("SCAN_CACHE_TTL", "120"))
+_SCAN_CACHE = {"ts": 0.0, "folder_roots": None, "id_map": None, "root_unassigned": None, "path_map": None}
 _SCAN_LOCK = threading.RLock()
 
 def _scan_state():
@@ -159,7 +159,32 @@ def _scan_state():
         folder_roots = []
       id_map = scan_workshop_items(WORKSHOP_PATH)
       root_unassigned = collect_unassigned_items(id_map, folder_roots)
-      _SCAN_CACHE.update(ts=now, folder_roots=folder_roots, id_map=id_map, root_unassigned=root_unassigned)
+
+      # ★ 构建子路径级缓存：{ "/A/B": {subfolders, vids, all_vids} }
+      def _build_path_map():
+        path_map = {}
+
+        def rec(parts: List[str], subfolders, vids):
+          # 规范化路径
+          path_str = "/" + "/".join(parts) if parts else "/"
+          # 聚合所有子孙视频 id（只在构建期做一次）
+          all_vids = list(vids)
+          for sf in (subfolders or []):
+            child_parts = parts + [sf.title]
+            child_subfolders, child_vids = find_node_by_path(folder_roots, child_parts)
+            # 递归对子路径建映射
+            _, _, child_all = rec(child_parts, child_subfolders, child_vids)
+            all_vids.extend(child_all)
+          path_map[path_str] = {"subfolders": subfolders, "vids": list(vids), "all_vids": all_vids}
+          return subfolders, vids, all_vids
+
+        # 根路径
+        rec([], folder_roots, root_unassigned[:])
+        return path_map
+
+      path_map = _build_path_map()
+
+      _SCAN_CACHE.update(ts=now, folder_roots=folder_roots, id_map=id_map, root_unassigned=root_unassigned, path_map=path_map)
     return _SCAN_CACHE["folder_roots"], _SCAN_CACHE["id_map"], _SCAN_CACHE["root_unassigned"]
 
 def _build_video_out(id_map, vid_id) -> VideoOut:
@@ -178,6 +203,11 @@ def _build_video_out(id_map, vid_id) -> VideoOut:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
   return templates.TemplateResponse("index.html", {"request": request})
+
+# ★ 启动异步预扫描（预热缓存）
+@app.on_event("startup")
+def prewarm_scan():
+  threading.Thread(target=_scan_state, daemon=True).start()
 
 # ==========（新）已播放 API ==========
 @app.get("/api/watched")
@@ -211,7 +241,7 @@ def api_set_watched(payload: WatchedSet):
   return {"ok": True, "count": len(ids)}
 
 # ========== 扫描 / 列表 ==========
-@app.get("/api/scan", response_model=ScanResponse)
+@app.get("/api/scan")
 def api_scan(
   path: str = Query("/", description="形如 /A/B"),
   page: int = Query(1, ge=1),
@@ -222,20 +252,33 @@ def api_scan(
 ):
   folder_roots, id_map, root_unassigned = _scan_state()
 
+  # 规范化路径 & 直接命中子路径缓存
   parts = [p for p in path.split("/") if p]
-  if not parts:
-    current_subfolders = folder_roots
-    current_item_ids = root_unassigned[:]
-    breadcrumb = []
-  else:
-    current_subfolders, current_item_ids = find_node_by_path(folder_roots, parts)
+  norm_path = ("/" + "/".join(parts)) if parts else "/"
+  with _SCAN_LOCK:
+    pm = _SCAN_CACHE.get("path_map") or {}
+    entry = pm.get(norm_path)
+
+  if entry:
+    current_subfolders = entry["subfolders"] or []
+    current_item_ids = list(entry["vids"] or [])
+    all_item_ids = list(entry["all_vids"] or [])
     breadcrumb = parts
+  else:
+    # 兜底（理论上不会走到）
+    if not parts:
+      current_subfolders = folder_roots
+      current_item_ids = root_unassigned[:]
+      breadcrumb = []
+    else:
+      current_subfolders, current_item_ids = find_node_by_path(folder_roots, parts)
+      breadcrumb = parts
+    # 回退时仅在需要时做递归
+    all_item_ids = list(current_item_ids) + all_ids_recursive(current_subfolders)
 
   tokens = [t.casefold() for t in q.split() if t.strip()]
   if tokens:
-    candidate_ids = set(current_item_ids)
-    candidate_ids.update(all_ids_recursive(current_subfolders))
-    base_ids = list(candidate_ids)
+    base_ids = list(dict.fromkeys(all_item_ids))  # 去重保持顺序
   else:
     base_ids = list(current_item_ids)
 
@@ -281,14 +324,15 @@ def api_scan(
     else:
       out_videos.append(_build_video_out(id_map, obj))
 
-  return ScanResponse(
-    breadcrumb=breadcrumb,
-    folders=out_folders,
-    videos=out_videos,
-    page=page,
-    total_pages=total_pages,
-    total_items=total_tiles
-  )
+  # ★ 提前序列化 JSON（绕过 Pydantic 实例化/校验）
+  return JSONResponse(content={
+    "breadcrumb": breadcrumb,
+    "folders": [f.dict() for f in out_folders],
+    "videos": [v.dict() for v in out_videos],
+    "page": page,
+    "total_pages": total_pages,
+    "total_items": total_tiles
+  })
 
 # 递归取文件夹视频；with_meta=1 时返回 [{id,title}]，否则 ids
 @app.get("/api/folder_videos")
