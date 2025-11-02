@@ -140,17 +140,27 @@ def _sort_key(idx: int):
   if idx == 4: return (lambda v: v.title.casefold(), True)
   return (lambda v: v.title.casefold(), False)
 
+# ======== ★ 新增：扫描结果内存缓存（TTL，默认 20s）========
+SCAN_CACHE_TTL = int(os.getenv("SCAN_CACHE_TTL", "20"))
+_SCAN_CACHE = {"ts": 0.0, "folder_roots": None, "id_map": None, "root_unassigned": None}
+_SCAN_LOCK = threading.RLock()
+
 def _scan_state():
-  folder_roots = []
-  try:
-    we_cfg = load_we_config(WE_PATH)
-    folders_list = extract_folders_list(we_cfg)
-    folder_roots = build_folder_tree(folders_list)
-  except Exception:
-    folder_roots = []
-  id_map = scan_workshop_items(WORKSHOP_PATH)
-  root_unassigned = collect_unassigned_items(id_map, folder_roots)
-  return folder_roots, id_map, root_unassigned
+  now = time.time()
+  with _SCAN_LOCK:
+    ok = (_SCAN_CACHE["id_map"] is not None) and (now - _SCAN_CACHE["ts"] <= SCAN_CACHE_TTL)
+    if not ok:
+      folder_roots = []
+      try:
+        we_cfg = load_we_config(WE_PATH)
+        folders_list = extract_folders_list(we_cfg)
+        folder_roots = build_folder_tree(folders_list)
+      except Exception:
+        folder_roots = []
+      id_map = scan_workshop_items(WORKSHOP_PATH)
+      root_unassigned = collect_unassigned_items(id_map, folder_roots)
+      _SCAN_CACHE.update(ts=now, folder_roots=folder_roots, id_map=id_map, root_unassigned=root_unassigned)
+    return _SCAN_CACHE["folder_roots"], _SCAN_CACHE["id_map"], _SCAN_CACHE["root_unassigned"]
 
 def _build_video_out(id_map, vid_id) -> VideoOut:
   v = id_map[vid_id]
@@ -247,13 +257,9 @@ def api_scan(
 
   folders_out: List[FolderOut] = []
   if not tokens:
-    def count_recursive(node) -> int:
-      total = len(node.items)
-      for sf in node.subfolders:
-        total += count_recursive(sf)
-      return total
+    # ★ 激进加速：不再递归统计数量（前端已不显示），统一返回 0
     for sf in current_subfolders:
-      folders_out.append(FolderOut(title=sf.title, count=count_recursive(sf)))
+      folders_out.append(FolderOut(title=sf.title, count=0))
 
   total_tiles = len(folders_out) + len(vids)
   total_pages = max(1, math.ceil(total_tiles / per_page))
@@ -358,12 +364,30 @@ def _get_repair_lock(path: str) -> threading.Lock:
       _repair_locks[path] = threading.Lock()
     return _repair_locks[path]
 
+def _choose_mux_and_ext(src: Path) -> Tuple[str | None, str]:
+  """
+  根据源文件后缀选择目标复用器与扩展名。
+  仅在 MP4/M4V/MOV 上启用 faststart；其他容器保持原容器的无损 copy。
+  """
+  ext = (src.suffix or "").lower()
+  if ext in (".mp4", ".m4v", ".mov"):
+    return "mp4", ".mp4"
+  if ext == ".mkv":
+    return "matroska", ".mkv"
+  if ext == ".webm":
+    return "webm", ".webm"
+  if ext == ".avi":
+    return "avi", ".avi"
+  # 默认回落到 mp4（可容纳大多数音视频流）
+  return "mp4", ".mp4"
+
 def _faststart_inplace(src_path: str) -> dict:
   """
-  无损重封装：-c copy -movflags +faststart
-  生成同目录临时文件，成功后 os.replace 覆盖原文件。
-  覆盖后恢复原文件的 atime/mtime，避免“修改时间”被刷新。
-  返回 {ok, before, after, tmp, out}
+  无损重封装（安全版）：
+  - 以有效容器后缀生成同目录临时文件（不以 .tmp 结尾避免 FFmpeg 选复用器失败）；
+  - 先写临时文件，校验后将源文件改名为 .bak，再原子替换；
+  - 任一步失败自动回滚，保证源文件不丢失。
+  返回 {ok, before, after, out} 或 {ok:False, error,...}
   """
   src_path = os.path.abspath(src_path)
   if not os.path.isfile(src_path):
@@ -371,6 +395,7 @@ def _faststart_inplace(src_path: str) -> dict:
 
   before = os.path.getsize(src_path)
   src = Path(src_path)
+
   # 记录原始时间戳（纳秒）以便恢复
   try:
     st_old = os.stat(src_path)
@@ -379,39 +404,80 @@ def _faststart_inplace(src_path: str) -> dict:
     st_old = None
     at_ns = mt_ns = None
 
-  force_mp4 = src.suffix.lower() in (".mp4", ".m4v")
-  tmp_path = str(src.with_suffix(src.suffix + ".faststart.tmp"))
+  mux, out_ext = _choose_mux_and_ext(src)
+  # 生成“可识别扩展名”的临时产物（避免 .xxx.tmp 导致 FFmpeg 无法判断复用器）
+  tmp_path = str(src.with_name(src.stem + ".fs" + out_ext))
+  bak_path = str(src.with_name(src.name + ".bak"))
 
+  # 构建命令
   cmd = [
-      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+      "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
       "-i", src_path,
       "-map", "0", "-dn",
       "-c", "copy",
-      "-movflags", "+faststart",
+      "-map_metadata", "0",
   ]
-  if force_mp4:
-      cmd += ["-f", "mp4"]
+  if mux == "mp4":
+      cmd += ["-movflags", "+faststart", "-f", "mp4"]
+  elif mux:
+      cmd += ["-f", mux]
   cmd += [tmp_path]
 
   lock = _get_repair_lock(src_path)
   with lock:
+    # 开始前清理同名残留
     try:
       if os.path.exists(tmp_path):
         os.remove(tmp_path)
     except Exception:
       pass
 
+    ok = False
     try:
+      # 1) 重封装到临时文件
       subprocess.run(cmd, check=True)
-      # 原子替换
-      os.replace(tmp_path, src_path)
+      if not os.path.isfile(tmp_path):
+        return {"ok": False, "error": "tmp-not-produced", "path": src_path}
+      after_tmp = os.path.getsize(tmp_path)
+      if after_tmp <= 0:
+        try: os.remove(tmp_path)
+        except Exception: pass
+        return {"ok": False, "error": "tmp-empty", "path": src_path}
 
-      # 恢复时间戳（若可用）
+      # 2) 原子替换（带回滚）
+      #  2.1 先把源文件改名为 .bak
+      if os.path.exists(bak_path):
+        try: os.remove(bak_path)
+        except Exception: pass
+      os.replace(src_path, bak_path)
+      try:
+        #  2.2 再把临时文件替换为新的源
+        os.replace(tmp_path, src_path)
+      except Exception as e:
+        #  2.3 失败 → 回滚
+        try:
+          if os.path.exists(bak_path) and not os.path.exists(src_path):
+            os.replace(bak_path, src_path)
+        finally:
+          try:
+            if os.path.exists(tmp_path):
+              os.remove(tmp_path)
+          except Exception:
+            pass
+        return {"ok": False, "error": f"replace-failed:{e}", "path": src_path}
+
+      # 2.4 成功 → 删除备份
+      try:
+        if os.path.exists(bak_path):
+          os.remove(bak_path)
+      except Exception:
+        pass
+
+      # 3) 恢复时间戳（若可用）
       try:
         if at_ns is not None and mt_ns is not None:
           os.utime(src_path, ns=(at_ns, mt_ns))
       except Exception:
-        # 回退到秒精度
         try:
           if st_old is not None:
             os.utime(src_path, (st_old.st_atime, st_old.st_mtime))
@@ -419,8 +485,10 @@ def _faststart_inplace(src_path: str) -> dict:
           pass
 
       after = os.path.getsize(src_path)
+      ok = True
       return {"ok": True, "before": before, "after": after, "out": src_path}
     except subprocess.CalledProcessError as e:
+      # FFmpeg 失败：清理临时产物
       try:
         if os.path.exists(tmp_path):
           os.remove(tmp_path)
@@ -428,6 +496,12 @@ def _faststart_inplace(src_path: str) -> dict:
         pass
       return {"ok": False, "error": f"ffmpeg-failed:{e}", "path": src_path}
     except Exception as e:
+      # 其他异常：尽力回滚
+      try:
+        if os.path.exists(bak_path) and not os.path.exists(src_path):
+          os.replace(bak_path, src_path)
+      except Exception:
+        pass
       try:
         if os.path.exists(tmp_path):
           os.remove(tmp_path)
