@@ -1,5 +1,5 @@
-/* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-02a) */
-console.log("app.js version fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-02a");
+/* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
+console.log("app.js version fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -103,22 +103,6 @@ function removeModalGuards(){ for(const [t,h,o] of modalGuards){ document.remove
 const $ = (id) => document.getElementById(id);
 const grid = () => $("grid");
 
-/* ★ NEW: 小工具 */
-function scheduleIdle(fn){ if ("requestIdleCallback" in window){ requestIdleCallback(fn); } else { setTimeout(fn, 0); } }
-function scheduleResumeImagesIdle(){
-  // 按你的要求：空闲时恢复被 defer 的图片
-  if ('requestIdleCallback' in window) {
-    requestIdleCallback(()=> resumeGridImageLoads());
-  } else {
-    setTimeout(resumeGridImageLoads, 200);
-  }
-}
-function isBelowFold(el, margin=100){
-  if (!el) return false;
-  const r = el.getBoundingClientRect();
-  return r.top > (window.innerHeight + margin);
-}
-
 function detectByUA(){
   const ua = navigator.userAgent || navigator.vendor || window.opera || "";
   try {
@@ -195,7 +179,7 @@ async function unmarkWatched(id){ return setWatchedOptimistic(id, false); }
 
 document.addEventListener("dragstart", e => e.preventDefault());
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
-function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
+function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size)); return out; }
 function showNotice(msg){ const n=$("notice"); if(!n) return; n.style.display="block"; n.innerHTML="ℹ︎ " + msg; }
 function clearNotice(){ const n=$("notice"); if(!n) return; n.style.display="none"; n.textContent=""; }
 function fmtSize(sz){ if (sz>=1<<30) return (sz/(1<<30)).toFixed(1)+" GB"; if (sz>=1<<20) return (sz/(1<<20)).toFixed(1)+" MB"; if (sz>=1<<10) return (sz/(1<<10)).toFixed(1)+" KB"; return sz+" B"; }
@@ -295,8 +279,7 @@ async function loadNextPage(){
     $("crumb").innerHTML = "当前位置：" + crumb;
 
     if (state.page===1){ grid().innerHTML=""; state.tiles=[]; }
-
-    const newIds = appendTiles(data, keyAtStart); // ★ folders 立刻渲染，videos 异步分批
+    const newIds = appendTiles(data);
     if (newIds.length) syncWatched(newIds);
 
     state.hasMore = state.page < data.total_pages;
@@ -304,91 +287,55 @@ async function loadNextPage(){
     setInfStatus(state.hasMore ? "下拉加载更多…" : "已到底部");
 
     bindDelegatedEvents(); bindRubber(); schedulePrefetch();
-
-    // ★ NEW: 空闲时统一恢复被 defer 的图片
-    scheduleResumeImagesIdle();
   }catch{ setInfStatus("加载失败，请重试"); }
   finally{ state.isLoading=false; queueMicrotask(()=>autoFillViewport(3)); }
 }
 
-/* ★ 修改点：仅同步渲染 folders；videos 延后用 requestIdleCallback 分批追加 */
-function appendTiles(data, keyAtStart){
+function appendTiles(data){
   let idx = state.tiles.length;
   const batchVideoIds = [];
 
-  // —— 先渲染文件夹（更快看到 UI）
-  (data.folders||[]).forEach(f=>{
+  data.folders.forEach(f=>{
     const path = (state.path.endsWith("/")? state.path : state.path + "/") + f.title;
     const el = document.createElement("div");
     el.className="tile folder"; el.dataset.type="folder"; el.dataset.path=path; el.dataset.idx=idx;
-    // 已按你之前的要求移除计数行
     el.innerHTML = `<div class="thumb"><div class="big">📁</div></div>
                     <div class="title">${f.title}</div>
+                    <div class="meta">(${f.count}) 项</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"folder", path, idx, title:f.title}); idx++;
   });
 
-  // —— 收集视频 ID，稍后分批异步追加
-  const videos = (data.videos||[]);
-  for (const v of videos) batchVideoIds.push(String(v.id));
+  (data.videos||[]).forEach(v=>{
+    const done = isWatched(v.id);
+    const base = v.preview_url;
+    const s128 = `${base}?s=128`;
+    const s192 = `${base}?s=192`;
+    const s256 = `${base}?s=256`;
+    const s384 = `${base}?s=384`;
+    const s512 = `${base}?s=512`;
+    const fallback = base;
+    const el = document.createElement("div");
+    el.className="tile"; el.dataset.type="video"; el.dataset.vid=v.id; el.dataset.idx=idx;
+    el.innerHTML = `<div class="thumb">
+                      <img
+                        src="${s256}"
+                        srcset="${s128} 128w, ${s192} 192w, ${s256} 256w, ${s384} 384w, ${s512} 512w"
+                        sizes="(max-width:640px) 48vw, 190px"
+                        alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
+                        onerror="this.onerror=null; this.src='${fallback}'"
+                      />
+                    </div>
+                    <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
+                    <div class="title">${v.title}</div>
+                    <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
+                    <button class="tile-menu" title="菜单">⋮</button>`;
+    grid().appendChild(el); state.tiles.push({el, type:"video", vid:v.id, idx, title:v.title}); idx++;
+    batchVideoIds.push(String(v.id));
 
-  if (videos.length){
-    const CHUNK = 24; // 小批量避免长任务
-    let i = 0;
-
-    const appendChunk = ()=>{
-      if (state.queryKey !== keyAtStart) return; // 已切换目录/筛选，丢弃
-      let appended = 0;
-      while (i < videos.length && appended < CHUNK){
-        const v = videos[i++];
-
-        const done = isWatched(v.id);
-        const base = v.preview_url;
-        const s128 = `${base}?s=128`;
-        const s192 = `${base}?s=192`;
-        const s256 = `${base}?s=256`;
-        const s384 = `${base}?s=384`;
-        const s512 = `${base}?s=512`;
-        const fallback = base;
-
-        const el = document.createElement("div");
-        el.className="tile"; el.dataset.type="video"; el.dataset.vid=v.id; el.dataset.idx=state.tiles.length;
-        el.innerHTML = `<div class="thumb">
-                          <img
-                            src="${s256}"
-                            srcset="${s128} 128w, ${s192} 192w, ${s256} 256w, ${s384} 384w, ${s512} 512w"
-                            sizes="(max-width:640px) 48vw, 190px"
-                            alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
-                            onerror="this.onerror=null; this.src='${fallback}'"
-                          />
-                        </div>
-                        <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
-                        <div class="title">${v.title}</div>
-                        <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
-                        <button class="tile-menu" title="菜单">⋮</button>`;
-
-        grid().appendChild(el);
-        state.tiles.push({el, type:"video", vid:v.id, idx:parseInt(el.dataset.idx,10), title:v.title});
-
-        // ★ NEW: 仅对“非首屏”图片先 defer，等空闲再恢复
-        const img = el.querySelector("img");
-        if (isPlayerActive()) {
-          // 播放器打开时以前的行为保持：统一 defer
-          deferImage(img);
-        } else if (isBelowFold(el)) {
-          deferImage(img);
-        }
-        appended++;
-      }
-      // 批次完成后，安排下一批在空闲时进行；同时空闲时尝试恢复 defer 的图片
-      if (i < videos.length){
-        scheduleIdle(appendChunk);
-      }
-      scheduleResumeImagesIdle();
-    };
-    // 第一批放到空闲时，确保文件夹先可见
-    scheduleIdle(appendChunk);
-  }
+    const img = el.querySelector("img");
+    if (isPlayerActive()) deferImage(img);
+  });
 
   return batchVideoIds;
 }
@@ -740,7 +687,8 @@ const switchToAudio = withSwitchLock(async function(){
 
   try{
     await attachAudioSrc(aSrc, resumeAt, {
-      muted: !autoPlay ? true : false,
+      /* ★ 修复：后台切换时以静音方式启动，避免被自动播放策略拦截 */
+      muted: true,
       ensurePlay: !!autoPlay,
       seek: 'force'
     });
@@ -748,6 +696,18 @@ const switchToAudio = withSwitchLock(async function(){
   try{
     await attachVideoSrc(vSrc, resumeAt);
     try{ v.pause(); }catch(_){}
+  }catch(_){}
+
+  /* ★ 修复：一旦进入 playing 再自动取消静音并恢复音量 */
+  try{
+    const aEl = media.a || $("bgAudio");
+    if (autoPlay && aEl){
+      const unmute = ()=>{ try{ aEl.muted = false; aEl.volume = Math.max(0.6, aEl.volume||0.6); }catch(_){}
+        aEl.removeEventListener("playing", unmute);
+      };
+      if (!aEl.paused && aEl.readyState >= 1) unmute();
+      else aEl.addEventListener("playing", unmute);
+    }
   }catch(_){}
 
   clearUserPaused();
@@ -1355,7 +1315,7 @@ async function handlePlayFromHereProgressive(vid, title){
   await syncWatched(all.map(x=>x.id));
   const idx = all.findIndex(x => String(x.id) === String(vid));
   const tail = (idx>=0) ? all.slice(idx+1) : all;
-  const pending = tail.filter(x => !isWatched(x));
+  const pending = tail.filter(x => !isWatched(x.id));
   const BATCH = 200;
   const producer = async function* (){ for (const part of chunk(pending, BATCH)) yield part; };
   progressiveAppendFrom(producer, "从该处后台加载");
@@ -1748,7 +1708,7 @@ function startStallHeartbeat(){
 }
 document.addEventListener("visibilitychange", ()=>{
   const a = media.a || $("bgAudio"); if (!a) return;
-  if (document.visibilityState==="hidden" && isPlayerActive() && playbackMode==="audio" && a && !a.paused){ resetGateBaseline(a); stopStallHeartbeat(); startGateHeartbeat(); }
+  if (document.visibilityState==="hidden" && isPlayerActive() && playbackMode==="audio" && !a.paused){ resetGateBaseline(a); stopStallHeartbeat(); startGateHeartbeat(); }
   else { stopGateHeartbeat(); stopStallHeartbeat(); }
 });
 setInterval(()=>{ const a=media.a||$("bgAudio"); if (document.visibilityState==="hidden" && isPlayerActive() && playbackMode==="audio" && a && !a.paused){ startStallHeartbeat(); } }, 5000);
