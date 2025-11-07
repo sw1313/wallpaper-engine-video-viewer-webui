@@ -1450,7 +1450,7 @@ function openContextMenu(x,y){
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
     add("播放此视频（全屏）", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
     add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
-    add("打开创意工坊链接", ()=> window.open(`/go/workshop/${vid}`, "_blank"));
+    add("打开创意工坊链接", ()=> window.open(`https://steamcommunity.com/sharedfiles/filedetails/?id=${vid}`, "_blank"));
     sep();
     add("删除（不可恢复）", async ()=>{
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
