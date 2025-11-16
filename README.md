@@ -3,6 +3,8 @@ wallpaper-engine-video-viewer-webui, Docker deployment, mimicking the we path di
 1.网页内播放，支持文件夹批量播放，支持播放完成记录，电脑支持框选及快捷键多选播放  
 2.适配手机浏览  
 3.添加后台播放音频功能，仅用chrome安卓版测试，via之类无法正常工作  
+4.添加取消订阅/移动路径功能，需要浏览器安装油猴添加wallpaper-engine-video-deduplication.js脚本文件，最好不要批量取消订阅过多文件，因为浏览器会打开所有文件的创意工坊链接;且尽量在非steam下载创意工坊时进行操作，否则可能出问题  
+
   
 # 部署教程
 
