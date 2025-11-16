@@ -46,7 +46,7 @@ docker run -d \
   -p 8066:8066 \
   -e WORKSHOP_PATH=/data/workshop/content/431960 \
   -e WE_PATH=/data/wallpaper_engine \
-  -v /path/to/workshop/content/431960:/data/workshop/content/431960 \
+  -v /path/to/workshop/content/431960:/data/workshop/content/431960:ro \
   -v /path/to/wallpaper_engine:/data/wallpaper_engine:ro \
   --name wallpaper-webui \
   wallpaper-webui:latest
