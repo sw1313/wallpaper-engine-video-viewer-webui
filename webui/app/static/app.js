@@ -66,9 +66,9 @@ function installBusyGuards(){
 }
 function removeBusyGuards(){
   if (!busyGuardsOn) return;
-  busyGuardsOn = false;
   const f = installBusyGuards._f, types = installBusyGuards._types||[];
   types.forEach(t=> document.removeEventListener(t, f, {capture:true}));
+  busyGuardsOn = false;
 }
 function showBusy(text="正在加载…"){
   ensureBusyEl();
@@ -115,6 +115,9 @@ function detectByUA(){
 }
 const UA = detectByUA();
 const IS_MOBILE_UA = UA.isMobile;
+
+/* ★ 新增：依据 UA 为 <html> 切换 is-desktop（仅桌面 UA 显示返回按钮） */
+try { document.documentElement.classList.toggle("is-desktop", !IS_MOBILE_UA); } catch(_){}
 
 const watchedCache = new Map();
 function isWatched(id){ return watchedCache.get(String(id)) === true; }
@@ -187,6 +190,151 @@ function fmtDate(ts){ return new Date(ts*1000).toLocaleString(); }
 function isSel(t){ return t.type==="video" ? state.selV.has(t.vid) : state.selF.has(t.path); }
 function setSel(t,on){ if(t.type==="video"){on?state.selV.add(t.vid):state.selV.delete(t.vid);} else {on?state.selF.add(t.path):state.selF.delete(t.path);} t.el.classList.toggle("selected",on); }
 function clearSel(){ state.tiles.forEach(t=>t.el.classList.remove("selected")); state.selV.clear(); state.selF.clear(); }
+
+/* ====================== （★ 新增）文件夹操作辅助 ====================== */
+
+// ★ 新增：拉取“移动到…”用的文件夹树（含子文件夹），缓存 60s
+let _foldersMenuCache = { ts:0, tree:null };
+async function getFoldersMenuTree(force=false){
+  const now = Date.now();
+  if (!force && _foldersMenuCache.tree && (now - _foldersMenuCache.ts < 60000)) return _foldersMenuCache.tree;
+  const r = await fetch("/api/folders_menu").catch(()=>null);
+  const j = r && r.ok ? (await r.json().catch(()=>({tree:[]}))) : {tree:[]};
+  _foldersMenuCache = { ts: now, tree: j.tree || [] };
+  return _foldersMenuCache.tree;
+}
+// ★ 新增：扁平化树为列表
+function flattenFolderTree(nodes, depth=0, out=[]){
+  for (const n of (nodes||[])){
+    out.push({ title: n.title || "未命名文件夹", path: n.path || "/", depth });
+    if (n.children && n.children.length) flattenFolderTree(n.children, depth+1, out);
+  }
+  return out;
+}
+// ★ 新增：创建/移动 API
+async function apiCreateFolder(parent, title){
+  const r = await fetch("/api/folder/create", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ parent, title })
+  }).catch(()=>null);
+  return !!(r && r.ok);
+}
+async function apiMove(ids, dest_path){
+  const r = await fetch("/api/move", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ ids: ids.map(String), dest_path })
+  }).catch(()=>null);
+  return !!(r && r.ok);
+}
+function sanitizeFolderTitle(name){
+  let s = String(name||"").trim();
+  s = s.replace(/[\\/]/g, " ").replace(/\s+/g, " ").trim();
+  return s.slice(0, 128);
+}
+
+// ★ 新增：选择器样式/DOM
+function ensureFolderPickerStyles(){
+  if (document.getElementById("folder-picker-style")) return;
+  const css = `
+  #folderPicker{position:fixed;z-index:99999;display:none;min-width:260px;max-width:320px;max-height:60vh;overflow:auto;
+    background:#222;color:#fff;border:1px solid #444;border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.45)}
+  #folderPicker .hdr{padding:10px 12px;font:600 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto;border-bottom:1px solid #333}
+  #folderPicker .itm{padding:8px 12px;cursor:pointer;white-space:nowrap}
+  #folderPicker .itm:hover{background:#2f2f2f}
+  #folderPicker .root{font-weight:600}
+  #folderPicker .path{opacity:.9}
+  #folderPicker .foot{padding:8px 12px;border-top:1px solid #333;display:flex;gap:10px}
+  #folderPicker .btn{padding:6px 10px;border-radius:8px;border:1px solid #555;background:#2a2a2a;color:#eee;cursor:pointer}
+  #folderPicker .btn:hover{background:#333}
+  `;
+  const s = document.createElement("style"); s.id="folder-picker-style"; s.textContent=css; document.head.appendChild(s);
+}
+function ensureFolderPicker(){
+  ensureFolderPickerStyles();
+  if (document.getElementById("folderPicker")) return;
+  const d = document.createElement("div");
+  d.id = "folderPicker";
+  d.innerHTML = `<div class="hdr">移动到…</div><div class="list" id="fpList"></div>
+                 <div class="foot"><button class="btn" id="fpCancel">取消</button></div>`;
+  document.body.appendChild(d);
+  $("fpCancel").onclick = hideFolderPicker;
+}
+function hideFolderPicker(){
+  const fp = $("folderPicker");
+  if (!fp) return;
+  fp.style.display="none";
+  document.removeEventListener("click", _fpClickAway, {capture:true});
+}
+function _fpClickAway(e){
+  const fp = $("folderPicker"); if (!fp) return;
+  if (!fp.contains(e.target)){ hideFolderPicker(); }
+}
+// ★ 新增：显示选择器
+async function showFolderPicker(anchorX, anchorY, onPick){
+  ensureFolderPicker();
+  const fp = $("folderPicker"), list = $("fpList");
+  list.innerHTML = "";
+  // Root
+  const root = document.createElement("div");
+  root.className = "itm root";
+  root.innerHTML = `<span>主页 <span class="path">(/)</span></span>`;
+  root.onclick = ()=>{ hideFolderPicker(); onPick("/"); };
+  list.appendChild(root);
+
+  // Tree
+  const tree = flattenFolderTree(await getFoldersMenuTree());
+  tree.forEach(node=>{
+    const row = document.createElement("div");
+    row.className = "itm";
+    row.style.paddingLeft = (12 + node.depth*16) + "px";
+    row.innerHTML = `<span>${node.title} <span class="path">(${node.path})</span></span>`;
+    row.onclick = ()=>{ hideFolderPicker(); onPick(node.path); };
+    list.appendChild(row);
+  });
+
+  fp.style.display="block";
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const w = Math.min(320, Math.max(260, fp.getBoundingClientRect().width||280));
+  const h = Math.min(vh*0.6, fp.getBoundingClientRect().height||320);
+  fp.style.left = Math.min(Math.max(8, anchorX), vw - w - 8) + "px";
+  fp.style.top  = Math.min(Math.max(8, anchorY), vh - h - 8) + "px";
+  setTimeout(()=> document.addEventListener("click", _fpClickAway, {capture:true}), 0);
+}
+// ★ 新增：根据所选收集视频 ID（可含文件夹→展开）
+async function collectSelectedIds(){
+  const ids = new Set();
+  for (const id of state.selV) ids.add(String(id));
+  if (state.selF.size){
+    const arr = await expandSelectionToItems();
+    for (const it of arr) ids.add(String(it.id));
+  }
+  return Array.from(ids);
+}
+// ★ 新增：移动并刷新
+async function moveIdsAndRefresh(ids, destPath){
+  if (!ids.length) { alert("没有可移动的条目"); return; }
+  primeBusy("正在移动…");
+  const ok = await apiMove(ids, destPath);
+  hideBusy();
+  if (!ok){ alert("移动失败，请重试"); return; }
+  showNotice(`已移动到：${destPath}`);
+  setTimeout(clearNotice, 1200);
+  clearSel();
+  changeContext({});
+}
+// ★ 新增：在指定父路径下创建文件夹
+async function promptCreateFolder(parentPath){
+  const name = sanitizeFolderTitle(prompt(`在「${parentPath}」下新建文件夹：`, ""));
+  if (!name) return;
+  primeBusy("正在创建文件夹…");
+  const ok = await apiCreateFolder(parentPath, name);
+  hideBusy();
+  if (!ok){ alert("创建失败，请重试"); return; }
+  _foldersMenuCache.ts = 0; // 失效本地缓存，便于后续“移动到…”立刻看到
+  changeContext({});
+}
 
 /* ====================== 路由/列表/分页 ====================== */
 
@@ -301,7 +449,6 @@ function appendTiles(data){
     el.className="tile folder"; el.dataset.type="folder"; el.dataset.path=path; el.dataset.idx=idx;
     el.innerHTML = `<div class="thumb"><div class="big">📁</div></div>
                     <div class="title">${f.title}</div>
-                    <div class="meta">(${f.count}) 项</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"folder", path, idx, title:f.title}); idx++;
   });
@@ -376,7 +523,6 @@ function changeContext({path, sort_idx, mature_only, q}={}){
   clearSel(); state.page=1; state.hasMore=true; state.isLoading=false; state.queryKey=makeQueryKey();
   resetPrefetch(); renderSkeleton(buildCrumbHtml(state.path)); setInfStatus("加载中…");
 
-  // 重置滚动至顶部，避免某些设备首屏 sentinel 位置错误带来的观感偏差
   try{ window.scrollTo(0,0); }catch(_){}
 
   if (!io){
@@ -385,10 +531,7 @@ function changeContext({path, sort_idx, mature_only, q}={}){
     if (sentinel) io.observe(sentinel);
   }
 
-  // ① 立即拉取第一页（主路径）
   loadNextPage();
-
-  // ② 兜底：若某些边缘状态导致未触发，微延迟再试一次（不会重复因为有 isLoading 防抖）
   setTimeout(()=>{ if (state.page===1 && !state.isLoading) loadNextPage(); }, 0);
 }
 
@@ -618,14 +761,16 @@ function updatePositionState(){
 
   if (playbackMode === "audio"){
     if (pos !== undefined) pos = Math.max(0, pos - (audioBias||0));
-    if (dur !== undefined) dur = Math.max(0, dur - (audioBias||0));
+    // 最小化修复：不要对 duration 做偏移，避免显示为“已播=总时长”
   }
 
   const rate = (!el.paused && Number.isFinite(el.playbackRate)) ? el.playbackRate : 0;
   try{
-    if (dur !== undefined && pos !== undefined)
+    if (dur !== undefined && pos !== undefined){
+      if (pos > dur) pos = Math.max(0, dur - 0.001); // 夹紧，避免越界导致 UI 误判
       navigator.mediaSession.setPositionState({ duration: dur, position: pos, playbackRate: rate });
-  }catch(_){}
+    }
+  }catch(_){ }
 }
 function startPosTicker(){ if (posTicker) return; updatePositionState(); posTicker = setInterval(updatePositionState, 1000); }
 function stopPosTicker(){ if (posTicker){ clearInterval(posTicker); posTicker=null; } }
@@ -682,12 +827,11 @@ const switchToAudio = withSwitchLock(async function(){
   const vSrc = mediaVideoSrcOf(id);
 
   const wasVideoPaused = !!(v && v.paused);
-  const autoPlay = !(wasVideoPaused || _userPaused);
+  const autoPlay = !_userPaused; // 最小化修复：仅以用户是否主动暂停为准，避免二次切后台被误判
   const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : 0;
 
   try{
     await attachAudioSrc(aSrc, resumeAt, {
-      /* ★ 修复：后台切换时以静音方式启动，避免被自动播放策略拦截 */
       muted: true,
       ensurePlay: !!autoPlay,
       seek: 'force'
@@ -698,7 +842,6 @@ const switchToAudio = withSwitchLock(async function(){
     try{ v.pause(); }catch(_){}
   }catch(_){}
 
-  /* ★ 修复：一旦进入 playing 再自动取消静音并恢复音量 */
   try{
     const aEl = media.a || $("bgAudio");
     if (autoPlay && aEl){
@@ -708,10 +851,19 @@ const switchToAudio = withSwitchLock(async function(){
       if (!aEl.paused && aEl.readyState >= 1) unmute();
       else aEl.addEventListener("playing", unmute);
     }
-  }catch(_){}
+  }
+  catch(_){ }
+
+  // 二次兜底：部分 UA 在第二次切到后台时会短暂停止播放，这里延迟重试一次
+  try{
+    const aEl2 = media.a || $("bgAudio");
+    if (autoPlay && aEl2 && aEl2.paused){
+      setTimeout(()=>{ if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && aEl2.paused){ aEl2.play().catch(()=>{}); } }, 250);
+    }
+  }catch(_){ }
 
   clearUserPaused();
-  playbackMode = "audio";
+playbackMode = "audio";
   updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
   if (autoPlay){ startBgAdvanceGuard(); startBgKeepAlive(); } else { stopBgAdvanceGuard(); stopBgKeepAlive(); }
 });
@@ -981,7 +1133,6 @@ function adjustFSViewport(){
   const wrap = $("playerFS");
   if (!wrap) return;
 
-  // ① 优先使用动态视口单位，完美贴合地址栏显示/隐藏
   if (SUPPORTS_DVH){
     wrap.style.height = "100dvh";
     const v = $("fsVideo"); const ov = $("overlay");
@@ -990,7 +1141,6 @@ function adjustFSViewport(){
     return;
   }
 
-  // ② 兼容回退：用 visualViewport.height（没有则用 innerHeight）
   const vv = window.visualViewport;
   const h = Math.ceil((vv && vv.height) ? vv.height : window.innerHeight);
   wrap.style.height = h + "px";
@@ -1020,16 +1170,15 @@ function installFsGuards(){
     window.visualViewport.addEventListener("scroll", _fsGuards.vvScroll);
   }
 
-  // ★ 关键：原生全屏切换后，下一拍再次贴边，避免“退出全屏 → 出现网址栏 → 底部漏边”
   const fixFS = ()=> setTimeout(adjustFSViewport, 50);
   document.addEventListener("fullscreenchange", fixFS);
-  document.addEventListener("webkitfullscreenchange", fixFS); // Safari
+  document.addEventListener("webkitfullscreenchange", fixFS);
 
   _fsGuards.installed = true;
 }
 /* 正确卸载（修复顶部黑条的那版仍保留） */
 function removeFsGuards(){
-  if (!_fsGuards.installed) return;
+  if (_fsGuards.installed) return;
   const wrap = $("playerFS");
   if (wrap){
     if (_fsGuards.wheel) wrap.removeEventListener("wheel", _fsGuards.wheel, { passive:false });
@@ -1038,7 +1187,7 @@ function removeFsGuards(){
   }
   const v = $("fsVideo"); const ov = $("overlay");
   if (v) v.style.height = "";
-  if (ov) ov.style.height = "";
+  if (ov) v.style.height = "";
   if (_fsGuards.resize) window.removeEventListener("resize", _fsGuards.resize);
   if (_fsGuards.orient) window.removeEventListener("orientationchange", _fsGuards.orient);
   if (window.visualViewport){
@@ -1070,8 +1219,24 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
 
   wrap.style.display = "flex";
 
-  const backBtn = $("btnBack");
-  if (backBtn && backBtn.parentNode) backBtn.parentNode.removeChild(backBtn);
+  /* ★ 变更：确保存在左上角返回按钮（仅桌面 UA 会显示；样式由 CSS 控制） */
+  let backBtn = $("btnBack");
+  if (!backBtn) {
+    backBtn = document.createElement("button");
+    backBtn.id = "btnBack";
+    backBtn.className = "icon-btn back";
+    backBtn.title = "返回";
+    backBtn.setAttribute("aria-label", "返回");
+    backBtn.textContent = "←";
+    wrap.appendChild(backBtn);
+  }
+  backBtn.onclick = ()=>{
+    try{
+      if (fsOverlayInHistory){ history.back(); fsOverlayInHistory = false; return; }
+    }catch(_){}
+    exitPlayer();
+    if (player.returnPath) navigateToPath(player.returnPath);
+  };
 
   document.documentElement.classList.add("noscroll");
   document.body.classList.add("noscroll");
@@ -1340,7 +1505,7 @@ async function progressivePlaySelection(){
   primeBusy("正在启动播放器…");
   cancelProgressive();
   const selVideos = [...state.selV].map(String), selFolders = [...state.selF];
-  let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>String(t.vid)===id)?.title) || `视频 ${id}` }));
+  let initial = selVideos.map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
   await syncWatched(initial.map(x=>x.id));
   if (!initial.length && selFolders.length){
     const firstFolderItems = await getFolderItems(selFolders[0]);
@@ -1380,6 +1545,53 @@ function getCurrentlyLoadedVideoItems(){
 /* ============== 事件委托 & 菜单 ============== */
 
 function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
+
+/* ★★★ 修改：取消订阅/批量取消订阅：访问链接后也删除本地条目，并带确认提示 ★★★ */
+async function openBulkUnsub(ids, batch=1){
+  try{
+    const uniq = Array.from(new Set((ids||[]).map(String).filter(Boolean)));
+    if (!uniq.length){ alert("没有可处理的条目"); return; }
+
+    // 确认提示
+    const okGo = confirm("是否取消订阅？会同时删除本地文件！");
+    if (!okGo) return;
+
+    // 打开创意工坊取消订阅链接（逐个）
+    uniq.forEach((id, i)=>{
+      const u = `https://steamcommunity.com/sharedfiles/filedetails/?id=${encodeURIComponent(id)}#bulk_unsub=1`;
+      setTimeout(()=>{ window.open(u, "_blank", "noopener"); }, i*120);
+    });
+
+    // 随后本地删除并刷新
+    primeBusy("正在取消订阅并删除本地条目…");
+    const ok = await deleteByIds(uniq);
+    hideBusy();
+
+    if (!ok){
+      alert("删除本地条目失败，请稍后重试。");
+    } else {
+      showNotice(`已打开取消订阅链接，并删除本地 ${uniq.length} 项`);
+      setTimeout(clearNotice, 1500);
+    }
+
+    clearSel();
+    changeContext({}); // 刷新
+  }catch(_){}
+}
+
+/* 删除接口 —— 改为返回 boolean，兼容旧调用 */
+async function deleteByIds(ids){
+  try{
+    const r = await fetch("/api/delete", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ids})
+    });
+    return !!(r && r.ok);
+  }catch(_){
+    return false;
+  }
+}
 
 function bindDelegatedEvents(){
   const el = grid(); if (el._allBound) return; el._allBound = true;
@@ -1436,7 +1648,6 @@ function bindDelegatedEvents(){
   el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
 }
 
-async function deleteByIds(ids){ await fetch("/api/delete", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ids}) }); }
 function openContextMenu(x,y){
   const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
   const selCount = state.selV.size + state.selF.size;
@@ -1445,31 +1656,65 @@ function openContextMenu(x,y){
   const oneFolder = onlyOne && state.selF.size === 1;
   function add(text, fn){ const d=document.createElement("div"); d.className="item"; d.textContent=text; d.onclick=()=>{ hideMenu(); fn(); }; menu.appendChild(d); }
   function sep(){ const s=document.createElement("div"); s.className="sep"; menu.appendChild(s); }
+
   if (oneVideo) {
     const vid = [...state.selV][0];
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
-    add("播放此视频（全屏）", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
+    add("播放此视频", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
     add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
     add("打开创意工坊链接", ()=> window.open(`https://steamcommunity.com/sharedfiles/filedetails/?id=${vid}`, "_blank"));
+    add("取消订阅", ()=> openBulkUnsub([vid], 1));
     sep();
-    add("删除（不可恢复）", async ()=>{
+    add("移动到主页", async ()=>{ await moveIdsAndRefresh([vid], "/"); });
+    add("移动到…", async ()=>{ showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh([vid], dest); }); });
+    sep();
+    add("删除", async ()=>{
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
-      await deleteByIds([vid]); clearSel(); changeContext({});
+      const ok = await deleteByIds([vid]);
+      if (!ok){ alert("删除失败，请稍后重试"); return; }
+      clearSel(); changeContext({});
     });
+    sep();
+    add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
   } else if (oneFolder) {
     const path = [...state.selF][0];
     add("打开此文件夹", ()=> navigateToPath(path));
-    add("播放此文件夹（全屏顺序播放）", async ()=>{ await progressivePlayFolder(path); });
-  } else {
-    add("批量播放（全屏顺序播放）", async ()=>{ await progressivePlaySelection(); });
+    add("播放此文件夹", async ()=>{ await progressivePlayFolder(path); });
     sep();
-    add("删除所选（不可恢复）", async ()=>{
+    add("在该文件夹下新建子文件夹…", ()=> promptCreateFolder(path));
+    sep();
+    add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
+  } else {
+    add("批量播放", async ()=>{ await progressivePlaySelection(); });
+    add("批量取消订阅", async ()=>{
+      const items = await expandSelectionToItems();
+      const ids = items.map(x=>String(x.id));
+      if (!ids.length){ alert("所选没有可取消订阅的条目"); return; }
+      await openBulkUnsub(ids, 1);
+    });
+    sep();
+    add("移动所选到主页", async ()=>{
+      const ids = await collectSelectedIds();
+      await moveIdsAndRefresh(ids, "/");
+    });
+    add("移动所选到…", async ()=>{
+      const ids = await collectSelectedIds();
+      if (!ids.length){ alert("没有可移动的条目"); return; }
+      showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh(ids, dest); });
+    });
+    sep();
+    add("删除所选", async ()=>{
       const items = await expandSelectionToItems();
       if (!items.length) return alert("所选没有可删除的视频");
       if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
-      await deleteByIds(items.map(x=>x.id)); clearSel(); changeContext({});
+      const ok = await deleteByIds(items.map(x=>x.id));
+      if (!ok){ alert("删除失败，请稍后重试"); return; }
+      clearSel(); changeContext({});
     });
+    sep();
+    add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
   }
+
   const vw=window.innerWidth,vh=window.innerHeight;
   menu.style.left = Math.min(x, vw-220)+"px"; menu.style.top = Math.min(y, vh-240)+"px";
   setTimeout(()=> document.addEventListener("click", hideMenu, {once:true}), 0);
@@ -1607,108 +1852,296 @@ async function expandSelectionToItems(){
   return items;
 }
 
-/* ========================= 进度门卫（Gate） 与 纯心跳（保留） ========================= */
-const gateHB = { active:false, timer:null, sampleMs:1000, windowMs:12000, eps:0.12, lastPos:0, lastMoveWall:0 };
-function resetGateBaseline(aEl){ gateHB.lastPos = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0; gateHB.lastMoveWall = performance.now(); }
-function stopGateHeartbeat(){ gateHB.active=false; if (gateHB.timer){ clearInterval(gateHB.timer); gateHB.timer=null; } }
-function startGateHeartbeat(){
-  if (gateHB.active) return;
-  const a = media.a || document.getElementById("bgAudio"); if (!a) return;
-  if (document.visibilityState!=="hidden" || playbackMode!=="audio" || a.paused) return;
-  resetGateBaseline(a); gateHB.active = true;
-  if (gateHB.timer) clearInterval(gateHB.timer);
-  gateHB.timer = setInterval(()=>{
-    const aa = media.a || document.getElementById("bgAudio");
-    if (!isPlayerActive() || playbackMode!=="audio" || !aa){ stopGateHeartbeat(); return; }
-    if (document.visibilityState!=="hidden"){ stopGateHeartbeat(); return; }
-    if (aa.paused || aa.seeking){ resetGateBaseline(aa); return; }
-    const pos = Number.isFinite(aa.currentTime) ? aa.currentTime : 0;
-    const advanced = (pos - gateHB.lastPos) >= gateHB.eps;
-    gateHB.lastPos = pos;
-    if (advanced){ gateHB.lastMoveWall = performance.now(); return; }
-    if (performance.now() - gateHB.lastMoveWall >= gateHB.windowMs){
-      stopGateHeartbeat(); const aNow = media.a || document.getElementById("bgAudio"); if (aNow) resetStallHeartbeat(aNow); startStallHeartbeat();
-    }
-  }, gateHB.sampleMs);
+/* ========================= 纯进度心跳检测 + 锚点缓存 + 稳定重启 ========================= */
+/*
+  - 舍弃能量检测，仅看 currentTime 前进；
+  - 每 3s 检测一次；连续 6 次（≈18s）几乎不前进（Δpos < 0.2s）→ 掐断；
+  - 掐断后的重启点使用“锚点时间缓存” lastGoodLogical（逻辑时间 = currentTime - audioBias）；
+  - 采用 doSilentRestart()：新建 Audio → 等 loadedmetadata → 计算 bias → seek 到 (lastGoodLogical + bias) → 替换元素 → 重绑事件 → play()；
+  - 掐断后进入 45s 冷却；暂停/切集/寻位/载入元数据 会重置计数和锚点；
+  - 仅在「后台 + 音频模式 + 正在播放」下运行。
+*/
+const stallHB = {
+  active:false,
+  timer:null,
+  intervalMs:3000,     // 3s 心跳
+  eps:0.2,             // 认为“几乎不动”的阈值（秒）
+  needCount:6,         // 连续 6 次（≈18s）
+  cooldownMs:45000,    // 掐断间隔 45s
+  lastPos:0,
+  stallCount:0,
+  cooldownUntil:0,
+  lastGoodLogical:0,   // ★ 锚点缓存（逻辑时间）
+  lastWall: 0          // [MIN-FIX#2] 上次墙钟心跳时间（ms, performance.now）
+};
+function _logicalAudioTime(aEl){
+  const t = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
+  return Math.max(0, t - (audioBias||0));
+}
+function resetStallHeartbeat(aEl){
+  stallHB.stallCount = 0;
+  stallHB.lastPos = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
+  stallHB.cooldownUntil = 0; 
+  stallHB.lastGoodLogical = _logicalAudioTime(aEl);
+  stallHB.lastWall = performance.now(); // [MIN-FIX#2]
 }
 
-const stallHB = { active:false, timer:null, intervalMs:3000, eps:0.2, needCount:6, cooldownMs:45000, lastPos:0, stallCount:0, cooldownUntil:0, lastGoodLogical:0, lastWall:0 };
-function _logicalAudioTime(aEl){ const t = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0; return Math.max(0, t - (audioBias||0)); }
-function resetStallHeartbeat(aEl){ stallHB.stallCount=0; stallHB.lastPos=Number.isFinite(aEl?.currentTime)?aEl.currentTime:0; stallHB.cooldownUntil=0; stallHB.lastGoodLogical=_logicalAudioTime(aEl); stallHB.lastWall=performance.now(); }
+/* ★ 抽出：心跳模块音频事件（可在替换音频后重复绑定） */
 function bindAudioEventsForStallHBOn(a){
-  if (!a || a._stallHBBound) return; a._stallHBBound = true;
-  a.addEventListener("playing", ()=>{ if (document.visibilityState==="hidden" && isPlayerActive() && playbackMode==="audio"){ resetGateBaseline(a); stopStallHeartbeat(); startGateHeartbeat(); } });
-  a.addEventListener("pause", ()=>{ resetGateBaseline(a); stopGateHeartbeat(); resetStallHeartbeat(a); stopStallHeartbeat(); });
-  a.addEventListener("ended", ()=>{ resetGateBaseline(a); stopGateHeartbeat(); resetStallHeartbeat(a); stopStallHeartbeat(); });
-  a.addEventListener("seeking", ()=>{ resetGateBaseline(a); resetStallHeartbeat(a); });
-  a.addEventListener("loadedmetadata", ()=>{ resetGateBaseline(a); resetStallHeartbeat(a); });
+  if (!a || a._stallHBBound) return;
+  a._stallHBBound = true;
+
+  a.addEventListener("playing", ()=>{
+    if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+      // 先 Gate 观察，避免直接进入重型心跳
+      resetGateBaseline(a);
+      stopStallHeartbeat();
+      startGateHeartbeat();
+    }
+  });
+  a.addEventListener("pause", ()=>{
+    resetGateBaseline(a);
+    stopGateHeartbeat();
+    resetStallHeartbeat(a);
+    stopStallHeartbeat();
+    try{ stopMinuteResync(); }catch(_){}
+  });
+  a.addEventListener("ended", ()=>{
+    resetGateBaseline(a);
+    stopGateHeartbeat();
+    resetStallHeartbeat(a);
+    stopStallHeartbeat();
+    try{ stopMinuteResync(); }catch(_){}
+  });
+  a.addEventListener("seeking", ()=>{
+    resetGateBaseline(a);
+    resetStallHeartbeat(a);
+  });
+  a.addEventListener("loadedmetadata", ()=>{
+    resetGateBaseline(a);
+    resetStallHeartbeat(a);
+  });
 }
+
+/* ★ 替换后重绑：near-end、stalled、position、keepAlive、心跳等 */
 function bindAudioCoreEventsAfterReplace(a){
   if (!a) return;
-  try{ a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline",""); a.disableRemotePlayback = true; a.preload = "auto"; }catch(_){}
+  try{
+    a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline","");
+    a.disableRemotePlayback = true;
+    a.preload = "auto";
+  }catch(_){}
+
   a.addEventListener("ended", ()=> handleEndedFromAny(a));
-  installAudioNearEndDetector(a); installStallListeners(media.v||$("fsVideo"), a);
+  installAudioNearEndDetector(a);
+  installStallListeners(media.v||$("fsVideo"), a);
+
   a.addEventListener("timeupdate", updatePositionState);
   a.addEventListener("loadedmetadata", updatePositionState);
   a.addEventListener("durationchange", updatePositionState);
-  a.addEventListener("playing", ()=>{ clearUserPaused(); updatePositionState(); startPosTicker(); if (playbackMode==="audio") startBgKeepAlive(); });
-  a.addEventListener("pause",   ()=>{ if (document.visibilityState==='visible') markUserPaused(); updatePositionState(); stopBgKeepAlive(); });
+  a.addEventListener("playing", ()=>{
+    clearUserPaused(); updatePositionState(); startPosTicker();
+    if (playbackMode==="audio") startBgKeepAlive();
+    try{ startMinuteResync(); }catch(_){}
+  });
+  a.addEventListener("pause",   ()=>{
+    if (document.visibilityState==='visible') markUserPaused();
+    updatePositionState(); stopBgKeepAlive();
+  });
+
   bindAudioEventsForStallHBOn(a);
 }
-(function initialBindAudioHB(){ const a=$("bgAudio"); if (!a) return; bindAudioEventsForStallHBOn(a); })();
+
+/* —— 首次为现有 bgAudio 绑定心跳监听 —— */
+(function initialBindAudioHB(){
+  const a = $("bgAudio");
+  if (!a) return;
+  bindAudioEventsForStallHBOn(a);
+})();
+
+/* ★ 核心：稳定后台重启，避免回到开头（并用墙钟推算累计播放点） */
 async function doSilentRestart(oldAudio, phase="stallHB"){
-  const id = player.ids[player.index]; if (!id) return;
-  const wasPaused=!!oldAudio?.paused, wasMuted=!!oldAudio?.muted;
-  const nowMs=performance.now(); const elapsed=Math.max(0,(nowMs-(stallHB.lastWall||nowMs))/1000);
-  const resumeAtLogical=Math.max(0,(stallHB.lastGoodLogical||0)+elapsed*0.9);
+  const id = player.ids[player.index];
+  if (!id) return;
+
+  const wasPaused = !!oldAudio?.paused;
+  const wasMuted  = !!oldAudio?.muted;
+
+  // [MIN-FIX#1] —— 用墙钟时间推算 resumeAtLogical，避免锚点滞后累积
+  const nowMs = performance.now();
+  const elapsed = Math.max(0, (nowMs - (stallHB.lastWall || nowMs)) / 1000);
+  const predictedLogical = Math.max(0, (stallHB.lastGoodLogical || 0) + elapsed * 0.9);
+  const resumeAtLogical = predictedLogical;
+
+  console.log(`[StallHB] ${phase} restart → resume at ${resumeAtLogical.toFixed(3)}s (logical, +${elapsed.toFixed(2)}s*0.9)`);
+
   try{
-    const newSrc = audioSrcOf(id, true);
-    const newAudio = new Audio(); newAudio.src=newSrc; newAudio.preload="auto"; newAudio.muted=wasMuted; newAudio.volume=wasMuted?0:Math.max(0.6, oldAudio?.volume||0.6);
-    await new Promise((resolve,reject)=>{ const onMeta=()=>{newAudio.removeEventListener("loadedmetadata",onMeta);resolve();}; const onErr=e=>{newAudio.removeEventListener("error",onErr);reject(e);}; newAudio.addEventListener("loadedmetadata",onMeta); newAudio.addEventListener("error",onErr); newAudio.load(); });
+    // 1) 只创建新元素与 src，不立即播放
+    const newSrc = audioSrcOf(id, /*cacheBust*/ true);
+    const newAudio = new Audio();
+    newAudio.src = newSrc;
+    newAudio.preload = "auto";
+    newAudio.muted = wasMuted;
+    newAudio.volume = wasMuted ? 0 : Math.max(0.6, oldAudio?.volume || 0.6);
+
+    // 2) 等待元数据（可安全 seek）
+    await new Promise((resolve, reject)=>{
+      const onMeta = ()=>{ newAudio.removeEventListener("loadedmetadata", onMeta); resolve(); };
+      const onErr  = (e)=>{ newAudio.removeEventListener("error", onErr); reject(e); };
+      newAudio.addEventListener("loadedmetadata", onMeta);
+      newAudio.addEventListener("error", onErr);
+      newAudio.load();
+    });
+
+    // 同步/计算新的 bias
     audioBias = computeAudioBias(newAudio);
+
+    // 3) 目标 = 预测逻辑时间 + 新 bias
     const target = Math.max(0, resumeAtLogical + (audioBias||0));
-    try{ newAudio.currentTime = target; }catch{ newAudio.currentTime = 0; }
-    const verifyOnce=()=>{ const cur=newAudio.currentTime||0; if (Math.abs(cur-target)>1.5){ try{ newAudio.currentTime=target; }catch(_){} } };
+    try { newAudio.currentTime = target; } catch (err) {
+      console.warn("[StallHB] initial seek failed, fallback to 0", err);
+      newAudio.currentTime = 0;
+    }
+
+    // 保险：首个 timeupdate 验证位置，不对则强制再 seek 一次
+    const verifyOnce = ()=>{
+      const cur = newAudio.currentTime || 0;
+      if (Math.abs(cur - target) > 1.5){
+        try{ newAudio.currentTime = target; }catch(_){}
+      }
+    };
     newAudio.addEventListener("timeupdate", verifyOnce, { once:true });
-    const old=$("bgAudio"); if (old && old.parentNode) old.parentNode.replaceChild(newAudio, old);
-    newAudio.id="bgAudio"; media.a=newAudio; bindAudioCoreEventsAfterReplace(newAudio);
-    if (!wasPaused){ try{ await newAudio.play(); }catch{} }
-    stallHB.lastPos=Number.isFinite(newAudio.currentTime)?newAudio.currentTime:0; stallHB.lastGoodLogical=resumeAtLogical; stallHB.lastWall=performance.now();
-  }catch(err){ console.warn("[StallHB] restart failed:", err); }
+
+    // 4) 替换旧的 bgAudio 元素
+    const old = $("bgAudio");
+    if (old && old.parentNode) old.parentNode.replaceChild(newAudio, old);
+    newAudio.id = "bgAudio";
+    media.a = newAudio;
+
+    // 5) 重新绑定项目依赖的所有音频事件
+    bindAudioCoreEventsAfterReplace(newAudio);
+
+    // 6) 播放（如原先在播放）
+    if (!wasPaused){
+      try { await newAudio.play(); } catch (err) {
+        console.warn("[StallHB] play() failed:", err);
+      }
+    }
+
+    // 7) 刷新心跳基线与锚点 & 记下墙钟
+    stallHB.lastPos = Number.isFinite(newAudio.currentTime) ? newAudio.currentTime : 0;
+    stallHB.lastGoodLogical = resumeAtLogical;
+    stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+
+    console.log(`[StallHB] restart complete, playing from ${resumeAtLogical.toFixed(3)}s (logical), bias=${(audioBias||0).toFixed(3)}s`);
+  }catch(err){
+    console.warn("[StallHB] restart failed:", err);
+  }
 }
-function stopStallHeartbeat(){ stallHB.active=false; if (stallHB.timer){ clearInterval(stallHB.timer); stallHB.timer=null; } }
+
+function stopStallHeartbeat(){
+  stallHB.active = false;
+  if (stallHB.timer){ clearInterval(stallHB.timer); stallHB.timer = null; }
+}
 function startStallHeartbeat(){
   if (stallHB.active) return;
-  const a = media.a || $("bgAudio"); if (!a) return;
-  if (document.visibilityState!=="hidden" || playbackMode!=="audio" || a.paused) return;
-  resetStallHeartbeat(a); stallHB.active=true;
+  const a = media.a || $("bgAudio");
+  if (!a) return;
+  if (document.visibilityState !== "hidden") return;
+  if (playbackMode !== "audio") return;
+  if (a.paused) return;
+
+  resetStallHeartbeat(a);
+  stallHB.active = true;
+
   if (stallHB.timer) clearInterval(stallHB.timer);
   stallHB.timer = setInterval(async ()=>{
     const aEl = media.a || $("bgAudio");
     if (!isPlayerActive() || playbackMode!=="audio" || !aEl){ stopStallHeartbeat(); return; }
     if (document.visibilityState!=="hidden" || aEl.paused) return;
-    if (aEl.seeking || scrubGuard.active) return;
+    if (aEl.seeking) { resetStallHeartbeat(aEl); return; }
+    if (scrubGuard.active) return;
+    if (stallRepair.inFlight) return;
+
+    // [MIN-FIX#2] 每次 tick 更新 lastWall，用于墙钟推算
     stallHB.lastWall = performance.now();
-    const pos=Number.isFinite(aEl.currentTime)?aEl.currentTime:0;
-    const advanced=(pos-stallHB.lastPos)>=stallHB.eps;
-    stallHB.lastPos=pos;
-    if (advanced){ stallHB.lastGoodLogical=_logicalAudioTime(aEl); stallHB.stallCount=0; return; }
-    stallHB.stallCount++;
-    if (stallHB.stallCount>=stallHB.needCount){
-      if (performance.now()<stallHB.cooldownUntil){ stallHB.stallCount=0; return; }
+
+    const pos = Number.isFinite(aEl.currentTime) ? aEl.currentTime : 0;
+    const advanced = (pos - stallHB.lastPos) >= stallHB.eps;
+    stallHB.lastPos = pos;
+
+    if (advanced){
+      // ★ 进度在向前，更新锚点为“最近一次可靠播放时间（逻辑）”
+      stallHB.lastGoodLogical = _logicalAudioTime(aEl);
+      stallHB.stallCount = 0;
+      return;
+    } else {
+      stallHB.stallCount++;
+    }
+
+    if (stallHB.stallCount >= stallHB.needCount){
+      if (performance.now() < stallHB.cooldownUntil){
+        stallHB.stallCount = 0;
+        return;
+      }
+      // ★ 改为“硬重启”以保证后台 seek 生效
       await doSilentRestart(aEl, "stallHB");
-      const aa=media.a||$("bgAudio");
-      stallHB.cooldownUntil=performance.now()+stallHB.cooldownMs;
-      stallHB.stallCount=0;
-      stallHB.lastPos=Number.isFinite(aa?.currentTime)?aa.currentTime:0;
-      stallHB.lastGoodLogical=_logicalAudioTime(aa);
-      stallHB.lastWall=performance.now();
+
+      // 进入冷却并刷新基线
+      const aa = media.a || $("bgAudio");
+      stallHB.cooldownUntil = performance.now() + stallHB.cooldownMs;
+      stallHB.stallCount = 0;
+      stallHB.lastPos = Number.isFinite(aa?.currentTime) ? aa.currentTime : 0;
+      stallHB.lastGoodLogical = _logicalAudioTime(aa);
+      stallHB.lastWall = performance.now(); // [MIN-FIX#2]
     }
   }, stallHB.intervalMs);
 }
+
+/* === 静音每分钟重播对齐（Minute Resync） === */
+const _minuteResync = { timer:null, active:false, periodMs:60000 };
+function startMinuteResync(){
+  if (_minuteResync.active) return;
+  _minuteResync.active = true;
+  if (_minuteResync.timer) clearInterval(_minuteResync.timer);
+  _minuteResync.timer = setInterval(async ()=>{
+    try{
+      const aEl = media.a || $("bgAudio");
+      if (!isPlayerActive() || playbackMode!=="audio" || !aEl) return;
+      if (document.visibilityState!=="hidden") return;
+      if (aEl.paused || aEl.seeking) return;
+      if (scrubGuard.active || stallRepair.inFlight) return;
+      // 每周期进行一次“硬重播+对齐”以防 UA 挂起静音段
+      await doSilentRestart(aEl, "minute-resync");
+    }catch(_){}
+  }, _minuteResync.periodMs);
+}
+function stopMinuteResync(){
+  _minuteResync.active = false;
+  if (_minuteResync.timer){ clearInterval(_minuteResync.timer); _minuteResync.timer = null; }
+}
+/* === 静音每分钟重播对齐（Minute Resync）·完 === */
+
+/* —— 生命周期：使用 Gate 作为前置，再决定是否进入 stallHB —— */
 document.addEventListener("visibilitychange", ()=>{
-  const a = media.a || $("bgAudio"); if (!a) return;
-  if (document.visibilityState==="hidden" && isPlayerActive() && playbackMode==="audio" && !a.paused){ resetGateBaseline(a); stopStallHeartbeat(); startGateHeartbeat(); }
-  else { stopGateHeartbeat(); stopStallHeartbeat(); }
+  const a = media.a || $("bgAudio");
+  if (!a) return;
+  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && !a.paused){
+    resetGateBaseline(a);
+    stopStallHeartbeat();
+    startGateHeartbeat();     startMinuteResync(); // 先门卫，再纯心跳
+  } else {
+    stopGateHeartbeat();
+    stopStallHeartbeat();
+  stopMinuteResync(); }
 });
-setInterval(()=>{ const a=media.a||$("bgAudio"); if (document.visibilityState==="hidden" && isPlayerActive() && playbackMode==="audio" && a && !a.paused){ startStallHeartbeat(); } }, 5000);
+
+/* —— 兜底：极少设备不发 visibilitychange，这里每 5s 尝试一次 —— */
+setInterval(()=>{
+  const a = media.a || $("bgAudio");
+  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && a && !a.paused){
+    startStallHeartbeat();
+  }
+}, 5000);
+
+/* ========================= 纯进度心跳检测 + 稳定重启（完） ========================= */

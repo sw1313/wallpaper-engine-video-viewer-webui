@@ -1,12 +1,14 @@
 # app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart + keepalive)
 import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil
 import time, logging  # ★ 新增：用于 /api/keepalive 时间与日志过滤
+import secrets  # ★ 新增
+from urllib.parse import quote  # ★ 新增
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException, Body  # ★ 添加 Body
 from fastapi.responses import (
     FileResponse,
     StreamingResponse,
@@ -25,6 +27,9 @@ from .we_scan import (
     collect_unassigned_items, find_node_by_path, all_ids_recursive, delete_id_dir
 )
 from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest
+
+# ★ 新增：导入 we_scan 的写操作（生成 .bak 再写入）
+from .we_scan import create_folder as ws_create_folder, move_items as ws_move_items  # ★ 新增
 
 # === 可配置路径 ===
 WORKSHOP_PATH = os.getenv("WORKSHOP_PATH", "/data/workshop/content/431960")
@@ -88,6 +93,15 @@ def _faststart_mark_done(vid_id: str):
 class WatchedSet(BaseModel):
     ids: List[str]
     watched: bool = True
+
+# ★ 新增：文件夹相关的请求模型
+class CreateFolderRequest(BaseModel):  # ★ 新增
+    parent: str = "/"
+    title: str
+
+class MoveRequest(BaseModel):  # ★ 新增
+    ids: List[str] = []
+    dest_path: str = "/"
 
 # ========= 预览图缓存 =========
 PREVIEW_CACHE_DIR = os.getenv("PREVIEW_CACHE_DIR", os.path.join(DATA_DIR, "preview_cache"))
@@ -186,6 +200,12 @@ def _scan_state():
 
       _SCAN_CACHE.update(ts=now, folder_roots=folder_roots, id_map=id_map, root_unassigned=root_unassigned, path_map=path_map)
     return _SCAN_CACHE["folder_roots"], _SCAN_CACHE["id_map"], _SCAN_CACHE["root_unassigned"]
+
+# ★ 新增：修改 config.json 后失效扫描缓存（让前端立即看到变化）
+def _invalidate_scan_cache():  # ★ 新增
+  with _SCAN_LOCK:
+    _SCAN_CACHE["ts"] = 0.0
+    _SCAN_CACHE["path_map"] = None
 
 def _build_video_out(id_map, vid_id) -> VideoOut:
   v = id_map[vid_id]
@@ -367,6 +387,39 @@ def api_folder_videos(
   if with_meta:
     return {"items": [{"id": i, "title": id_map[i].title} for i in vids]}
   return {"ids": vids}
+
+# === 右键/菜单用：列出“移动到 …”二级菜单（包含已有文件夹与子文件夹） ===
+@app.get("/api/folders_menu")  # ★ 新增
+def api_folders_menu():
+  try:
+    we_cfg = load_we_config(WE_PATH)
+    lst = extract_folders_list(we_cfg)
+  except Exception:
+    lst = []
+
+  def rec(nodes, prefix):
+    out = []
+    for n in (nodes or []):
+      title = n.get("title", "未命名文件夹")
+      path = (prefix + "/" + title) if prefix != "/" else ("/" + title)
+      out.append({"title": title, "path": path, "children": rec(n.get("subfolders") or [], path)})
+    return out
+
+  return {"tree": rec(lst, "/")}
+
+# === 在当前路径下新建文件夹（写 config.json，先 .bak 再写入） ===
+@app.post("/api/folder/create")  # ★ 新增
+def api_folder_create(req: CreateFolderRequest):
+  ws_create_folder(WE_PATH, req.parent or "/", req.title)
+  _invalidate_scan_cache()  # 失效缓存，前端刷新立即可见
+  return {"ok": True}
+
+# === 移动所选项目（支持多选）到目标路径；"/" 表示移动到主页 ===
+@app.post("/api/move")  # ★ 新增
+def api_move(req: MoveRequest):
+  ws_move_items(WE_PATH, req.ids or [], req.dest_path or "/")
+  _invalidate_scan_cache()
+  return {"ok": True, "moved": len(req.ids or [])}
 
 # === 直接删除（危险操作，已在前端加确认框） ===
 @app.post("/api/delete")
@@ -1106,3 +1159,103 @@ def health():
     "workshop_exists": work_ok,
     "workshop_has_digit_dirs": work_has_dirs
   }
+
+# =======================
+# ★ 新增：取消订阅（服务器端队列 + 脚本回调），最小化集成
+# =======================
+
+# 队列：key -> {queue: deque[str], total:int, assigned:int, done:int, ts:float}
+UNSUB_STORE = {}
+UNSUB_LOCK  = threading.Lock()
+UNSUB_TTL   = int(os.getenv("UNSUB_TTL", "3600"))  # 1 小时
+
+def _unsub_cleanup():
+    now = time.time()
+    with UNSUB_LOCK:
+        dead = [k for k, v in UNSUB_STORE.items() if (now - v.get("ts", now)) > UNSUB_TTL]
+        for k in dead:
+            UNSUB_STORE.pop(k, None)
+
+def _build_cb_url(request: Request, key: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/unsub/next?key={quote(key)}"
+
+def _steam_url_with_hash(workshop_id: str, cb_url: str) -> str:
+    # 统一加 #bulk_unsub=1&cb=ENCODED
+    h = f"bulk_unsub=1&cb={quote(cb_url, safe=':/?&=')}"
+    return f"https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}#{h}"
+
+@app.get("/unsub", response_class=HTMLResponse)
+def unsub_page(request: Request):
+    # 模板 unsub.html 负责读取 ?ids= 和 batch= 并调用 /api/unsub/init
+    return templates.TemplateResponse("unsub.html", {"request": request})
+
+@app.post("/api/unsub/init")
+def api_unsub_init(request: Request, payload: dict = Body(..., embed=False)):
+    """
+    注册一个退订任务队列，默认 batch=1，并返回首批要打开的 Steam 链接（已带 #bulk_unsub=1&cb=…）。
+    前端或用户脚本随后会在每次完成后回调 /unsub/next?key=… 取下一条。
+    """
+    ids = [str(x).strip() for x in (payload.get("ids") or []) if str(x).strip()]
+    if not ids:
+        raise HTTPException(400, detail="no ids")
+    batch = int(payload.get("batch") or 1)
+    batch = max(1, min(batch, 10))
+
+    key = secrets.token_urlsafe(16)
+    cb  = _build_cb_url(request, key)
+    urls = [_steam_url_with_hash(wid, cb) for wid in ids]
+
+    from collections import deque
+    first, rest = urls[:batch], urls[batch:]
+    with UNSUB_LOCK:
+        UNSUB_STORE[key] = dict(queue=deque(rest), total=len(urls),
+                                assigned=len(first), done=0, ts=time.time())
+    return {"key": key, "first": first, "total": len(urls)}
+
+def _cors_headers(extra: dict | None = None):
+    base = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "content-type",
+        "Access-Control-Max-Age": "86400",
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+@app.options("/unsub/next")
+def unsub_next_options():
+    return Response(status_code=204, headers=_cors_headers())
+
+@app.post("/unsub/next")
+async def unsub_next(request: Request, key: str = Query(...)):
+    """
+    油猴脚本在完成当前条目的取消订阅后调用本接口，服务器返回下一条要处理的 URL。
+    若队列为空，返回 {"url": ""}。
+    """
+    _unsub_cleanup()
+
+    # 读取客户端上报（可选）
+    data = {}
+    try:
+        raw = await request.body()
+        if raw:
+            import json as _json
+            data = _json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        data = {}
+
+    with UNSUB_LOCK:
+        slot = UNSUB_STORE.get(key)
+        if not slot:
+            return JSONResponse({"url": ""}, headers=_cors_headers())
+        # 统计
+        slot["done"] = int(slot.get("done", 0)) + 1
+        q = slot["queue"]
+        nxt = q.popleft() if q else ""
+        if nxt:
+            slot["assigned"] = int(slot.get("assigned", 0)) + 1
+        slot["ts"] = time.time()
+
+    return JSONResponse({"url": nxt}, headers=_cors_headers())

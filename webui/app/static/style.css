@@ -5,7 +5,6 @@
    - 底部控件安全区 padding，确保进度条不出屏
    - 播放页阻止上下滑动；进入/退出通过 .noscroll 切换
 */
-
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 html, body { height:100%; overflow-x:hidden; }
@@ -130,7 +129,6 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
   /* ★ 防上下滑动、边界回弹 */
   touch-action:none; overscroll-behavior:contain;
 }
-/* ★ 使用动态视口高度，修复安卓地址栏顶起导致的高度不足 */
 @supports (height: 100dvh){
   .playerfs{ height:100dvh; }
   .playerfs video{ height:100dvh; }
@@ -144,7 +142,6 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 .overlay{
   position:absolute; left:0; top:0; width:100vw; height:100vh;
   pointer-events:none; z-index:20;
-  /* ★ 为底部控件预留安全区，避免进度条被顶出屏外 */
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
 }
 
@@ -157,7 +154,13 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .icon-btn:hover{ opacity:1; }
 .icon-btn.menu{ right:14px; }
-.icon-btn.back{ display:none !important; } /* ★ 去掉左上角返回按钮 */
+
+/* 默认隐藏返回按钮 */
+.icon-btn.back{ display:none !important; }
+
+/* ★ 仅在“桌面 UA”下显示返回按钮（左上角） */
+html.is-desktop .icon-btn.back{ display:flex !important; left:14px; }
+
 .playerfs.idle .icon-btn{ opacity:0; }
 
 /* 半透明遮罩：点击可收起播放列表 */
@@ -184,14 +187,12 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 }
 .playlist.hidden{ display:none; }
 
-/* ★ 竖屏下加宽（手机竖屏显著更宽） */
 @media (orientation: portrait){
   .playlist{
     width: min(92vw, 560px);
     max-width: 560px;
   }
 }
-/* 宽屏下的默认宽度 */
 @media (min-width: 1024px){
   .playlist{ width:360px; max-width: 420px; }
 }
@@ -204,7 +205,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 #plist .dot{ width:8px; height:8px; border-radius:8px; background:#bbb; }
 #plist li.active .dot{ background:#007fff; }
 
-.playerfs.locked{ /* 继续保留锁定行为（抽屉打开时） */
+.playerfs.locked{
   touch-action:none; overscroll-behavior:contain;
 }
 .playerfs.locked video{ pointer-events:none; }
@@ -212,7 +213,6 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 .inf-status{ text-align:center; padding:12px 10px; color:#666; font-size:13px; }
 .sentinel{ width:100%; height:1px; }
 
-/* 全屏 :fullscreen / :-webkit-full-screen 提升层级 */
 #playerFS:fullscreen,
 #playerFS:-webkit-full-screen{ z-index:2147483638; }
 #playerFS:fullscreen video,

@@ -1,3 +1,4 @@
+# we_scan.py — 最小化修改版（方案2：严格只碰 folders/items）
 import os, json, math, shutil, time, threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -176,3 +177,176 @@ def delete_id_dir(workshop_root: str, wid: str) -> bool:
         return False
     shutil.rmtree(src, ignore_errors=False)
     return True
+
+
+# =====================================================================
+# ★ 基于 config.json 的“新建文件夹 / 移动项目”写操作（带 .bak 备份）
+#   方案2：严格只碰 folders/items，不改 UI 状态键
+# =====================================================================
+
+_WRITE_LOCK = threading.Lock()
+
+def _cfg_path(we_path: str) -> str:
+    return os.path.join(we_path, "config.json")
+
+def _locate_folders_slot(we_cfg: dict) -> Tuple[dict, str]:
+    """
+    只定位“folders”容器，避免写入/覆盖其它 UI/状态键：
+    - 优先使用 general.browser.folders
+    - 次选 general.folders
+    - 若都不存在，仅在 default.general.browser 下创建 {"folders": []}
+    """
+    # 仅读取，不 create：不影响不存在的 profile
+    for _, profile in we_cfg.items():
+        if not isinstance(profile, dict):
+            continue
+        general = profile.get("general")
+        if not isinstance(general, dict):
+            continue
+        browser = general.get("browser")
+        if isinstance(browser, dict) and isinstance(browser.get("folders"), list):
+            return browser, "folders"
+        folders = general.get("folders")
+        if isinstance(folders, list):
+            return general, "folders"
+
+    # 安全兜底：只在 default.general.browser 下创建 folders
+    default_prof = we_cfg.setdefault("default", {})
+    gen = default_prof.setdefault("general", {})
+    bro = gen.get("browser")
+    if not isinstance(bro, dict):
+        bro = {}
+        gen["browser"] = bro
+    if not isinstance(bro.get("folders"), list):
+        bro["folders"] = []
+    return bro, "folders"
+
+def _ensure_path(folders_list: List[dict], path_parts: List[str]) -> None:
+    """
+    确保 /A/B/... 路径逐级存在；不存在则创建占位 folder。
+    """
+    cur_list = folders_list
+    for name in path_parts:
+        found = None
+        for f in cur_list:
+            if isinstance(f, dict) and f.get("title") == name:
+                found = f
+                break
+        if not found:
+            found = {"type": "folder", "title": name, "items": {}, "subfolders": []}
+            cur_list.append(found)
+        cur_list = found.setdefault("subfolders", [])
+
+def _write_config_atomic_with_backup(we_path: str, cfg: dict) -> None:
+    """
+    写回 config.json（先备份 .bak，再写临时文件，最后原子替换）。
+    任一步骤失败会抛出异常；原文件与 .bak 均保留以便手工回滚。
+    """
+    cfg_file = _cfg_path(we_path)
+    tmp_file = cfg_file + ".tmp"
+    bak_file = cfg_file + ".bak"
+
+    # 1) 先备份
+    try:
+        if os.path.isfile(cfg_file):
+            shutil.copy2(cfg_file, bak_file)
+    except Exception as e:
+        # 备份失败也不继续写，避免覆盖原文件
+        raise RuntimeError(f"备份 config.json 失败: {e}")
+
+    # 2) 写入临时文件
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    # 3) 原子替换
+    os.replace(tmp_file, cfg_file)
+
+def _prune_ids(node_list: List[dict], ids: List[str]) -> None:
+    """
+    从整颗 folders 树里移除这些 id（遍历 items 与 subfolders）。
+    """
+    for f in node_list or []:
+        if not isinstance(f, dict):
+            continue
+        items = f.setdefault("items", {}) or {}
+        for i in ids:
+            if i in items:
+                items.pop(i, None)
+        subs = f.get("subfolders") or []
+        _prune_ids(subs, ids)
+
+def create_folder(we_path: str, parent_path: str, title: str) -> None:
+    """
+    在 parent_path 下创建名为 title 的子文件夹。
+    parent_path: 形如 "/", "/A", "/A/B"
+    """
+    parent_path = (parent_path or "/").strip()
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("文件夹名称不能为空")
+
+    parts = [p for p in parent_path.split("/") if p]
+    with _WRITE_LOCK:
+        cfg = load_we_config(we_path)
+        container, key = _locate_folders_slot(cfg)
+        folders = container.setdefault(key, [])
+
+        # 确保父级路径存在
+        _ensure_path(folders, parts)
+
+        # 下钻到父级 subfolders
+        target_list = folders
+        for name in parts:
+            target = next((x for x in target_list if x.get("title") == name), None)
+            if not target:
+                target = {"type": "folder", "title": name, "items": {}, "subfolders": []}
+                target_list.append(target)
+            target_list = target.setdefault("subfolders", [])
+
+        # 如果同名已存在则不重复创建
+        exists = next((x for x in target_list if x.get("title") == title), None)
+        if not exists:
+            target_list.append({"type": "folder", "title": title, "items": {}, "subfolders": []})
+
+        _write_config_atomic_with_backup(we_path, cfg)
+
+def move_items(we_path: str, ids: List[str], dest_path: str) -> None:
+    """
+    将若干 id 移动到目标路径 dest_path。
+    - dest_path="/" 表示移出所有文件夹（保留在主页）
+    - 仅修改 folders.items；不写入/覆写其它任何键
+    """
+    ids = [str(i) for i in (ids or []) if str(i)]
+    if not ids:
+        return
+    dest_path = (dest_path or "/").strip()
+    dest_parts = [p for p in dest_path.split("/") if p]
+
+    with _WRITE_LOCK:
+        cfg = load_we_config(we_path)
+        container, key = _locate_folders_slot(cfg)
+        folders = container.setdefault(key, [])
+
+        # 1) 全树删掉这些 id
+        _prune_ids(folders, ids)
+
+        # 2) "/" = 主页：不写入任何 folder（即保持未分配状态）
+        if dest_path != "/":
+            # 确保目标路径存在
+            _ensure_path(folders, dest_parts)
+
+            # 找到目标节点
+            cur_list = folders
+            node = None
+            for name in dest_parts:
+                node = next((x for x in cur_list if x.get("title") == name), None)
+                if not node:
+                    node = {"type": "folder", "title": name, "items": {}, "subfolders": []}
+                    cur_list.append(node)
+                cur_list = node.setdefault("subfolders", [])
+
+            items = node.setdefault("items", {})
+            for i in ids:
+                items[str(i)] = 1
+
+        _write_config_atomic_with_backup(we_path, cfg)
