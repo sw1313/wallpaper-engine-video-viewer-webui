@@ -313,16 +313,20 @@ async function collectSelectedIds(){
   return Array.from(ids);
 }
 // ★ 新增：移动并刷新
+
 async function moveIdsAndRefresh(ids, destPath){
   if (!ids.length) { alert("没有可移动的条目"); return; }
+  const samePath = (destPath === state.path);
   primeBusy("正在移动…");
   const ok = await apiMove(ids, destPath);
   hideBusy();
   if (!ok){ alert("移动失败，请重试"); return; }
   showNotice(`已移动到：${destPath}`);
   setTimeout(clearNotice, 1200);
+  if (!samePath){
+    removeTilesByVideoIds(ids);
+  }
   clearSel();
-  changeContext({});
 }
 // ★ 新增：在指定父路径下创建文件夹
 async function promptCreateFolder(parentPath){
@@ -1570,12 +1574,12 @@ async function openBulkUnsub(ids, batch=1){
     if (!ok){
       alert("删除本地条目失败，请稍后重试。");
     } else {
+      removeTilesByVideoIds(uniq);
       showNotice(`已打开取消订阅链接，并删除本地 ${uniq.length} 项`);
       setTimeout(clearNotice, 1500);
     }
 
     clearSel();
-    changeContext({}); // 刷新
   }catch(_){}
 }
 
@@ -1593,14 +1597,54 @@ async function deleteByIds(ids){
   }
 }
 
-function bindDelegatedEvents(){
-  const el = grid(); if (el._allBound) return; el._allBound = true;
+function removeTilesByVideoIds(ids){
+  const set = new Set((ids || []).map(String).filter(Boolean));
+  if (!set.size) return;
+  const g = grid();
+  if (!g) return;
+  const newTiles = [];
+  for (const t of state.tiles){
+    if (t && t.type === "video" && set.has(String(t.vid))){
+      try{
+        if (t.el && t.el.parentNode){
+          t.el.parentNode.removeChild(t.el);
+        }
+      }catch(_){}
+    } else {
+      newTiles.push(t);
+    }
+  }
+  state.tiles = newTiles;
+  // 重新编号 idx，保持 getTile 正常工作
+  state.tiles.forEach((t, idx)=>{
+    t.idx = idx;
+    if (t.el && t.el.dataset) t.el.dataset.idx = String(idx);
+  });
+  // 清理选中状态
+  set.forEach(id=>{
+    try{
+      state.selV.delete(id);
+      state.selV.delete(Number(id));
+    }catch(_){}
+  });
+  state.lastIdx = null;
+}
 
+function bindDelegatedEvents(){
+  const el = grid();
+  if (el._allBound) return;
+  el._allBound = true;
+
+  //---------------------------------------------------------
+  // 左键点击处理 (保持不变)
+  //---------------------------------------------------------
   el.addEventListener("click", async (ev)=>{
     const wbtn = ev.target.closest(".watched-btn");
     if (wbtn){
-      ev.preventDefault(); ev.stopPropagation();
-      const t = getTile(wbtn); if (!t || t.type!=="video") return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const t = getTile(wbtn);
+      if (!t || t.type!=="video") return;
       const id = String(t.vid);
       const next = !isWatched(id);
       paintWatchedButton(wbtn, next);
@@ -1610,42 +1654,136 @@ function bindDelegatedEvents(){
 
     const menuBtn = ev.target.closest(".tile-menu");
     if (menuBtn) {
-      const t = getTile(menuBtn); if (!t) return;
-      clearSel(); setSel(t, true); state.lastIdx = t.idx;
+      const t = getTile(menuBtn);
+      if (!t) return;
+      clearSel();
+      setSel(t, true);
+      state.lastIdx = t.idx;
       const b = menuBtn.getBoundingClientRect();
       openContextMenu(b.left + b.width/2, b.top + b.height);
-      ev.stopPropagation(); return;
+      ev.stopPropagation();
+      return;
     }
 
-    const t = getTile(ev.target); if (!t) return;
-    if (ev.ctrlKey) { setSel(t, !isSel(t)); state.lastIdx=t.idx; ev.preventDefault(); return; }
+    const t = getTile(ev.target);
+    if (!t) return;
+
+    // CTRL 多选
+    if (ev.ctrlKey) {
+      setSel(t, !isSel(t));
+      state.lastIdx=t.idx;
+      ev.preventDefault();
+      return;
+    }
+
+    // SHIFT 连选
     if (ev.shiftKey) {
       const start = state.lastIdx==null ? t.idx : state.lastIdx;
       const [a,b] = [start, t.idx].sort((x,y)=>x-y);
-      if (!ev.ctrlKey) clearSel(); for (let i=a;i<=b;i++) setSel(state.tiles[i], true);
-      ev.preventDefault(); return;
+      if (!ev.ctrlKey) clearSel();
+      for (let i=a;i<=b;i++) setSel(state.tiles[i], true);
+      ev.preventDefault();
+      return;
     }
-    t.el.classList.add("pulse"); setTimeout(()=> t.el.classList.remove("pulse"), 200);
-    clearSel(); setSel(t,true); state.lastIdx=t.idx;
-    if (t.type === "folder") navigateToPath(t.path);
-    else { primeBusy("正在启动播放器…"); await startPlaylist([{id:t.vid, title:t.title}], 0, state.path); }
+
+    // 普通单击
+    t.el.classList.add("pulse");
+    setTimeout(()=> t.el.classList.remove("pulse"), 200);
+
+    clearSel();
+    setSel(t,true);
+    state.lastIdx=t.idx;
+
+    if (t.type === "folder") {
+      navigateToPath(t.path);
+    } else {
+      primeBusy("正在启动播放器…");
+      await startPlaylist([{id:t.vid, title:t.title}], 0, state.path);
+    }
   });
 
+  //---------------------------------------------------------
+  // ★ 右键菜单处理（移动端兼容，保持不变）
+  //---------------------------------------------------------
   try { el.oncontextmenu = null; } catch(_) {}
+
   if (IS_MOBILE_UA) {
-    el.addEventListener("contextmenu", e => e.preventDefault(), { capture:true, passive:false });
+    el.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      e.stopPropagation();
+    }, { capture:true, passive:false });
     return;
   }
-  const openFrom = (ev)=>{
-    const t = getTile(ev.target); if (!t) return false;
-    ev.preventDefault();
-    if (!isSel(t)) { clearSel(); setSel(t,true); state.lastIdx=t.idx; }
-    openContextMenu(ev.clientX, ev.clientY);
-    return true;
-  };
-  el.addEventListener("contextmenu", (ev)=>{ openFrom(ev); }, { capture:true });
-  el.addEventListener("mouseup", (ev)=>{ if (ev.button===2) openFrom(ev); });
-  el.addEventListener("pointerup", (ev)=>{ if (ev.button===2) openFrom(ev); });
+
+  //---------------------------------------------------------
+  // ★★ 终极修复 V2：Grid 级右键捕获（彻底防止浏览器右键菜单）
+  //     → 分离了“阻止默认行为”和“触发业务逻辑”，确保在边缘也能拦截。
+  //---------------------------------------------------------
+  (function installGridContextGuard(){
+    const g = $("grid");
+    if (!g || g._ctxGuardInstalled) return;
+
+    // ◆ 业务逻辑：尝试选中 Tile 并打开自定义菜单
+    //    如果点击的是 Grid 内的空白缝隙，则只清除选择。
+    const tryTriggerCustomMenu = (ev) => {
+      // 确保事件目标仍在 Grid 范围内
+      if (!g.contains(ev.target)) return;
+
+      let tile = ev.target.closest(".tile");
+      if (!tile){
+        // 点击了 Grid 内的空白处
+        clearSel();
+        hideMenu();
+        return;
+      }
+
+      const idx = parseInt(tile.dataset.idx,10);
+      const t = state.tiles[idx];
+      if (!t){
+        clearSel();
+        hideMenu();
+        return;
+      }
+
+      if (!isSel(t)){
+        clearSel();
+        setSel(t,true);
+        state.lastIdx=t.idx;
+      }
+
+      // 使用事件触发时的坐标打开菜单
+      openContextMenu(ev.clientX, ev.clientY);
+    };
+
+    // ◆ 核心拦截器：contextmenu
+    //    使用 capture 阶段，无条件阻止默认行为，然后再尝试触发业务逻辑。
+    g.addEventListener("contextmenu", (ev)=>{
+      // 【关键修改】无条件阻止浏览器菜单，无论是否点中了 Tile
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      // 尝试执行业务逻辑
+      tryTriggerCustomMenu(ev);
+    }, { capture:true, passive:false });
+
+    // ◆ 辅助拦截器：mouseup / pointerup
+    //    处理某些浏览器或特定操作下不触发 contextmenu 的右键行为。
+    const fallbackHandler = (ev) => {
+      if (ev.button === 2){ // 右键
+        ev.preventDefault();
+        ev.stopPropagation();
+        // 这里不需要再调用 tryTriggerCustomMenu，因为大部分桌面浏览器
+        // 都会紧接着触发 contextmenu，由上面的监听器统一处理业务逻辑。
+        // 如果在此处也调用，可能会导致菜单闪烁（触发两次）。
+        // 这里的主要目的是确保在某些极端情况下阻止默认的浏览器行为。
+      }
+    };
+
+    g.addEventListener("mouseup", fallbackHandler, {capture:true, passive:false});
+    g.addEventListener("pointerup", fallbackHandler, {capture:true, passive:false});
+
+    g._ctxGuardInstalled = true;
+  })();
 }
 
 function openContextMenu(x,y){
@@ -1672,7 +1810,8 @@ function openContextMenu(x,y){
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
       const ok = await deleteByIds([vid]);
       if (!ok){ alert("删除失败，请稍后重试"); return; }
-      clearSel(); changeContext({});
+      removeTilesByVideoIds([vid]);
+      clearSel();
     });
     sep();
     add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
@@ -1707,9 +1846,11 @@ function openContextMenu(x,y){
       const items = await expandSelectionToItems();
       if (!items.length) return alert("所选没有可删除的视频");
       if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
-      const ok = await deleteByIds(items.map(x=>x.id));
+      const ids = items.map(x=>x.id);
+      const ok = await deleteByIds(ids);
       if (!ok){ alert("删除失败，请稍后重试"); return; }
-      clearSel(); changeContext({});
+      removeTilesByVideoIds(ids);
+      clearSel();
     });
     sep();
     add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
