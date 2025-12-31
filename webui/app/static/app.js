@@ -611,43 +611,123 @@ function computeAudioBias(a){
   return b;
 }
 
-/* ========== 后台保活（best-effort：sendBeacon 优先） ========== */
-const keepAlive = { ctx:null, gain:null, src:null, pingTimer:null, active:false };
+/* ========== 后台保活（增强版：多重保护机制） ========== */
+const keepAlive = { 
+  ctx:null, gain:null, src:null, pingTimer:null, active:false,
+  wakeLock:null, wakeLockTimer:null,  // Wake Lock API
+  playWatchTimer:null, lastPlayTime:0  // 播放状态监控
+};
 async function startBgKeepAlive(){
   if (keepAlive.active) return;
   keepAlive.active = true;
+  
+  // 1. AudioContext 保活（原有机制）
   try{
     const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return;
-    if (!keepAlive.ctx) keepAlive.ctx = new AC({ latencyHint: "interactive" });
-    await keepAlive.ctx.resume().catch(()=>{});
-    if (!keepAlive.gain){
-      keepAlive.gain = keepAlive.ctx.createGain();
-      keepAlive.gain.gain.value = 1e-7;
-      keepAlive.gain.connect(keepAlive.ctx.destination);
-    }
-    if (!keepAlive.src){
-      keepAlive.src = keepAlive.ctx.createConstantSource ? keepAlive.ctx.createConstantSource() : keepAlive.ctx.createOscillator();
-      if (keepAlive.src.offset) keepAlive.src.offset.value = 0.0; else keepAlive.src.frequency.value = 1;
-      keepAlive.src.connect(keepAlive.gain);
-      try{ keepAlive.src.start(); }catch(_){}
-    }
-    if (keepAlive.pingTimer) clearInterval(keepAlive.pingTimer);
-    keepAlive.pingTimer = setInterval(()=>{
-      if (document.visibilityState === "hidden"){
-        try{
-          if (navigator.sendBeacon) navigator.sendBeacon("/api/keepalive", "1");
-          else fetch("/api/keepalive",{method:"POST",body:"1",keepalive:true,cache:"no-store",headers:{"Content-Type":"text/plain","Connection":"close"}}).catch(()=>{});
-        }catch(_){}
+    if (AC){
+      if (!keepAlive.ctx) keepAlive.ctx = new AC({ latencyHint: "interactive" });
+      await keepAlive.ctx.resume().catch(()=>{});
+      if (!keepAlive.gain){
+        keepAlive.gain = keepAlive.ctx.createGain();
+        keepAlive.gain.gain.value = 1e-7;
+        keepAlive.gain.connect(keepAlive.ctx.destination);
       }
-    }, 45000);
-  }catch(_){
-    keepAlive.active = false;
-  }
+      if (!keepAlive.src){
+        keepAlive.src = keepAlive.ctx.createConstantSource ? keepAlive.ctx.createConstantSource() : keepAlive.ctx.createOscillator();
+        if (keepAlive.src.offset) keepAlive.src.offset.value = 0.0; else keepAlive.src.frequency.value = 1;
+        keepAlive.src.connect(keepAlive.gain);
+        try{ keepAlive.src.start(); }catch(_){}
+      }
+    }
+  }catch(_){}
+  
+  // 2. Wake Lock API（防止设备休眠）
+  try{
+    if ('wakeLock' in navigator){
+      const requestWakeLock = async ()=>{
+        try{
+          if (keepAlive.wakeLock) return;
+          keepAlive.wakeLock = await navigator.wakeLock.request('screen');
+          keepAlive.wakeLock.addEventListener('release', ()=>{
+            keepAlive.wakeLock = null;
+          });
+        }catch(err){
+          console.warn("[KeepAlive] Wake Lock failed:", err);
+          keepAlive.wakeLock = null;
+        }
+      };
+      await requestWakeLock();
+      // 定期检查并重新获取（某些浏览器会自动释放）
+      if (keepAlive.wakeLockTimer) clearInterval(keepAlive.wakeLockTimer);
+      keepAlive.wakeLockTimer = setInterval(async ()=>{
+        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+          if (!keepAlive.wakeLock || keepAlive.wakeLock.released){
+            await requestWakeLock();
+          }
+        }
+      }, 30000); // 每30秒检查一次
+    }
+  }catch(_){}
+  
+  // 3. 更频繁的服务器心跳（从45秒改为20秒）
+  if (keepAlive.pingTimer) clearInterval(keepAlive.pingTimer);
+  keepAlive.pingTimer = setInterval(()=>{
+    if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+      try{
+        if (navigator.sendBeacon) navigator.sendBeacon("/api/keepalive", "1");
+        else fetch("/api/keepalive",{method:"POST",body:"1",keepalive:true,cache:"no-store",headers:{"Content-Type":"text/plain","Connection":"close"}}).catch(()=>{});
+      }catch(_){}
+    }
+  }, 20000); // 20秒一次
+  
+  // 4. 播放状态监控（检测播放是否被系统杀死）
+  if (keepAlive.playWatchTimer) clearInterval(keepAlive.playWatchTimer);
+  keepAlive.playWatchTimer = setInterval(()=>{
+    if (document.visibilityState !== "hidden") return;
+    if (!isPlayerActive() || playbackMode !== "audio") return;
+    const a = media.a || $("bgAudio");
+    if (!a) return;
+    
+    const now = Date.now();
+    const wasPlaying = !a.paused;
+    const timeAdvanced = (a.currentTime || 0) > (keepAlive.lastPlayTime || 0);
+    
+    // 如果应该播放但时间没前进，说明被系统杀死了
+    if (wasPlaying && !timeAdvanced && (now - (keepAlive.lastPlayTime || 0)) > 3000){
+      console.warn("[KeepAlive] 检测到播放被系统暂停，尝试恢复...");
+      try{
+        a.play().catch(()=>{
+          // 如果直接play失败，尝试重启
+          const id = player.ids[player.index];
+          if (id){
+            const resumeAt = Math.max(0, (a.currentTime || 0) - (audioBias || 0));
+            attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
+          }
+        });
+      }catch(_){}
+    }
+    
+    if (wasPlaying && timeAdvanced){
+      keepAlive.lastPlayTime = a.currentTime || 0;
+    }
+  }, 2000); // 每2秒检查一次
 }
 function stopBgKeepAlive(){
   keepAlive.active = false;
+  
   if (keepAlive.pingTimer){ clearInterval(keepAlive.pingTimer); keepAlive.pingTimer = null; }
+  if (keepAlive.wakeLockTimer){ clearInterval(keepAlive.wakeLockTimer); keepAlive.wakeLockTimer = null; }
+  if (keepAlive.playWatchTimer){ clearInterval(keepAlive.playWatchTimer); keepAlive.playWatchTimer = null; }
+  
+  // 释放 Wake Lock
+  try{
+    if (keepAlive.wakeLock && !keepAlive.wakeLock.released){
+      keepAlive.wakeLock.release();
+    }
+    keepAlive.wakeLock = null;
+  }catch(_){}
+  
+  // 清理 AudioContext
   try{
     if (keepAlive.src){ try{ keepAlive.src.stop(); }catch(_){}
       try{ keepAlive.src.disconnect(); }catch(_){}
@@ -657,6 +737,8 @@ function stopBgKeepAlive(){
     if (keepAlive.ctx){ try{ keepAlive.ctx.close(); }catch(_){}
       keepAlive.ctx = null; }
   }catch(_){}
+  
+  keepAlive.lastPlayTime = 0;
 }
 
 /* === 附加/预热（带 seek 策略） === */
@@ -668,6 +750,12 @@ async function attachVideoSrc(src, resumeAt){
   const needReload = curAttr !== src;
   if (needReload){ v.src = src; try{ v.load(); }catch(_){} }
   setCurrentTimeWhenReady(v, resumeAt||0);
+  // ★ 在视频元数据加载后修复竖屏视频在全屏模式下的显示
+  if (v.readyState >= 1) {
+    setTimeout(fixPortraitVideoInFullscreen, 50);
+  } else {
+    v.addEventListener("loadedmetadata", ()=> setTimeout(fixPortraitVideoInFullscreen, 50), {once:true});
+  }
 }
 async function attachAudioSrc(src, resumeAt, {muted=true, ensurePlay=true, seek='smart'}={}){
   const a = media.a || $("bgAudio");
@@ -703,9 +791,10 @@ function prewarmVideo(srcUrl, resumeAt){
     }catch(_){}
   });
 }
-function prewarmAudio(srcUrl, resumeAt){
+function prewarmAudio(srcUrl, resumeAt, shouldPlay=false){
   queueMicrotask(async ()=>{
-    try{ await attachAudioSrc(srcUrl, resumeAt||0, { muted:true, ensurePlay:true, seek:'smart' }); }catch(_){}
+    // 预热只做 load/seek，不要触发播放；否则会在前台抢占 MediaSession/进度条为“音频样式”
+    try{ await attachAudioSrc(srcUrl, resumeAt||0, { muted:true, ensurePlay:!!shouldPlay, seek:'smart' }); }catch(_){}
   });
 }
 
@@ -862,14 +951,53 @@ const switchToAudio = withSwitchLock(async function(){
   try{
     const aEl2 = media.a || $("bgAudio");
     if (autoPlay && aEl2 && aEl2.paused){
-      setTimeout(()=>{ if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && aEl2.paused){ aEl2.play().catch(()=>{}); } }, 250);
+      setTimeout(()=>{ 
+        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && aEl2.paused){ 
+          aEl2.play().catch(()=>{
+            // 如果直接play失败，尝试重新加载源
+            const id = player.ids[player.index];
+            if (id){
+              const resumeAt = Math.max(0, (aEl2.currentTime || 0) - (audioBias || 0));
+              attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
+            }
+          }); 
+        } 
+      }, 250);
+      // 增强：多次重试机制（250ms, 500ms, 1000ms）
+      setTimeout(()=>{ 
+        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+          const aEl3 = media.a || $("bgAudio");
+          if (aEl3 && aEl3.paused && autoPlay){ 
+            aEl3.play().catch(()=>{});
+          }
+        } 
+      }, 500);
+      setTimeout(()=>{ 
+        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+          const aEl4 = media.a || $("bgAudio");
+          if (aEl4 && aEl4.paused && autoPlay){ 
+            aEl4.play().catch(()=>{});
+          }
+        } 
+      }, 1000);
     }
   }catch(_){ }
 
   clearUserPaused();
-playbackMode = "audio";
+  playbackMode = "audio";
   updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
-  if (autoPlay){ startBgAdvanceGuard(); startBgKeepAlive(); } else { stopBgAdvanceGuard(); stopBgKeepAlive(); }
+  if (autoPlay){ 
+    startBgAdvanceGuard(); 
+    startBgKeepAlive(); 
+    // 增强：确保保活机制已启动，并记录播放时间
+    const aFinal = media.a || $("bgAudio");
+    if (aFinal && !aFinal.paused){
+      keepAlive.lastPlayTime = aFinal.currentTime || 0;
+    }
+  } else { 
+    stopBgAdvanceGuard(); 
+    stopBgKeepAlive(); 
+  }
 });
 
 const switchToVideo = withSwitchLock(async function(){
@@ -923,6 +1051,27 @@ document.addEventListener("visibilitychange", async ()=>{
   if (scrubGuard.active) return;
   if (document.visibilityState === "hidden"){
     await switchToAudio();
+    // 增强：切到后台后立即启动保活和监控
+    const a = media.a || $("bgAudio");
+    if (a && !a.paused && playbackMode === "audio"){
+      startBgKeepAlive();
+      // 延迟检查一次，确保播放真的在继续
+      setTimeout(()=>{
+        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode === "audio"){
+          const a2 = media.a || $("bgAudio");
+          if (a2 && a2.paused){
+            console.warn("[Visibility] 后台播放被暂停，尝试恢复...");
+            a2.play().catch(()=>{
+              const id = player.ids[player.index];
+              if (id){
+                const resumeAt = Math.max(0, (a2.currentTime || 0) - (audioBias || 0));
+                attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
+              }
+            });
+          }
+        }
+      }, 500);
+    }
   }else{
     await switchToVideo();
     setTimeout(()=> kickVisWatch("visible"), 50);
@@ -940,11 +1089,55 @@ window.addEventListener("pageshow", ()=>{
 });
 document.addEventListener("resume", ()=> kickVisWatch("resume"));
 
-window.addEventListener("pagehide", ()=> { if (isPlayerActive() && !scrubGuard.active) switchToAudio(); });
+// Page Lifecycle API 支持（更现代的页面状态管理）
+if ('onpageshow' in window){
+  window.addEventListener("pageshow", (e)=>{
+    if (e.persisted && isPlayerActive() && playbackMode === "audio"){
+      // 页面从 bfcache 恢复，检查播放状态
+      const a = media.a || $("bgAudio");
+      if (a && !a.paused){
+        setTimeout(()=>{
+          if (a.paused){
+            console.warn("[PageLifecycle] 从 bfcache 恢复后播放被暂停，尝试恢复...");
+            a.play().catch(()=>{});
+          }
+        }, 100);
+      }
+    }
+  });
+}
+
+window.addEventListener("pagehide", (e)=> { 
+  if (isPlayerActive() && !scrubGuard.active) switchToAudio();
+  // 如果是进入 bfcache，保持保活机制
+  if (e.persisted){
+    // 不停止保活，让它在后台继续
+  } else {
+    stopBgKeepAlive();
+  }
+});
 window.addEventListener("beforeunload", stopBgKeepAlive);
 window.addEventListener("unload", stopBgKeepAlive);
-window.addEventListener("pagehide", (e)=>{ if (!e.persisted) stopBgKeepAlive(); });
-document.addEventListener("freeze", stopBgKeepAlive);
+document.addEventListener("freeze", ()=>{
+  // 页面被冻结时，尝试保持播放
+  if (isPlayerActive() && playbackMode === "audio"){
+    const a = media.a || $("bgAudio");
+    if (a && !a.paused){
+      // 在冻结前确保保活机制运行
+      startBgKeepAlive();
+    }
+  }
+});
+document.addEventListener("resume", ()=>{
+  // 页面从冻结恢复
+  if (isPlayerActive() && playbackMode === "audio"){
+    const a = media.a || $("bgAudio");
+    if (a && a.paused){
+      console.warn("[PageLifecycle] 从冻结恢复后播放被暂停，尝试恢复...");
+      a.play().catch(()=>{});
+    }
+  }
+});
 
 /* —— 结束→下一集 —— */
 let lastAdvanceId = null;
@@ -1131,6 +1324,34 @@ function injectVideoPreload(src){
 
 /* ===== 播放入口 ===== */
 
+/* ★ 修复横向设备上竖屏视频在全屏模式下的旋转和拉伸问题 */
+function fixPortraitVideoInFullscreen(){
+  const v = $("fsVideo");
+  if (!v) return;
+  const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  if (!isFullscreen) {
+    v.classList.remove("portrait-fix");
+    return;
+  }
+  // 检测屏幕方向（横向）
+  const isLandscape = window.innerWidth > window.innerHeight;
+  if (!isLandscape) {
+    v.classList.remove("portrait-fix");
+    return;
+  }
+  // 检测视频是否为竖屏
+  const videoWidth = v.videoWidth || 0;
+  const videoHeight = v.videoHeight || 0;
+  if (videoWidth > 0 && videoHeight > 0) {
+    const isPortraitVideo = videoHeight > videoWidth;
+    if (isPortraitVideo) {
+      v.classList.add("portrait-fix");
+    } else {
+      v.classList.remove("portrait-fix");
+    }
+  }
+}
+
 /* ★ 视口高度自适应 & 滚动拦截（进入/退出时安装/卸载） */
 const SUPPORTS_DVH = (typeof CSS !== "undefined" && CSS.supports && CSS.supports("height","100dvh"));
 function adjustFSViewport(){
@@ -1163,8 +1384,8 @@ function installFsGuards(){
   wrap.addEventListener("touchmove", _fsGuards.touch, { passive:false });
 
   adjustFSViewport();
-  _fsGuards.resize = ()=> adjustFSViewport();
-  _fsGuards.orient = ()=> adjustFSViewport();
+  _fsGuards.resize = ()=> { adjustFSViewport(); fixPortraitVideoInFullscreen(); };
+  _fsGuards.orient = ()=> { adjustFSViewport(); fixPortraitVideoInFullscreen(); };
   window.addEventListener("resize", _fsGuards.resize);
   window.addEventListener("orientationchange", _fsGuards.orient);
   if (window.visualViewport){
@@ -1175,8 +1396,19 @@ function installFsGuards(){
   }
 
   const fixFS = ()=> setTimeout(adjustFSViewport, 50);
-  document.addEventListener("fullscreenchange", fixFS);
-  document.addEventListener("webkitfullscreenchange", fixFS);
+  const fixPortraitOnFullscreenChange = ()=>{
+    fixFS();
+    setTimeout(fixPortraitVideoInFullscreen, 100);
+  };
+  document.addEventListener("fullscreenchange", fixPortraitOnFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", fixPortraitOnFullscreenChange);
+  // 监听视频元数据加载，以便在视频尺寸确定后应用修复
+  const v = $("fsVideo");
+  if (v && !v._portraitFixBound) {
+    v._portraitFixBound = true;
+    v.addEventListener("loadedmetadata", fixPortraitVideoInFullscreen);
+    v.addEventListener("resize", fixPortraitVideoInFullscreen);
+  }
 
   _fsGuards.installed = true;
 }
@@ -1343,9 +1575,6 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   const aSrc = audioSrcOf(id, cacheBust);
   injectVideoPreload(vSrc);
 
-  setMediaSessionMeta(id);
-  updatePositionState(); startPosTicker();
-
   if (document.visibilityState === "hidden") {
     audioBias = 0;
     try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true, seek:'force' }); }catch(_){}
@@ -1354,18 +1583,25 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
       try{ v.pause(); }catch(_){}
     }catch(_){}
     playbackMode = "audio";
+    setMediaSessionMeta(id);
+    updatePositionState(); startPosTicker();
     startBgAdvanceGuard();
     startBgKeepAlive();
     armFirstPlayWatch(id, a);
   } else {
+    // 前台视频模式：先声明 playbackMode，避免 MediaSession/进度条误绑到 audio
+    playbackMode = "video";
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
-    prewarmAudio(aSrc, resumeAt||0);
+    // 确保音频不抢占前台（Chrome 可能把“在播音频”作为主媒体）
+    try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
+    prewarmAudio(aSrc, resumeAt||0, false);
+    setMediaSessionMeta(id);
+    updatePositionState(); startPosTicker();
     stopBgAdvanceGuard();
     stopBgKeepAlive();
     armFirstPlayWatch(id, v);
-    playbackMode = "video";
   }
   startFgSync();
   renderPlaylistPanel();
@@ -1550,24 +1786,69 @@ function getCurrentlyLoadedVideoItems(){
 
 function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
 
-/* ★★★ 修改：取消订阅/批量取消订阅：访问链接后也删除本地条目，并带确认提示 ★★★ */
+/* ★★★ 修改：取消订阅/批量取消订阅：单项直接访问，批量使用单页面模式，访问链接后也删除本地条目，并带确认提示 ★★★ */
 async function openBulkUnsub(ids, batch=1){
   try{
     const uniq = Array.from(new Set((ids||[]).map(String).filter(Boolean)));
     if (!uniq.length){ alert("没有可处理的条目"); return; }
 
     // 确认提示
-    const okGo = confirm("是否取消订阅？会同时删除本地文件！");
+    const okGo = confirm(`是否取消订阅${uniq.length}个项目？会同时删除本地文件！`);
     if (!okGo) return;
 
-    // 打开创意工坊取消订阅链接（逐个）
-    uniq.forEach((id, i)=>{
-      const u = `https://steamcommunity.com/sharedfiles/filedetails/?id=${encodeURIComponent(id)}#bulk_unsub=1`;
-      setTimeout(()=>{ window.open(u, "_blank", "noopener"); }, i*120);
-    });
+    // 单项取消订阅：直接打开简单链接，不使用回调机制（batch=0表示单项模式）
+    if (batch === 0) {
+      const id = uniq[0];
+      const simpleUrl = `https://steamcommunity.com/sharedfiles/filedetails/?id=${encodeURIComponent(id)}#bulk_unsub=1`;
+      window.open(simpleUrl, "_blank", "noopener");
+      showNotice("已打开取消订阅页面");
+      setTimeout(clearNotice, 1500);
+
+      // 本地删除
+      primeBusy("正在删除本地条目…");
+      const ok = await deleteByIds(uniq);
+      hideBusy();
+
+      if (!ok){
+        alert("删除本地条目失败，请稍后重试。");
+      } else {
+        removeTilesByVideoIds(uniq);
+        showNotice("已删除本地条目");
+        setTimeout(clearNotice, 1500);
+      }
+
+      clearSel();
+      return;
+    }
+
+    // 批量取消订阅：使用服务器队列和单页面模式
+    primeBusy(`正在初始化批量取消订阅（${uniq.length}项）…`);
+    let initResp;
+    try {
+      const r = await fetch("/api/unsub/init", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ ids: uniq, batch: 1 })
+      });
+      if (!r.ok) throw new Error("初始化失败");
+      initResp = await r.json();
+    } catch(e) {
+      hideBusy();
+      alert("初始化批量取消订阅失败，请稍后重试。");
+      return;
+    }
+    hideBusy();
+
+    // 单页面模式：只打开第一个链接（脚本会自动检测并批量处理）
+    if (initResp.first && initResp.first.length > 0) {
+      const firstUrl = initResp.first[0];
+      window.open(firstUrl, "_blank", "noopener");
+      showNotice(`已打开单页面批量取消订阅（共 ${uniq.length} 项），请在新页面中等待处理完成`);
+      setTimeout(clearNotice, 3000);
+    }
 
     // 随后本地删除并刷新
-    primeBusy("正在取消订阅并删除本地条目…");
+    primeBusy("正在删除本地条目…");
     const ok = await deleteByIds(uniq);
     hideBusy();
 
@@ -1575,7 +1856,7 @@ async function openBulkUnsub(ids, batch=1){
       alert("删除本地条目失败，请稍后重试。");
     } else {
       removeTilesByVideoIds(uniq);
-      showNotice(`已打开取消订阅链接，并删除本地 ${uniq.length} 项`);
+      showNotice(`已删除本地 ${uniq.length} 项`);
       setTimeout(clearNotice, 1500);
     }
 
@@ -1801,7 +2082,7 @@ function openContextMenu(x,y){
     add("播放此视频", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
     add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
     add("打开创意工坊链接", ()=> window.open(`https://steamcommunity.com/sharedfiles/filedetails/?id=${vid}`, "_blank"));
-    add("取消订阅", ()=> openBulkUnsub([vid], 1));
+    add("取消订阅", ()=> openBulkUnsub([vid], 0));  // batch=0 表示单项模式
     sep();
     add("移动到主页", async ()=>{ await moveIdsAndRefresh([vid], "/"); });
     add("移动到…", async ()=>{ showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh([vid], dest); }); });
@@ -1829,7 +2110,7 @@ function openContextMenu(x,y){
       const items = await expandSelectionToItems();
       const ids = items.map(x=>String(x.id));
       if (!ids.length){ alert("所选没有可取消订阅的条目"); return; }
-      await openBulkUnsub(ids, 1);
+      await openBulkUnsub(ids, 2);  // batch=2 表示批量模式
     });
     sep();
     add("移动所选到主页", async ()=>{

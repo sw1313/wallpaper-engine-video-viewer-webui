@@ -225,3 +225,18 @@ html.is-desktop .icon-btn.back{ display:flex !important; left:14px; }
 #playerFS:-webkit-full-screen .shade{ z-index:32; }
 #playerFS:fullscreen .playlist,
 #playerFS:-webkit-full-screen .playlist{ z-index:33; }
+
+/* ★ 修复横向设备上竖屏视频在全屏模式下的旋转和拉伸问题 */
+@media (orientation: landscape) {
+  #playerFS:fullscreen video.portrait-fix,
+  #playerFS:-webkit-full-screen video.portrait-fix {
+    object-fit: contain !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: 100vw !important;
+    max-height: 100vh !important;
+    left: 50% !important;
+    top: 50% !important;
+    transform: translate(-50%, -50%) !important;
+  }
+}
