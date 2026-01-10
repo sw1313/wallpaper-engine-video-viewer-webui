@@ -1182,7 +1182,8 @@ def _build_cb_url(request: Request, key: str) -> str:
 
 def _steam_url_with_hash(workshop_id: str, cb_url: str) -> str:
     # 统一加 #bulk_unsub=1&cb=ENCODED
-    h = f"bulk_unsub=1&cb={quote(cb_url, safe=':/?&=')}"
+    # 必须对整个 cb_url 进行编码，包括 ? 和 &，否则 userscript 解析时会出错
+    h = f"bulk_unsub=1&cb={quote(cb_url, safe='')}"
     return f"https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}#{h}"
 
 @app.get("/unsub", response_class=HTMLResponse)
@@ -1211,12 +1212,17 @@ def api_unsub_init(request: Request, payload: dict = Body(..., embed=False)):
     with UNSUB_LOCK:
         UNSUB_STORE[key] = dict(queue=deque(rest), total=len(urls),
                                 assigned=len(first), done=0, ts=time.time())
+    
+    print(f"[UNSUB/INIT] Created queue with key={key}, total={len(urls)} items, first_batch={len(first)}, queue_size={len(rest)}")
+    print(f"[UNSUB/INIT] Callback URL: {cb}")
+    print(f"[UNSUB/INIT] First URL: {first[0] if first else 'none'}")
+    
     return {"key": key, "first": first, "total": len(urls)}
 
 def _cors_headers(extra: dict | None = None):
     base = {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "content-type",
         "Access-Control-Max-Age": "86400",
     }
@@ -1259,3 +1265,82 @@ async def unsub_next(request: Request, key: str = Query(...)):
         slot["ts"] = time.time()
 
     return JSONResponse({"url": nxt}, headers=_cors_headers())
+
+@app.options("/unsub/batch")
+def unsub_batch_options():
+    return Response(status_code=204, headers=_cors_headers())
+
+@app.get("/unsub/batch")
+async def unsub_batch(request: Request, key: str = Query(None), size: int = Query(10)):
+    """
+    单页面模式：批量返回多个 workshop ID，供脚本在同一页面中处理。
+    返回格式：{"ids": ["id1", "id2", ...], "remaining": N}
+    如果没有提供 key，返回空列表（用于检测接口是否存在）
+    """
+    _unsub_cleanup()
+    
+    # 兼容 userscript 可能拼出：/unsub/batch?key=XXX?size=10（第二个 ? 进入 key 值）
+    # 以及在某些环境下 size 解析不到的情况：尽量从原始 query 兜底解析。
+    query_string = str(request.url.query or "")
+    import re
+
+    # 1) 优先修正 key：去掉误拼进来的 "?size=..."
+    original_key = key
+    if isinstance(key, str) and key:
+        # FastAPI 可能会把 "XXX?size=10" 当成 key 的值
+        key = key.split("?", 1)[0].strip()
+
+    # 2) 若 key 仍为空，尝试从原始 query 里提取
+    if not key:
+        key_match = re.search(r"(?:^|[&?])key=([^&?]+)", query_string)
+        if key_match:
+            key = key_match.group(1).split("?", 1)[0].strip()
+
+    # 3) size 兜底解析（支持 key=XXX?size=10 这种情况）
+    size_match = re.search(r"(?:^|[&?])size=(\d+)", query_string)
+    if size_match:
+        try:
+            size = int(size_match.group(1))
+        except Exception:
+            pass
+    
+    size = max(1, min(size, 50))  # 限制每次最多50个
+    
+    # 调试日志
+    print(f"[UNSUB/BATCH] query_string={query_string}, original_key={original_key}, parsed_key={key}, size={size}")
+    
+    # 如果没有 key，返回空列表（用于检测接口是否存在）
+    if not key:
+        print(f"[UNSUB/BATCH] No key provided, returning empty list for detection")
+        return JSONResponse({"ids": [], "remaining": 0}, headers=_cors_headers())
+    
+    with UNSUB_LOCK:
+        slot = UNSUB_STORE.get(key)
+        if not slot:
+            print(f"[UNSUB/BATCH] Key '{key}' not found in store. Available keys: {list(UNSUB_STORE.keys())}")
+            return JSONResponse({"ids": [], "remaining": 0}, headers=_cors_headers())
+        
+        # 从队列中取出 size 个 URL，解析出 workshop ID
+        q = slot["queue"]
+        ids = []
+        print(f"[UNSUB/BATCH] Queue length: {len(q)}, requesting size: {size}")
+        for _ in range(min(size, len(q))):
+            if not q:
+                break
+            url = q.popleft()
+            # 从 URL 中解析 workshop ID: https://steamcommunity.com/sharedfiles/filedetails/?id=123456#...
+            import re
+            match = re.search(r'[?&]id=(\d+)', url)
+            if match:
+                wid = match.group(1)
+                ids.append(wid)
+                slot["assigned"] = int(slot.get("assigned", 0)) + 1
+                print(f"[UNSUB/BATCH] Extracted workshop ID: {wid}")
+            else:
+                print(f"[UNSUB/BATCH] Failed to extract ID from URL: {url}")
+        
+        slot["ts"] = time.time()
+        remaining = len(q)
+    
+    print(f"[UNSUB/BATCH] Returning {len(ids)} IDs, {remaining} remaining")
+    return JSONResponse({"ids": ids, "remaining": remaining}, headers=_cors_headers())
