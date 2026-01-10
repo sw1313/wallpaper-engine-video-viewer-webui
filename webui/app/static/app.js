@@ -447,6 +447,15 @@ function appendTiles(data){
   let idx = state.tiles.length;
   const batchVideoIds = [];
 
+  // 修复：清理骨架屏占位（renderSkeleton() 插入的 .skeleton），否则会残留成“整块区域骨架/黑边”
+  // 这里不能只在 page===1 时清理，因为用户滚动/重试/预取等路径可能会留下占位。
+  try{
+    const g = grid();
+    if (g){
+      g.querySelectorAll(".skeleton").forEach(el=>{ try{ el.remove(); }catch(_){ } });
+    }
+  }catch(_){}
+
   data.folders.forEach(f=>{
     const path = (state.path.endsWith("/")? state.path : state.path + "/") + f.title;
     const el = document.createElement("div");
@@ -1786,7 +1795,7 @@ function getCurrentlyLoadedVideoItems(){
 
 function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
 
-/* ★★★ 修改：取消订阅/批量取消订阅：单项直接访问，批量使用单页面模式，访问链接后也删除本地条目，并带确认提示 ★★★ */
+/* ★★★ 修改：取消订阅/批量取消订阅：统一复用 Steam「已订阅物品主页」并 postMessage 投递 IDs（不再打开详情页） ★★★ */
 async function openBulkUnsub(ids, batch=1){
   try{
     const uniq = Array.from(new Set((ids||[]).map(String).filter(Boolean)));
@@ -1796,59 +1805,108 @@ async function openBulkUnsub(ids, batch=1){
     const okGo = confirm(`是否取消订阅${uniq.length}个项目？会同时删除本地文件！`);
     if (!okGo) return;
 
-    // 单项取消订阅：直接打开简单链接，不使用回调机制（batch=0表示单项模式）
-    if (batch === 0) {
-      const id = uniq[0];
-      const simpleUrl = `https://steamcommunity.com/sharedfiles/filedetails/?id=${encodeURIComponent(id)}#bulk_unsub=1`;
-      window.open(simpleUrl, "_blank", "noopener");
-      showNotice("已打开取消订阅页面");
-      setTimeout(clearNotice, 1500);
+    // 统一：打开/复用订阅主页（不携带 workshop 详情页 id；不固化账号）
+    // 使用 /my/ 指向当前登录账号，适合提交到 GitHub 的通用版本
+    const steamSubUrl =
+      "https://steamcommunity.com/my/myworkshopfiles?browsesort=mysubscriptions&browsefilter=mysubscriptions&appid=431960&p=1#bulk_unsub=1";
 
-      // 本地删除
-      primeBusy("正在删除本地条目…");
-      const ok = await deleteByIds(uniq);
-      hideBusy();
-
-      if (!ok){
-        alert("删除本地条目失败，请稍后重试。");
-      } else {
-        removeTilesByVideoIds(uniq);
-        showNotice("已删除本地条目");
-        setTimeout(clearNotice, 1500);
+    // 用固定 window.name 复用同一个标签页；如果已开，不会新开
+    const winName = "steam-bulk-unsub";
+    // 注意：不要用 noopener，否则部分浏览器会让 window 引用变成 null，导致无法 postMessage 投递任务
+    // 关键修复：window.open(url, name) 在已存在时会“导航/刷新”该标签页。
+    // 我们希望复用已打开的订阅页并保持不刷新：先用 window.open("", name) 获取引用（不导航），必要时再打开目标 URL。
+    let w = null;
+    let openedOrNavigated = false;
+    try{ w = window.open("", winName); }catch(_){ w = null; }
+    if (!w || w.closed){
+      w = window.open(steamSubUrl, winName);
+      openedOrNavigated = !!w;
+    } else {
+      // 首次：window.open("", name) 会创建 about:blank（同源可读）。如果是空白页则立刻导航到订阅页。
+      try{
+        const href = (w.location && w.location.href) ? String(w.location.href) : "";
+        if (href === "about:blank" || href === "") {
+          try{ w.location.replace(steamSubUrl); }catch(_){ try{ w.location.href = steamSubUrl; }catch(__){} }
+          openedOrNavigated = true;
+        }
+      }catch(_){
+        // 跨域时无法读取 location：说明已经在 Steam 页面，无需刷新/导航
+      }
+    }
+    if (!w){
+      alert("无法打开 Steam 页面（可能被浏览器拦截了弹窗）。请允许弹窗后重试。");
+      // 弹窗打不开则不应继续删除本地（否则会造成“本地删除了但 Steam 未退订”）
+      return;
+    } else {
+      // 不要强制把焦点切到 Steam 页（用户不希望被打断）
+      // 仅在首次新开/导航时，尽量把焦点抢回当前 WebUI（浏览器可能会忽略）
+      if (openedOrNavigated){
+        try{ w.blur && w.blur(); }catch(_){}
+        try{ window.focus && window.focus(); }catch(_){}
+        // 首次打开/导航：给订阅页加载和 userscript 初始化留足时间（避免 postMessage 投递时脚本还没就绪）
+        await new Promise(r=>setTimeout(r, 1800));
       }
 
-      clearSel();
-      return;
+      // postMessage 投递：带 reqId，短时间重试直到收到 ack（避免订阅页加载慢导致丢消息）
+      const reqId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const payload = { type: "bulk_unsub_add", ids: uniq, reqId };
+      const maxAckMs = 10000, intervalMs = 250, startAt = Date.now();
+      let acked = false;
+      let donePayload = null;
+
+      const onMsg = (ev)=>{
+        const d = ev && ev.data;
+        if (!d || d.reqId !== reqId) return;
+        if (d.type === "bulk_unsub_ack") {
+          acked = true;
+          return;
+        }
+        if (d.type === "bulk_unsub_done") {
+          donePayload = d;
+          return;
+        }
+      };
+      window.addEventListener("message", onMsg);
+
+      const tick = ()=>{
+        if (acked) return;
+        if (Date.now() - startAt > maxAckMs){
+          showNotice("已打开订阅页，但未收到脚本确认（可能脚本未启用/未加载）。本地不会删除。");
+          setTimeout(clearNotice, 4500);
+          return;
+        }
+        try{ w.postMessage(payload, "*"); }catch(_){}
+        setTimeout(tick, intervalMs);
+      };
+      tick();
+
+      // 等待 ACK（最多 maxAckMs）
+      const waitAck = async ()=>{
+        while (!acked && (Date.now() - startAt <= maxAckMs)) await new Promise(r=>setTimeout(r, 100));
+        return acked;
+      };
+      const okAck = await waitAck();
+      if (!okAck){
+        try{ window.removeEventListener("message", onMsg); }catch(_){}
+        return; // 不删除本地
+      }
+      showNotice(`任务已投递：${uniq.length} 项（等待 Steam 侧完成后再删除本地）`);
+      setTimeout(clearNotice, 2500);
+
+      // 等待 DONE（给足时间：最多 1 小时，避免大批量时误删本地）
+      const doneDeadline = Date.now() + 60*60*1000;
+      while (!donePayload && Date.now() < doneDeadline) await new Promise(r=>setTimeout(r, 250));
+      try{ window.removeEventListener("message", onMsg); }catch(_){}
+      if (!donePayload){
+        showNotice("未收到完成回执，本地不会删除。");
+        setTimeout(clearNotice, 4500);
+        return;
+      }
+
+      // 收到完成回执后再删除本地
+      primeBusy(`取消订阅完成（成功:${donePayload.ok||0} 失败:${donePayload.fail||0}），正在删除本地条目…`);
     }
 
-    // 批量取消订阅：使用服务器队列和单页面模式
-    primeBusy(`正在初始化批量取消订阅（${uniq.length}项）…`);
-    let initResp;
-    try {
-      const r = await fetch("/api/unsub/init", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ ids: uniq, batch: 1 })
-      });
-      if (!r.ok) throw new Error("初始化失败");
-      initResp = await r.json();
-    } catch(e) {
-      hideBusy();
-      alert("初始化批量取消订阅失败，请稍后重试。");
-      return;
-    }
-    hideBusy();
-
-    // 单页面模式：只打开第一个链接（脚本会自动检测并批量处理）
-    if (initResp.first && initResp.first.length > 0) {
-      const firstUrl = initResp.first[0];
-      window.open(firstUrl, "_blank", "noopener");
-      showNotice(`已打开单页面批量取消订阅（共 ${uniq.length} 项），请在新页面中等待处理完成`);
-      setTimeout(clearNotice, 3000);
-    }
-
-    // 随后本地删除并刷新
-    primeBusy("正在删除本地条目…");
     const ok = await deleteByIds(uniq);
     hideBusy();
 
@@ -1883,6 +1941,16 @@ function removeTilesByVideoIds(ids){
   if (!set.size) return;
   const g = grid();
   if (!g) return;
+  
+  // 记录当前选中的第一个 tile 的索引（用于后续恢复 lastIdx）
+  let firstSelectedIdx = null;
+  for (let i = 0; i < state.tiles.length; i++) {
+    if (isSel(state.tiles[i]) && !set.has(String(state.tiles[i].vid))) {
+      firstSelectedIdx = i;
+      break;
+    }
+  }
+  
   const newTiles = [];
   for (const t of state.tiles){
     if (t && t.type === "video" && set.has(String(t.vid))){
@@ -1908,7 +1976,19 @@ function removeTilesByVideoIds(ids){
       state.selV.delete(Number(id));
     }catch(_){}
   });
-  state.lastIdx = null;
+  
+  // 更新 lastIdx：如果有其他选中的 tile，使用第一个；否则重置为 null
+  if (firstSelectedIdx !== null && state.selV.size > 0) {
+    // 查找原来的 tile 在新数组中的位置
+    for (let i = 0; i < state.tiles.length; i++) {
+      if (isSel(state.tiles[i])) {
+        state.lastIdx = i;
+        break;
+      }
+    }
+  } else {
+    state.lastIdx = null;
+  }
 }
 
 function bindDelegatedEvents(){
@@ -1959,10 +2039,24 @@ function bindDelegatedEvents(){
 
     // SHIFT 连选
     if (ev.shiftKey) {
-      const start = state.lastIdx==null ? t.idx : state.lastIdx;
+      // 修复：刷新/移动后的第一次 Shift 可能 lastIdx 为空（或失效），但已有“锚点选中项”。
+      // 规则：优先使用 lastIdx 指向且仍处于选中状态的 tile；否则使用当前已选中的某个 tile；再否则退化为自身。
+      let start = t.idx;
+      const lastTile = (state.lastIdx != null) ? state.tiles[state.lastIdx] : null;
+      if (lastTile && isSel(lastTile)) {
+        start = lastTile.idx;
+      } else {
+        // 即使 lastIdx 为 null，也要尝试从现有选择里找锚点（避免第一次 Shift 退化为单选）
+        for (let i = 0; i < state.tiles.length; i++) {
+          if (isSel(state.tiles[i])) { start = i; break; }
+        }
+      }
       const [a,b] = [start, t.idx].sort((x,y)=>x-y);
       if (!ev.ctrlKey) clearSel();
-      for (let i=a;i<=b;i++) setSel(state.tiles[i], true);
+      for (let i=a;i<=b;i++) {
+        if (state.tiles[i]) setSel(state.tiles[i], true);
+      }
+      state.lastIdx = t.idx;  // 更新 lastIdx
       ev.preventDefault();
       return;
     }
