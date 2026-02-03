@@ -46,6 +46,16 @@
     }
   }
 
+  function buildReportUrl(apiNext){
+    try{
+      const u = new URL(String(apiNext));
+      u.pathname = u.pathname.replace(/\/next\/?$/i, "/report");
+      return u.toString();
+    }catch(_){
+      return String(apiNext||"").replace("/next", "/report");
+    }
+  }
+
   const D = document;
   const isVis = (el)=> !!el && el.getBoundingClientRect().width>0 && el.getBoundingClientRect().height>0;
   const txt   = (el)=> (el && (el.innerText || el.textContent) || '').trim();
@@ -292,6 +302,22 @@
         const success = !!(r && r.success);
         if (success) MSG_QUEUE.ok++; else MSG_QUEUE.fail++;
 
+        // 若 API_NEXT 指向本机 controller，则上报进度（/report 不会弹出队列）
+        try{
+          await new Promise(res=>{
+            GM_xmlhttpRequest({
+              method:"POST",
+              url: buildReportUrl(API_NEXT),
+              headers:{ "Content-Type":"application/json" },
+              data: JSON.stringify({ id, status: success ? "ok" : "fail", ok: success }),
+              onload: ()=>res(null),
+              onerror: ()=>res(null),
+              ontimeout: ()=>res(null),
+              timeout: 2000
+            });
+          });
+        }catch(_){}
+
         // 逐个 ID 更新各 reqId 的完成度，全部完成后给 opener 回执 bulk_unsub_done
         for (const [reqId, st] of REQS.entries()){
           if (!st || !st.pending || !st.pending.has(id)) continue;
@@ -525,6 +551,8 @@
   }
 
   (function netProbe(){
+    // 只在“作品详情页”启用 netProbe。订阅主页/单页队列模式下启用会导致 /next 被频繁触发，从而“吞队列”。
+    if (!/\/sharedfiles\/filedetails\//i.test(location.pathname || "")) return;
     if (window.__bulk_unsub_net_patched) return; window.__bulk_unsub_net_patched = true;
     const of = window.fetch?.bind(window);
     if (of){
@@ -533,7 +561,7 @@
         const body = init && init.body ? String(init.body) : '';
         const s = (url + ' ' + body).toLowerCase();
         const isUnsub = /\/sharedfiles\/unsubscribe/.test(s);
-        return of(res, init).then(r=>{ if(isUnsub && r && r.status===200) goNext('net_unsub'); return r; });
+        return of(res, init).then(r=>{ if(isUnsub && r && r.status===200 && !SINGLE_PAGE_MODE) goNext('net_unsub'); return r; });
       };
     }
     const X = window.XMLHttpRequest;
@@ -543,7 +571,7 @@
       X.prototype.send=function(b){
         const body=b?String(b):''; const url=String(this.__url||'').toLowerCase();
         const isUnsub=/\/sharedfiles\/unsubscribe/.test(url+' '+body);
-        this.addEventListener('loadend',()=>{ if(isUnsub && this.status===200) goNext('net_unsub'); });
+        this.addEventListener('loadend',()=>{ if(isUnsub && this.status===200 && !SINGLE_PAGE_MODE) goNext('net_unsub'); });
         return send.call(this,b);
       };
     }
