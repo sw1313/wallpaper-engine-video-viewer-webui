@@ -1,5 +1,5 @@
 # app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart + keepalive)
-import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil
+import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil, json
 import time, logging  # ★ 新增：用于 /api/keepalive 时间与日志过滤
 import secrets  # ★ 新增
 from urllib.parse import quote  # ★ 新增
@@ -41,6 +41,18 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # === 新增：纯音频缓存目录 ===
 AUDIO_CACHE_DIR = os.getenv("AUDIO_CACHE_DIR", os.path.join(DATA_DIR, "audio_cache"))
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+
+# === 新增：视频转码缓存目录（用于“强制转码修复”不覆盖原文件，避免触发 Steam 校验） ===
+VIDEO_CACHE_DIR = os.getenv("VIDEO_CACHE_DIR", os.path.join(DATA_DIR, "video_cache"))
+os.makedirs(VIDEO_CACHE_DIR, exist_ok=True)
+
+# === 音频缓存定时清理（避免 audio_cache 无限膨胀） ===
+# - AUDIO_CACHE_MAX_AGE_DAYS：超过多少天的缓存直接删除
+# - AUDIO_CACHE_MAX_TOTAL_MB：目录总大小超过多少 MB 时，从最旧开始删到低于阈值
+# - AUDIO_CACHE_CLEAN_INTERVAL_MIN：清理周期（分钟）
+_AUDIO_CACHE_MAX_AGE_DAYS = int(os.getenv("AUDIO_CACHE_MAX_AGE_DAYS", "14"))
+_AUDIO_CACHE_MAX_TOTAL_MB = int(os.getenv("AUDIO_CACHE_MAX_TOTAL_MB", "4096"))  # 4GB
+_AUDIO_CACHE_CLEAN_INTERVAL_MIN = int(os.getenv("AUDIO_CACHE_CLEAN_INTERVAL_MIN", "60"))
 
 # ========= watched（服务器端“已播放”持久化） =========
 DB_PATH = os.getenv("WATCHED_DB", os.path.join(DATA_DIR, "watched.db"))
@@ -222,6 +234,11 @@ def _build_video_out(id_map, vid_id) -> VideoOut:
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
+  # 给模板一个 cache-bust 参数，避免前端 app.js 被浏览器长期缓存导致功能不更新
+  try:
+    request.scope["ts"] = str(int(time.time()))
+  except Exception:
+    request.scope["ts"] = "0"
   return templates.TemplateResponse("index.html", {"request": request})
 
 # ★ 启动异步预扫描（预热缓存）
@@ -606,6 +623,148 @@ def _faststart_inplace(src_path: str) -> dict:
         pass
       return {"ok": False, "error": f"exception:{e}", "path": src_path}
 
+def _repair_inplace(src_path: str, mode: str = "auto") -> dict:
+  """
+  更强的“卡死点修复”（针对中途某秒必卡/解码错误）：
+  - 先尝试“带 genpts/ignore_err 的无损重封装”，尽量修复时间戳/断裂问题；
+  - 如仍失败，再回退到“转码修复”（重建编码流，代价更大但最稳）。
+  返回 {ok, mode, before, after, out} 或 {ok:False, error,...}
+  """
+  src_path = os.path.abspath(src_path)
+  if not os.path.isfile(src_path):
+    return {"ok": False, "error": "source-not-found", "path": src_path}
+  mode = (mode or "auto").lower().strip()
+  if mode not in ("auto", "copy", "reencode"):
+    mode = "auto"
+
+  before = os.path.getsize(src_path)
+  src = Path(src_path)
+
+  # 保留时间戳
+  try:
+    st_old = os.stat(src_path)
+    at_ns, mt_ns = st_old.st_atime_ns, st_old.st_mtime_ns
+  except Exception:
+    st_old = None
+    at_ns = mt_ns = None
+
+  mux, out_ext = _choose_mux_and_ext(src)
+  tmp_copy = str(src.with_name(src.stem + ".rp_copy" + out_ext))
+  tmp_enc  = str(src.with_name(src.stem + ".rp_enc"  + out_ext))
+  bak_path = str(src.with_name(src.name + ".bak"))
+
+  # 统一：尽量生成 PTS + 忽略坏包（对“某秒必卡”更有效）
+  common_pre = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-fflags", "+genpts", "-err_detect", "ignore_err"]
+
+  def _cmd_out(tmp_path: str, reencode: bool):
+    cmd = common_pre + ["-i", src_path]
+    if reencode:
+      # 转码兜底：重建编码流，最稳但较慢
+      # 只保留“主视频流 + 音频流”，避免 -map 0 把封面/附件/奇怪流也塞进输出导致前端选流异常。
+      # 同时强制 yuv420p（浏览器/硬解兼容性最好），并把宽高压到偶数，避免某些源导致的异常像素格式/奇数分辨率问题。
+      cmd += ["-map", "0:v:0", "-map", "0:a?", "-sn", "-dn", "-map_metadata", "0",
+              "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+              "-pix_fmt", "yuv420p",
+              "-tag:v", "avc1",
+              "-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    else:
+      cmd += ["-map", "0", "-dn", "-map_metadata", "0", "-c", "copy"]
+    if mux == "mp4":
+      cmd += ["-movflags", "+faststart", "-avoid_negative_ts", "make_zero", "-f", "mp4"]
+    elif mux:
+      cmd += ["-f", mux]
+    cmd += [tmp_path]
+    return cmd
+
+  lock = _get_repair_lock(src_path)
+  with lock:
+    # 清理残留
+    for p in (tmp_copy, tmp_enc):
+      try:
+        if os.path.exists(p):
+          os.remove(p)
+      except Exception:
+        pass
+
+    def _atomic_replace(tmp_path: str):
+      if os.path.exists(bak_path):
+        try: os.remove(bak_path)
+        except Exception: pass
+      os.replace(src_path, bak_path)
+      try:
+        os.replace(tmp_path, src_path)
+      except Exception as e:
+        # 回滚
+        try:
+          if os.path.exists(bak_path) and not os.path.exists(src_path):
+            os.replace(bak_path, src_path)
+        finally:
+          try:
+            if os.path.exists(tmp_path):
+              os.remove(tmp_path)
+          except Exception:
+            pass
+        raise e
+      # 删除备份
+      try:
+        if os.path.exists(bak_path):
+          os.remove(bak_path)
+      except Exception:
+        pass
+      # ★ 恢复原 mtime（Steam 会校验 mtime，修改后会触发重新下载）
+      # 浏览器缓存刷新由前端的 cacheBust 机制（URL 时间戳参数）保证
+      try:
+        if at_ns is not None and mt_ns is not None:
+          os.utime(src_path, ns=(at_ns, mt_ns))
+      except Exception:
+        try:
+          if st_old is not None:
+            os.utime(src_path, (st_old.st_atime, st_old.st_mtime))
+        except Exception:
+          pass
+
+    # 1) 无损 copy 重封装（可选）
+    if mode in ("auto", "copy"):
+      try:
+        subprocess.run(_cmd_out(tmp_copy, reencode=False), check=True)
+        if os.path.isfile(tmp_copy) and os.path.getsize(tmp_copy) > 0:
+          _atomic_replace(tmp_copy)
+          after = os.path.getsize(src_path)
+          return {
+            "ok": True, "mode": "copy", "before": before, "after": after,
+            "out": src_path, "mtime_preserved": True
+          }
+      except Exception as e:
+        # copy 失败 → 继续尝试转码（auto），或直接返回（copy）
+        try:
+          if os.path.exists(tmp_copy):
+            os.remove(tmp_copy)
+        except Exception:
+          pass
+        if mode == "copy":
+          return {"ok": False, "error": f"copy-failed:{e}", "path": src_path}
+
+    # 2) 转码兜底
+    try:
+      subprocess.run(_cmd_out(tmp_enc, reencode=True), check=True)
+      if os.path.isfile(tmp_enc) and os.path.getsize(tmp_enc) > 0:
+        _atomic_replace(tmp_enc)
+        after = os.path.getsize(src_path)
+        return {
+          "ok": True, "mode": "reencode", "before": before, "after": after,
+          "out": src_path, "mtime_preserved": True
+        }
+      return {"ok": False, "error": "tmp-empty", "path": src_path}
+    except Exception as e:
+      try:
+        if os.path.exists(tmp_enc):
+          os.remove(tmp_enc)
+      except Exception:
+        pass
+      return {"ok": False, "error": f"ffmpeg-repair-failed:{e}", "path": src_path}
+
 @app.post("/api/faststart/{vid_id}")
 def api_faststart_inplace(vid_id: str):
   """
@@ -633,6 +792,37 @@ def api_faststart_inplace(vid_id: str):
     res["skipped"] = False
     return JSONResponse(res, status_code=500)
 
+@app.post("/api/repair/{vid_id}")
+def api_repair_inplace(vid_id: str, mode: str = Query("auto", description="auto|copy|reencode")):
+  """
+  针对"某秒必卡/解码错误"的更强修复：
+  - 尝试 genpts+ignore_err 的无损重封装；
+  - 失败则转码兜底。
+  - ★ 修复后清理该 vid 的所有音频缓存，避免前端拿到旧的"只有音频"的缓存。
+  - ★ 注意：当 mode=reencode 时，不覆盖原文件，而是写入 VIDEO_CACHE_DIR（避免触发 Steam 校验/重下）。
+  """
+  _, id_map, _ = _scan_state()
+  v = id_map.get(vid_id)
+  if not v:
+    raise HTTPException(404, detail="video-not-found")
+
+  print(f"[REPAIR] vid={vid_id} mode={mode} path={getattr(v,'video_path',None)}")
+  if (mode or "").lower().strip() == "reencode":
+    res = _reencode_to_video_cache(vid_id, v.video_path)
+  else:
+    res = _repair_inplace(v.video_path, mode=mode)
+  print(f"[REPAIR] vid={vid_id} result_ok={res.get('ok')} result_mode={res.get('mode')} err={res.get('error')}")
+  
+  # ★ 修复成功后清理音频缓存（避免前端拿到旧的只有音频的 m4a）
+  if res.get("ok"):
+    try:
+      _cleanup_old_audio_caches(vid_id, "")  # 清理该 vid 的所有音频缓存
+      print(f"[REPAIR] vid={vid_id} cleaned audio caches")
+    except Exception as e:
+      print(f"[REPAIR] vid={vid_id} audio cache cleanup failed: {e}")
+    return JSONResponse(res, status_code=200)
+  return JSONResponse(res, status_code=500)
+
 # =======================
 # 媒体传输（预览 & 视频）
 # =======================
@@ -647,6 +837,152 @@ def _last_modified_str(path: str) -> str:
   st = os.stat(path)
   dt = datetime.utcfromtimestamp(st.st_mtime)
   return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+# =======================
+# 视频转码缓存（video_cache/<vid_id>/...）
+# =======================
+def _video_cache_dir(vid_id: str) -> str:
+  return os.path.join(VIDEO_CACHE_DIR, str(vid_id))
+
+def _video_cache_meta_path(vid_id: str) -> str:
+  return os.path.join(_video_cache_dir(vid_id), "meta.json")
+
+def _video_cache_out_path(vid_id: str) -> str:
+  # 强制转码输出统一为 mp4，便于浏览器播放
+  return os.path.join(_video_cache_dir(vid_id), "reencode.mp4")
+
+def _read_json(path: str) -> dict:
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      return json.load(f) or {}
+  except Exception:
+    return {}
+
+def _write_json_atomic(path: str, data: dict):
+  tmp = path + ".tmp"
+  with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+  os.replace(tmp, path)
+
+def _is_video_cache_valid(vid_id: str, src_path: str) -> bool:
+  outp = _video_cache_out_path(vid_id)
+  meta = _video_cache_meta_path(vid_id)
+  if not (os.path.isfile(outp) and os.path.getsize(outp) > 0 and os.path.isfile(meta)):
+    return False
+  m = _read_json(meta)
+  try:
+    st = os.stat(src_path)
+  except Exception:
+    return False
+  try:
+    return (
+      os.path.abspath(m.get("src_path", "")) == os.path.abspath(src_path)
+      and int(m.get("src_size", -1)) == int(st.st_size)
+      and int(m.get("src_mtime", -1)) == int(st.st_mtime)
+      and int(m.get("src_ino", -1)) == int(getattr(st, "st_ino", -1))
+    )
+  except Exception:
+    return False
+
+def _get_video_cache_path_if_any(vid_id: str, src_path: str) -> str | None:
+  try:
+    if _is_video_cache_valid(vid_id, src_path):
+      return _video_cache_out_path(vid_id)
+  except Exception:
+    pass
+  return None
+
+def _reencode_to_video_cache(vid_id: str, src_path: str) -> dict:
+  """
+  强制转码修复：输出到 data/video_cache/<vid_id>/reencode.mp4，不覆盖原文件（避免触发 Steam 校验/重下）。
+  返回 {ok, mode, before, after, out, cached:true}
+  """
+  src_path = os.path.abspath(src_path)
+  if not os.path.isfile(src_path):
+    return {"ok": False, "error": "source-not-found", "path": src_path}
+
+  before = os.path.getsize(src_path)
+  try:
+    st = os.stat(src_path)
+    src_meta = {
+      "src_path": src_path,
+      "src_size": int(st.st_size),
+      "src_mtime": int(st.st_mtime),
+      "src_ino": int(getattr(st, "st_ino", -1)),
+      "created_at": int(time.time()),
+    }
+  except Exception:
+    src_meta = {"src_path": src_path, "created_at": int(time.time())}
+
+  out_dir = _video_cache_dir(vid_id)
+  os.makedirs(out_dir, exist_ok=True)
+  out_path = _video_cache_out_path(vid_id)
+  tmp_out = out_path + ".tmp"
+
+  # 若已有且仍有效，直接复用
+  if _is_video_cache_valid(vid_id, src_path):
+    try:
+      return {
+        "ok": True, "mode": "reencode_cache", "before": before,
+        "after": os.path.getsize(out_path), "out": out_path, "cached": True, "reused": True
+      }
+    except Exception:
+      pass
+
+  common_pre = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-fflags", "+genpts", "-err_detect", "ignore_err"]
+  # 强制浏览器兼容：H.264 (avc1) + AAC + yuv420p + 偶数宽高 + MP4
+  cmd = common_pre + [
+    "-i", src_path,
+    "-map", "0:v:0",
+    "-map", "0:a?",
+    "-sn", "-dn",
+    "-map_metadata", "0",
+    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+    "-pix_fmt", "yuv420p",
+    "-tag:v", "avc1",
+    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+    "-movflags", "+faststart",
+    "-avoid_negative_ts", "make_zero",
+    "-f", "mp4",
+    tmp_out
+  ]
+
+  try:
+    if os.path.exists(tmp_out):
+      os.remove(tmp_out)
+  except Exception:
+    pass
+
+  try:
+    subprocess.run(cmd, check=True)
+    if not os.path.isfile(tmp_out) or os.path.getsize(tmp_out) <= 0:
+      try:
+        if os.path.exists(tmp_out):
+          os.remove(tmp_out)
+      except Exception:
+        pass
+      return {"ok": False, "error": "tmp-empty", "path": src_path}
+
+    os.replace(tmp_out, out_path)
+    try:
+      _write_json_atomic(_video_cache_meta_path(vid_id), src_meta | {"ffmpeg": " ".join(cmd)})
+    except Exception:
+      try:
+        _write_json_atomic(_video_cache_meta_path(vid_id), src_meta)
+      except Exception:
+        pass
+
+    after = os.path.getsize(out_path)
+    return {"ok": True, "mode": "reencode_cache", "before": before, "after": after, "out": out_path, "cached": True}
+  except Exception as e:
+    try:
+      if os.path.exists(tmp_out):
+        os.remove(tmp_out)
+    except Exception:
+      pass
+    return {"ok": False, "error": f"ffmpeg-reencode-cache-failed:{e}", "path": src_path}
 
 def _parse_range_header(range_header: str, file_size: int):
   if not range_header:
@@ -890,7 +1226,10 @@ def media_video(request: Request, vid_id: str):
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
   if not v: raise HTTPException(404)
-  path = v.video_path
+  src_path = v.video_path
+  # ★ 若存在有效的转码缓存，则优先用缓存文件（不覆盖原文件也能在 WebUI 播放）
+  cache_path = _get_video_cache_path_if_any(vid_id, src_path)
+  path = cache_path or src_path
   file_size = os.path.getsize(path)
   mime, _ = mimetypes.guess_type(path)
   mime = mime or "application/octet-stream"
@@ -980,16 +1319,83 @@ def _audio_cache_file(vid: str, src_path: str) -> str:
   return os.path.join(AUDIO_CACHE_DIR, f"{key}.m4a")
 
 def _cleanup_old_audio_caches(vid: str, keep_path: str):
+  """清理指定 vid 的旧音频缓存。如果 keep_path 为空字符串，则清理该 vid 的所有缓存。"""
   try:
-    kp = os.path.abspath(keep_path)
+    kp = os.path.abspath(keep_path) if keep_path else ""
     for p in glob.glob(os.path.join(AUDIO_CACHE_DIR, f"{vid}_*.m4a")):
       try:
-        if os.path.abspath(p) != kp:
+        if not kp or os.path.abspath(p) != kp:
           os.remove(p)
+          print(f"[AUDIO_CACHE] removed old cache: {os.path.basename(p)}")
+      except Exception as e:
+        print(f"[AUDIO_CACHE] failed to remove {os.path.basename(p)}: {e}")
+  except Exception as e:
+    print(f"[AUDIO_CACHE] cleanup failed for vid={vid}: {e}")
+
+def _cleanup_audio_cache_dir():
+  """按“最大保留天数 + 最大目录体积”清理 audio_cache。"""
+  try:
+    paths = glob.glob(os.path.join(AUDIO_CACHE_DIR, "*.m4a"))
+    if not paths:
+      return
+    now = time.time()
+    max_age_s = max(0, int(_AUDIO_CACHE_MAX_AGE_DAYS)) * 86400
+    max_total_bytes = max(0, int(_AUDIO_CACHE_MAX_TOTAL_MB)) * 1024 * 1024
+
+    # 1) 先按年龄删
+    kept = []
+    for p in paths:
+      try:
+        st = os.stat(p)
+        age = now - float(st.st_mtime)
+        if max_age_s > 0 and age > max_age_s:
+          try:
+            os.remove(p)
+            print(f"[AUDIO_CACHE] pruned by age: {os.path.basename(p)}")
+          except Exception as e:
+            print(f"[AUDIO_CACHE] prune-by-age failed {os.path.basename(p)}: {e}")
+        else:
+          kept.append((p, st.st_mtime, st.st_size))
       except Exception:
         pass
+
+    if max_total_bytes <= 0:
+      return
+
+    # 2) 再按总大小删（从最旧开始）
+    total = sum(sz for _, _, sz in kept)
+    if total <= max_total_bytes:
+      return
+    kept.sort(key=lambda x: x[1])  # mtime asc（最旧先删）
+    for p, mt, sz in kept:
+      if total <= max_total_bytes:
+        break
+      try:
+        os.remove(p)
+        total -= sz
+        print(f"[AUDIO_CACHE] pruned by size: {os.path.basename(p)}")
+      except Exception as e:
+        print(f"[AUDIO_CACHE] prune-by-size failed {os.path.basename(p)}: {e}")
+  except Exception as e:
+    print(f"[AUDIO_CACHE] directory cleanup failed: {e}")
+
+def _start_audio_cache_cleaner():
+  try:
+    interval_s = max(60, int(_AUDIO_CACHE_CLEAN_INTERVAL_MIN) * 60)
   except Exception:
-    pass
+    interval_s = 3600
+  def _loop():
+    while True:
+      try:
+        _cleanup_audio_cache_dir()
+      except Exception:
+        pass
+      time.sleep(interval_s)
+  t = threading.Thread(target=_loop, name="audio-cache-cleaner", daemon=True)
+  t.start()
+
+# 启动后台清理线程（模块加载即启动；daemon 不阻塞退出）
+_start_audio_cache_cleaner()
 
 def _ensure_audio_cached(vid: str, src_path: str) -> Tuple[str, str]:
     """
@@ -1064,6 +1470,10 @@ def media_audio(request: Request, vid_id: str):
   v = id_map.get(vid_id)
   if not v: raise HTTPException(404)
   src_path = v.video_path
+  # ★ 若存在有效的转码缓存，音频也优先从缓存视频抽取（保证与 WebUI 播放的版本一致）
+  cache_path = _get_video_cache_path_if_any(vid_id, src_path)
+  if cache_path:
+    src_path = cache_path
 
   try:
     cache_path, mime = _ensure_audio_cached(vid_id, src_path)
