@@ -185,6 +185,56 @@ const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size)); return out; }
 function showNotice(msg){ const n=$("notice"); if(!n) return; n.style.display="block"; n.innerHTML="ℹ︎ " + msg; }
 function clearNotice(){ const n=$("notice"); if(!n) return; n.style.display="none"; n.textContent=""; }
+function _escHtml(s){
+  // 注意：部分安卓 WebView/旧浏览器没有 String.prototype.replaceAll，会导致这里直接抛错，
+  // 进而出现“点了修复完全没提示”的现象。用正则 replace 保守兼容。
+  const str = (s === null || s === undefined) ? "" : String(s);
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+function showNoticeProgress(title, sub){
+  try{
+    const n = $("notice"); if (!n) return null;
+    const t = _escHtml(title || "正在处理…");
+    const s = _escHtml(sub || "");
+    n.style.display = "block";
+    n.innerHTML = `
+      <div class="notice-wrap">
+        <div class="notice-line"><span>🛠 ${t}</span><span class="notice-pct" id="noticePct"></span></div>
+        <div class="notice-sub" id="noticeSub">${s}</div>
+        <div class="pbar"><div class="bar indeterminate" id="noticeBar"></div></div>
+      </div>
+    `.trim();
+    return {
+      root: n,
+      subEl: document.getElementById("noticeSub"),
+      pctEl: document.getElementById("noticePct"),
+      barEl: document.getElementById("noticeBar"),
+    };
+  }catch(e){
+    // 兜底：任何渲染异常都退回到纯文本 notice，避免“完全无提示”
+    try{ showNotice(`正在处理…（提示条渲染失败：${String(e||"error")}）`); }catch(_){}
+    return null;
+  }
+}
+function setNoticeSubText(text){
+  const el = document.getElementById("noticeSub");
+  if (el) el.textContent = String(text ?? "");
+}
+function setNoticePct(pct){
+  const p = Math.max(0, Math.min(100, Number(pct)));
+  const bar = document.getElementById("noticeBar");
+  const pctEl = document.getElementById("noticePct");
+  if (bar){
+    bar.classList.remove("indeterminate");
+    bar.style.width = p.toFixed(0) + "%";
+  }
+  if (pctEl) pctEl.textContent = isFinite(p) ? (p.toFixed(0) + "%") : "";
+}
 function fmtSize(sz){ if (sz>=1<<30) return (sz/(1<<30)).toFixed(1)+" GB"; if (sz>=1<<20) return (sz/(1<<20)).toFixed(1)+" MB"; if (sz>=1<<10) return (sz/(1<<10)).toFixed(1)+" KB"; return sz+" B"; }
 function fmtDate(ts){ return new Date(ts*1000).toLocaleString(); }
 function isSel(t){ return t.type==="video" ? state.selV.has(t.vid) : state.selF.has(t.path); }
@@ -227,6 +277,95 @@ async function apiMove(ids, dest_path){
     body: JSON.stringify({ ids: ids.map(String), dest_path })
   }).catch(()=>null);
   return !!(r && r.ok);
+}
+
+/* ====================== 视频修复（针对“固定秒数卡住”） ====================== */
+async function apiRepairVideo(id, mode="reencode"){
+  try{
+    const qs = new URLSearchParams({ mode: String(mode||"reencode") });
+    const r = await fetch(`/api/repair/${encodeURIComponent(String(id))}?${qs.toString()}`, { method:"POST" });
+    const j = await r.json().catch(()=>({}));
+    return { ok: !!(r && r.ok), data: j };
+  }catch(e){
+    return { ok:false, data: { error: String(e||"network-error") } };
+  }
+}
+// ★ 全局标记：修复进行中时阻止自动切换到 audio 模式
+let _repairInProgress = false;
+// ★ 记录已修复的视频 ID，下次播放时强制 cacheBust
+const _repairedVideos = new Set();
+
+async function repairVideoAndReload(id, mode="reencode"){
+  if (!id || String(id) === "undefined" || String(id) === "null"){
+    showNotice("修复失败：无效视频ID（可能是前端状态异常或脚本报错导致）");
+    setTimeout(clearNotice, 3500);
+    return;
+  }
+  const v = media.v || $("fsVideo");
+  const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : 0;
+  const title = (mode==="copy" ? "无损重封装修复中…" : "强制转码修复中（更慢但更稳）…");
+  const t0 = Date.now();
+  _repairInProgress = true;  // ★ 标记修复开始
+  showNoticeProgress(title, "已耗时 0s");
+  // "进度条"这里做成不定进度 + 实时耗时（不改后端接口也能看见正在进行）
+  const tick = setInterval(()=> {
+    const sec = Math.max(0, Math.floor((Date.now()-t0)/1000));
+    setNoticeSubText(`已耗时 ${sec}s（请勿关闭页面）`);
+  }, 500);
+  let res = null;
+  try{
+    res = await apiRepairVideo(id, mode);
+  } finally {
+    clearInterval(tick);
+  }
+  if (!res.ok){
+    const err = (res.data && res.data.error) ? String(res.data.error) : "unknown";
+    const sec = Math.max(0, Math.round((Date.now()-t0)/1000));
+    showNotice(`修复失败：${_escHtml(err)}（耗时 ${sec}s）`);
+    setTimeout(clearNotice, 3000);
+    return;
+  }
+  setNoticePct(100);
+  const m = (res.data && res.data.mode) ? String(res.data.mode) : String(mode||"unknown");
+  const before = (res.data && res.data.before!=null) ? String(res.data.before) : "";
+  const after  = (res.data && res.data.after!=null) ? String(res.data.after) : "";
+  const sec = Math.max(0, Math.round((Date.now()-t0)/1000));
+  
+  // ★ 标记这个视频已修复（下次播放时强制 cacheBust）
+  _repairedVideos.add(String(id));
+  
+  showNotice(`修复完成（${_escHtml(m)}${before&&after?`，${_escHtml(before)}→${_escHtml(after)}`:""}，耗时 ${sec}s）。下次播放时将使用修复后的文件。`);
+  setTimeout(clearNotice, 4000);
+  _repairInProgress = false;  // ★ 标记修复结束
+  
+  // ★ 修复完成后不自动播放，只是清理浏览器/音频缓存，等用户下次手动播放时才使用修复后的文件
+  // 清空当前音频元素（避免缓存旧的音频流）
+  try{
+    const a = media.a || $("bgAudio");
+    const v = media.v || $("fsVideo");
+    // 清理 audio
+    if (a){
+      const wasPlaying = !a.paused;
+      a.pause();
+      a.muted = true;
+      a.volume = 0;
+      a.removeAttribute("src");
+      a.load();
+      // 如果之前在播放，提示用户需要重新播放
+      if (wasPlaying && isPlayerActive()){
+        setTimeout(()=>{
+          showNotice("修复已完成。请关闭播放器后重新点击该视频。");
+          setTimeout(clearNotice, 3000);
+        }, 4100);
+      }
+    }
+    // 清理 video（避免浏览器缓存"无视频流"的判断）
+    if (v){
+      v.pause();
+      v.removeAttribute("src");
+      v.load();
+    }
+  }catch(_){}
 }
 function sanitizeFolderTitle(name){
   let s = String(name||"").trim();
@@ -1058,6 +1197,7 @@ function kickVisWatch(reason="return"){
 document.addEventListener("visibilitychange", async ()=>{
   if (!isPlayerActive()) return;
   if (scrubGuard.active) return;
+  if (_repairInProgress) return;  // ★ 修复期间不自动切换到 audio
   if (document.visibilityState === "hidden"){
     await switchToAudio();
     // 增强：切到后台后立即启动保活和监控
@@ -1117,7 +1257,7 @@ if ('onpageshow' in window){
 }
 
 window.addEventListener("pagehide", (e)=> { 
-  if (isPlayerActive() && !scrubGuard.active) switchToAudio();
+  if (isPlayerActive() && !scrubGuard.active && !_repairInProgress) switchToAudio();
   // 如果是进入 bfcache，保持保活机制
   if (e.persisted){
     // 不停止保活，让它在后台继续
@@ -1237,14 +1377,25 @@ function updateMediaSessionPlaybackState(){
 }
 
 /* —— stalled/首帧修复 —— */
-const stallRepair = { inFlight:false, tried:new Set(), timer:null, detach:null, startedAt:0 };
+const stallRepair = {
+  inFlight:false,
+  tried:new Set(),
+  timer:null,
+  detach:null,
+  startedAt:0,
+  lastSeekAt:0,
+  lastSeekPos:0,
+  lastVideoTime:0,
+  startedOnce:false
+};
 function installStallListeners(v, a){
   if (!v._stallBound){
     const vh = async ()=> await maybeRepairFromEl('video', v);
     v.addEventListener('stalled', vh); v.addEventListener('waiting', vh); v.addEventListener('error',   vh);
-    v.addEventListener('seeking', ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); updatePositionState(); });
+    v.addEventListener('seeking', ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); stallRepair.lastSeekAt = Date.now(); stallRepair.lastSeekPos = Number.isFinite(v.currentTime)? v.currentTime : stallRepair.lastSeekPos; disarmFirstPlayWatch(); updatePositionState(); });
     v.addEventListener('seeked',  ()=>{ endScrubGuardSoon(); updatePositionState(); });
-    v.addEventListener('playing', ()=> clearUserPaused());
+    v.addEventListener('timeupdate', ()=>{ if (Number.isFinite(v.currentTime)) stallRepair.lastVideoTime = v.currentTime; });
+    v.addEventListener('playing', ()=>{ stallRepair.startedOnce = true; clearUserPaused(); });
     v.addEventListener('pause',   ()=>{ if (document.visibilityState==='visible') markUserPaused(); updatePositionState(); });
     v._stallBound = true;
   }
@@ -1258,18 +1409,21 @@ function installStallListeners(v, a){
 async function maybeRepairFromEl(which, el){
   if (!isPlayerActive()) return;
   if (scrubGuard.active) return;
+  if (stallRepair.lastSeekAt && (Date.now() - stallRepair.lastSeekAt) < 3000) return;
   if (playbackMode === "audio" && which === "video") return;
 
   const id = player.ids[player.index];
   if (!id || stallRepair.inFlight || stallRepair.tried.has(String(id))) return;
+  if (stallRepair.startedOnce) return;
   const early = (el.currentTime || 0) < 1.0;
   const starving = (el.readyState || 0) < 3;
-  if (!(early || starving)) return;
+  if (!(early && starving)) return;
 
   if (!stallRepair.startedAt) stallRepair.startedAt = Date.now();
   if (Date.now() - stallRepair.startedAt < STALL_REPAIR_GRACE_MS) return;
 
-  await triggerRepair(id, el.currentTime || 0);
+  const resumeAt = Number.isFinite(el.currentTime) ? el.currentTime : (stallRepair.lastSeekPos || stallRepair.lastVideoTime || 0);
+  await triggerRepair(id, resumeAt);
 }
 function armFirstPlayWatch(id, el){
   disarmFirstPlayWatch();
@@ -1515,8 +1669,9 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
         if (!isVideo) stopBgKeepAlive();                             
       });
       if (isVideo){
-        el.addEventListener("seeking", ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); updatePositionState(); });
+        el.addEventListener("seeking", ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); stallRepair.lastSeekAt = Date.now(); stallRepair.lastSeekPos = Number.isFinite(el.currentTime)? el.currentTime : stallRepair.lastSeekPos; disarmFirstPlayWatch(); updatePositionState(); });
         el.addEventListener("seeked",  ()=>{ endScrubGuardSoon(); updatePositionState(); });
+        el.addEventListener("timeupdate", ()=>{ if (Number.isFinite(el.currentTime)) stallRepair.lastVideoTime = el.currentTime; });
       }
     };
     bindPos(v, true); bindPos(a, false);
@@ -1568,8 +1723,9 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
 }
 
 /* ★ 切集 / 首次播放 */
-async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
+async function playIndex(i, {cacheBust=false, resumeAt=0, forceVideo=false} = {}){
   player.index = i;
+  stallRepair.startedOnce = false;
   lastAdvanceId = null;
   disarmFirstPlayWatch();
   stallRepair.startedAt = Date.now();
@@ -1578,13 +1734,20 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   if (a0){ try{ a0.muted = true; a0.volume = 0; }catch(_){ } }
 
   const id = player.ids[i];
+  // ★ 如果这个视频刚修复过，强制 cacheBust + 强制视频模式
+  if (_repairedVideos.has(String(id))){
+    cacheBust = true;
+    forceVideo = true;  // 修复后首次播放强制使用视频模式
+    // 播放一次后就从集合里移除（避免永远 cacheBust）
+    _repairedVideos.delete(String(id));
+  }
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
   const vSrc = mediaVideoSrcOf(id, cacheBust);
   const aSrc = audioSrcOf(id, cacheBust);
   injectVideoPreload(vSrc);
 
-  if (document.visibilityState === "hidden") {
+  if (document.visibilityState === "hidden" && !forceVideo) {
     audioBias = 0;
     try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true, seek:'force' }); }catch(_){}
     try{
@@ -1600,11 +1763,11 @@ async function playIndex(i, {cacheBust=false, resumeAt=0} = {}){
   } else {
     // 前台视频模式：先声明 playbackMode，避免 MediaSession/进度条误绑到 audio
     playbackMode = "video";
+    // ★ 确保音频完全停止并静音（避免后台播放音频）
+    try{ if (a){ a.pause(); a.muted = true; a.volume = 0; a.removeAttribute("src"); a.load(); } }catch(_){}
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
-    // 确保音频不抢占前台（Chrome 可能把“在播音频”作为主媒体）
-    try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
     prewarmAudio(aSrc, resumeAt||0, false);
     setMediaSessionMeta(id);
     updatePositionState(); startPosTicker();
@@ -1796,6 +1959,8 @@ function getCurrentlyLoadedVideoItems(){
 function getTile(target){ const el = target.closest(".tile"); if(!el) return null; const idx = parseInt(el.dataset.idx,10); return state.tiles[idx] || null; }
 
 /* ★★★ 修改：取消订阅/批量取消订阅：统一复用 Steam「已订阅物品主页」并 postMessage 投递 IDs（不再打开详情页） ★★★ */
+// 缓存 Steam 订阅页窗口句柄：避免每次 window.open("", name) 都可能把焦点切过去
+let STEAM_BULK_UNSUB_WIN = null;
 async function openBulkUnsub(ids, batch=1){
   try{
     const uniq = Array.from(new Set((ids||[]).map(String).filter(Boolean)));
@@ -1805,6 +1970,14 @@ async function openBulkUnsub(ids, batch=1){
     const okGo = confirm(`是否取消订阅${uniq.length}个项目？会同时删除本地文件！`);
     if (!okGo) return;
 
+    // ★★ UI立即响应：秒删这些项目，然后在后台异步执行取消订阅和删除本地文件 ★★
+    removeTilesByVideoIds(uniq);
+    clearSel();
+    showNotice(`正在处理 ${uniq.length} 项的取消订阅…`);
+
+    // ★★ 后续流程全部在后台异步执行，不阻塞UI ★★
+    (async () => {
+      try {
     // 统一：打开/复用订阅主页（不携带 workshop 详情页 id；不固化账号）
     // 使用 /my/ 指向当前登录账号，适合提交到 GitHub 的通用版本
     const steamSubUrl =
@@ -1813,38 +1986,58 @@ async function openBulkUnsub(ids, batch=1){
     // 用固定 window.name 复用同一个标签页；如果已开，不会新开
     const winName = "steam-bulk-unsub";
     // 注意：不要用 noopener，否则部分浏览器会让 window 引用变成 null，导致无法 postMessage 投递任务
-    // 关键修复：window.open(url, name) 在已存在时会“导航/刷新”该标签页。
-    // 我们希望复用已打开的订阅页并保持不刷新：先用 window.open("", name) 获取引用（不导航），必要时再打开目标 URL。
-    let w = null;
+        // 关键：不要每次都 window.open("", name) "查找窗口"，很多浏览器会因此把标签页置前（抢焦点）。
+    // 改为缓存句柄，后续直接复用句柄发 postMessage；仅在缺失/已关闭时才真正 window.open(url,name)。
+    let w = STEAM_BULK_UNSUB_WIN;
     let openedOrNavigated = false;
-    try{ w = window.open("", winName); }catch(_){ w = null; }
-    if (!w || w.closed){
+        
+        // ★ 改进的窗口可用性检查：不仅检查 closed，还要测试窗口是否真的可用
+        let needNewWindow = false;
+        if (!w){
+          needNewWindow = true;
+        } else {
+          try{
+            // 尝试访问 closed 属性，如果窗口已失效会抛异常
+            if (w.closed){
+              needNewWindow = true;
+            }
+          }catch(_){
+            // 窗口句柄已失效（可能被浏览器回收）
+            needNewWindow = true;
+          }
+        }
+        
+        if (needNewWindow){
       w = window.open(steamSubUrl, winName);
+      STEAM_BULK_UNSUB_WIN = w;
       openedOrNavigated = !!w;
     } else {
-      // 首次：window.open("", name) 会创建 about:blank（同源可读）。如果是空白页则立刻导航到订阅页。
+          // 窗口存在且未关闭，检查是否需要导航
       try{
         const href = (w.location && w.location.href) ? String(w.location.href) : "";
         if (href === "about:blank" || href === "") {
           try{ w.location.replace(steamSubUrl); }catch(_){ try{ w.location.href = steamSubUrl; }catch(__){} }
           openedOrNavigated = true;
         }
+            // 如果已经在Steam页面，不做任何操作，直接复用
       }catch(_){
         // 跨域时无法读取 location：说明已经在 Steam 页面，无需刷新/导航
+            // 这是正常情况，窗口已经在Steam页面了
       }
     }
     if (!w){
-      alert("无法打开 Steam 页面（可能被浏览器拦截了弹窗）。请允许弹窗后重试。");
-      // 弹窗打不开则不应继续删除本地（否则会造成“本地删除了但 Steam 未退订”）
+          showNotice("无法打开 Steam 页面（可能被浏览器拦截了弹窗）");
+          setTimeout(clearNotice, 3000);
       return;
-    } else {
+        }
+
       // 不要强制把焦点切到 Steam 页（用户不希望被打断）
       // 仅在首次新开/导航时，尽量把焦点抢回当前 WebUI（浏览器可能会忽略）
       if (openedOrNavigated){
         try{ w.blur && w.blur(); }catch(_){}
         try{ window.focus && window.focus(); }catch(_){}
-        // 首次打开/导航：给订阅页加载和 userscript 初始化留足时间（避免 postMessage 投递时脚本还没就绪）
-        await new Promise(r=>setTimeout(r, 1800));
+          // 首次打开/导航：给订阅页加载和 userscript 初始化留足时间（避免 postMessage 投递时脚本还没就绪）
+          await new Promise(r=>setTimeout(r, 1800));
       }
 
       // postMessage 投递：带 reqId，短时间重试直到收到 ack（避免订阅页加载慢导致丢消息）
@@ -1871,7 +2064,7 @@ async function openBulkUnsub(ids, batch=1){
       const tick = ()=>{
         if (acked) return;
         if (Date.now() - startAt > maxAckMs){
-          showNotice("已打开订阅页，但未收到脚本确认（可能脚本未启用/未加载）。本地不会删除。");
+            showNotice("已打开订阅页，但未收到脚本确认（可能脚本未启用/未加载）");
           setTimeout(clearNotice, 4500);
           return;
         }
@@ -1887,38 +2080,43 @@ async function openBulkUnsub(ids, batch=1){
       };
       const okAck = await waitAck();
       if (!okAck){
-        try{ window.removeEventListener("message", onMsg); }catch(_){}
+          try{ window.removeEventListener("message", onMsg); }catch(_){}
         return; // 不删除本地
       }
-      showNotice(`任务已投递：${uniq.length} 项（等待 Steam 侧完成后再删除本地）`);
+        showNotice(`任务已投递：${uniq.length} 项（等待 Steam 侧完成）`);
       setTimeout(clearNotice, 2500);
 
-      // 等待 DONE（给足时间：最多 1 小时，避免大批量时误删本地）
+        // 等待 DONE（给足时间：最多 1 小时，避免大批量时误删本地）
       const doneDeadline = Date.now() + 60*60*1000;
       while (!donePayload && Date.now() < doneDeadline) await new Promise(r=>setTimeout(r, 250));
-      try{ window.removeEventListener("message", onMsg); }catch(_){}
+        try{ window.removeEventListener("message", onMsg); }catch(_){}
       if (!donePayload){
-        showNotice("未收到完成回执，本地不会删除。");
+          showNotice("未收到完成回执，本地不会删除");
         setTimeout(clearNotice, 4500);
         return;
       }
 
-      // 收到完成回执后再删除本地
-      primeBusy(`取消订阅完成（成功:${donePayload.ok||0} 失败:${donePayload.fail||0}），正在删除本地条目…`);
-    }
+        // 收到完成回执后再静默删除本地文件
+        showNotice(`Steam 取消订阅完成（成功:${donePayload.ok||0}），正在后台删除本地文件…`);
+        setTimeout(clearNotice, 2000);
 
+        // ★★ 后台静默删除本地文件，不显示转圈 ★★
     const ok = await deleteByIds(uniq);
-    hideBusy();
 
     if (!ok){
-      alert("删除本地条目失败，请稍后重试。");
+          showNotice("本地文件删除失败，请稍后重试");
+          setTimeout(clearNotice, 3000);
     } else {
-      removeTilesByVideoIds(uniq);
-      showNotice(`已删除本地 ${uniq.length} 项`);
-      setTimeout(clearNotice, 1500);
+          showNotice(`已完成 ${uniq.length} 项的取消订阅和本地删除`);
+          setTimeout(clearNotice, 2000);
     }
+      } catch(err) {
+        console.error("[openBulkUnsub] 后台处理出错:", err);
+        showNotice("取消订阅处理过程中出现错误");
+        setTimeout(clearNotice, 3000);
+      }
+    })(); // 立即执行异步函数，不等待结果
 
-    clearSel();
   }catch(_){}
 }
 
@@ -1987,7 +2185,7 @@ function removeTilesByVideoIds(ids){
       }
     }
   } else {
-    state.lastIdx = null;
+  state.lastIdx = null;
   }
 }
 
@@ -2163,11 +2361,126 @@ function bindDelegatedEvents(){
 
 function openContextMenu(x,y){
   const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
+  try{ menu.classList.remove("move-submenu"); }catch(_){}
   const selCount = state.selV.size + state.selF.size;
   const onlyOne = selCount === 1;
   const oneVideo = onlyOne && state.selV.size === 1;
   const oneFolder = onlyOne && state.selF.size === 1;
-  function add(text, fn){ const d=document.createElement("div"); d.className="item"; d.textContent=text; d.onclick=()=>{ hideMenu(); fn(); }; menu.appendChild(d); }
+  // 点击菜单内部不要冒泡到 document（否则会触发 click-away 立刻关闭，二级菜单也打不开）
+  if (!menu._stopPropBound){
+    menu._stopPropBound = true;
+    menu.addEventListener("click", (e)=>{ try{ e.stopPropagation(); }catch(_){} });
+    menu.addEventListener("pointerdown", (e)=>{ try{ e.stopPropagation(); }catch(_){} }, {passive:true});
+  }
+
+  function add(text, fn, {keepOpen=false}={}){
+    const d=document.createElement("div");
+    d.className="item";
+    d.textContent=text;
+    d.onclick=()=>{
+      if (!keepOpen) hideMenu();
+      fn && fn();
+    };
+    menu.appendChild(d);
+  }
+  // ★ 二级菜单：复用同一个 ctxmenu，提供“返回”
+  function openSubMenu(title, entries){
+    try{ menu.classList.remove("move-submenu"); }catch(_){}
+    // entries: [{text, fn}]
+    menu.innerHTML = "";
+    const back = document.createElement("div");
+    back.className = "item";
+    back.textContent = "← 返回";
+    back.onclick = ()=>{ openContextMenu(x,y); };
+    menu.appendChild(back);
+    const hdr = document.createElement("div");
+    hdr.className = "sep";
+    menu.appendChild(hdr);
+    (entries||[]).forEach(ent=>{
+      const d = document.createElement("div");
+      d.className = "item";
+      d.textContent = ent.text;
+      d.onclick = ()=>{ hideMenu(); ent.fn && ent.fn(); };
+      menu.appendChild(d);
+    });
+  }
+  // ★ 二级菜单（异步填充）：用于“移动到…”这种需要拉取文件夹树的场景
+  function openSubMenuAsync(title, loader, {moveStyle=false}={}){
+    try{ menu.classList.toggle("move-submenu", !!moveStyle); }catch(_){}
+    menu.innerHTML = "";
+    const back = document.createElement("div");
+    back.className = "item";
+    back.textContent = "← 返回";
+    back.onclick = ()=>{ openContextMenu(x,y); };
+    menu.appendChild(back);
+    const hdr = document.createElement("div");
+    hdr.className = "sep";
+    menu.appendChild(hdr);
+    const loading = document.createElement("div");
+    loading.className = "item";
+    loading.textContent = `${title}：加载中…`;
+    loading.onclick = ()=>{};
+    menu.appendChild(loading);
+
+    (async ()=>{
+      try{
+        const entries = await loader();
+        // 如果用户已返回上一级/关闭菜单，则不再覆盖
+        if (menu.style.display === "none") return;
+        try{ menu.classList.toggle("move-submenu", !!moveStyle); }catch(_){}
+        // 重新渲染同一个子菜单
+        menu.innerHTML = "";
+        const back2 = document.createElement("div");
+        back2.className = "item";
+        back2.textContent = "← 返回";
+        back2.onclick = ()=>{ openContextMenu(x,y); };
+        menu.appendChild(back2);
+        const hdr2 = document.createElement("div");
+        hdr2.className = "sep";
+        menu.appendChild(hdr2);
+        (entries||[]).forEach(ent=>{
+          const d = document.createElement("div");
+          d.className = "item";
+          d.textContent = ent.text;
+          d.onclick = ()=>{ hideMenu(); ent.fn && ent.fn(); };
+          menu.appendChild(d);
+        });
+      }catch(_){
+        try{
+          loading.textContent = `${title}：加载失败`;
+        }catch(__){}
+      }
+    })();
+  }
+  function openMoveSubMenu(getIds){
+    openSubMenuAsync("移动到…", async ()=>{
+      const ids = await getIds();
+      if (!ids || !ids.length){
+        return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
+      }
+      const entries = [];
+      // 主页
+      entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(ids, "/"); } });
+
+      // 文件夹树（扁平化 + 缩进）
+      const tree = flattenFolderTree(await getFoldersMenuTree());
+      const MAX = 240; // 防止菜单过长
+      for (let i=0;i<tree.length && i<MAX;i++){
+        const n = tree[i];
+        const indent = "　".repeat(Math.min(10, n.depth||0)); // 全角空格，移动端更对齐
+        const label = `${indent}${n.title} (${n.path})`;
+        entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
+      }
+      if (tree.length > MAX){
+        entries.push({ text:`（仅显示前 ${MAX} 项…）`, fn: ()=>{} });
+      }
+      // 兜底：仍保留原“浮层选择器”
+      entries.push({ text:"打开完整选择器…", fn: async ()=>{
+        showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh(ids, dest); });
+      }});
+      return entries;
+    }, {moveStyle:true});
+  }
   function sep(){ const s=document.createElement("div"); s.className="sep"; menu.appendChild(s); }
 
   if (oneVideo) {
@@ -2176,10 +2489,13 @@ function openContextMenu(x,y){
     add("播放此视频", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
     add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
     add("打开创意工坊链接", ()=> window.open(`https://steamcommunity.com/sharedfiles/filedetails/?id=${vid}`, "_blank"));
+    add("修复…", ()=> openSubMenu("修复", [
+      { text:"强制转码修复（推荐）", fn: async ()=>{ await repairVideoAndReload(vid, "reencode"); } },
+      { text:"无损重封装（可能无效）", fn: async ()=>{ await repairVideoAndReload(vid, "copy"); } },
+    ]), {keepOpen:true});
     add("取消订阅", ()=> openBulkUnsub([vid], 0));  // batch=0 表示单项模式
     sep();
-    add("移动到主页", async ()=>{ await moveIdsAndRefresh([vid], "/"); });
-    add("移动到…", async ()=>{ showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh([vid], dest); }); });
+    add("移动到…", ()=> openMoveSubMenu(async ()=> [String(vid)]), {keepOpen:true});
     sep();
     add("删除", async ()=>{
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
@@ -2207,15 +2523,7 @@ function openContextMenu(x,y){
       await openBulkUnsub(ids, 2);  // batch=2 表示批量模式
     });
     sep();
-    add("移动所选到主页", async ()=>{
-      const ids = await collectSelectedIds();
-      await moveIdsAndRefresh(ids, "/");
-    });
-    add("移动所选到…", async ()=>{
-      const ids = await collectSelectedIds();
-      if (!ids.length){ alert("没有可移动的条目"); return; }
-      showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh(ids, dest); });
-    });
+    add("移动到…", ()=> openMoveSubMenu(async ()=> await collectSelectedIds()), {keepOpen:true});
     sep();
     add("删除所选", async ()=>{
       const items = await expandSelectionToItems();
@@ -2390,6 +2698,40 @@ const stallHB = {
   lastGoodLogical:0,   // ★ 锚点缓存（逻辑时间）
   lastWall: 0          // [MIN-FIX#2] 上次墙钟心跳时间（ms, performance.now）
 };
+/* ========================= Gate Heartbeat（前置门卫） =========================
+   说明：当前版本有代码在多处调用 start/stop/resetGateBaseline，但函数缺失会导致 JS 直接崩溃，
+   进而出现“点修复没任何通知/播放流程异常”等连锁问题。
+   这里提供一个“保守实现”：只负责不报错 + 维护基线 + 安全启停（不主动改动播放逻辑）。
+*/
+const gateHB = { active:false, timer:null, intervalMs:2000, lastPos:0, lastWall:0 };
+function resetGateBaseline(aEl){
+  try{
+    gateHB.lastPos = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
+    gateHB.lastWall = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  }catch(_){
+    gateHB.lastPos = 0;
+    gateHB.lastWall = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  }
+}
+function startGateHeartbeat(){
+  if (gateHB.timer) return;
+  gateHB.active = true;
+  gateHB.timer = setInterval(()=>{
+    // 保守：仅保持心跳存在，避免缺失函数导致的崩溃；不在这里触发任何“修复/重启”动作。
+    try{
+      const aEl = media.a || $("bgAudio");
+      if (!aEl) return;
+      if (!isPlayerActive() || playbackMode!=="audio") return;
+      if (aEl.paused || aEl.seeking) return;
+      // 轻量更新基线，给未来扩展留接口
+      resetGateBaseline(aEl);
+    }catch(_){}
+  }, gateHB.intervalMs);
+}
+function stopGateHeartbeat(){
+  gateHB.active = false;
+  if (gateHB.timer){ clearInterval(gateHB.timer); gateHB.timer = null; }
+}
 function _logicalAudioTime(aEl){
   const t = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
   return Math.max(0, t - (audioBias||0));
@@ -2640,6 +2982,7 @@ function stopMinuteResync(){
 
 /* —— 生命周期：使用 Gate 作为前置，再决定是否进入 stallHB —— */
 document.addEventListener("visibilitychange", ()=>{
+  if (_repairInProgress) return;  // ★ 修复期间不触发心跳切换
   const a = media.a || $("bgAudio");
   if (!a) return;
   if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && !a.paused){
