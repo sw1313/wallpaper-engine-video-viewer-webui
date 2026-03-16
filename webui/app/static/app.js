@@ -185,6 +185,26 @@ const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size)); return out; }
 function showNotice(msg){ const n=$("notice"); if(!n) return; n.style.display="block"; n.innerHTML="ℹ︎ " + msg; }
 function clearNotice(){ const n=$("notice"); if(!n) return; n.style.display="none"; n.textContent=""; }
+
+// ===== Service Worker：持久缓存封面图（/media/preview/*）=====
+function _appVersionFromScript(){
+  try{
+    const scripts = Array.from(document.getElementsByTagName("script"));
+    const s = scripts.map(x=>x && x.src).filter(Boolean).find(src=>/\/static\/app\.js\?/i.test(src)) || "";
+    const u = new URL(s, location.origin);
+    return u.searchParams.get("v") || "";
+  }catch(_){ return ""; }
+}
+async function registerPreviewSW(){
+  try{
+    if (!("serviceWorker" in navigator)) return;
+    // /sw.js 在根路径，scope 默认覆盖 /
+    const v = _appVersionFromScript();
+    const url = v ? (`/sw.js?v=${encodeURIComponent(v)}`) : "/sw.js";
+    await navigator.serviceWorker.register(url);
+  }catch(_){}
+}
+registerPreviewSW();
 function _escHtml(s){
   // 注意：部分安卓 WebView/旧浏览器没有 String.prototype.replaceAll，会导致这里直接抛错，
   // 进而出现“点了修复完全没提示”的现象。用正则 replace 保守兼容。
@@ -608,19 +628,15 @@ function appendTiles(data){
   (data.videos||[]).forEach(v=>{
     const done = isWatched(v.id);
     const base = v.preview_url;
-    const s128 = `${base}?s=128`;
-    const s192 = `${base}?s=192`;
-    const s256 = `${base}?s=256`;
-    const s384 = `${base}?s=384`;
-    const s512 = `${base}?s=512`;
+    // 性能优化：不要用 srcset 一次性触发多尺寸缩略图生成（会导致每次打开页面都要转码/读写很多文件）。
+    // 固定一个尺寸 + 固定格式，服务端 preview_cache 命中率最高，加载会明显变快。
+    const thumb = `${base}?s=256&fmt=webp&q=80`;
     const fallback = base;
     const el = document.createElement("div");
     el.className="tile"; el.dataset.type="video"; el.dataset.vid=v.id; el.dataset.idx=idx;
     el.innerHTML = `<div class="thumb">
                       <img
-                        src="${s256}"
-                        srcset="${s128} 128w, ${s192} 192w, ${s256} 256w, ${s384} 384w, ${s512} 512w"
-                        sizes="(max-width:640px) 48vw, 190px"
+                        src="${thumb}"
                         alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
                         onerror="this.onerror=null; this.src='${fallback}'"
                       />
@@ -730,6 +746,105 @@ function installPopStateGuard(){
 }
 installPopStateGuard();
 
+/* --- 双指右滑返回手势（移动端/平板） --- */
+(function installTwoFingerSwipeBack(){
+  let startX = 0, startY = 0, tracking = false, fired = false;
+  const MIN_DX = 70, MAX_DY_RATIO = 0.7;
+
+  document.addEventListener("touchstart", (e)=>{
+    if (e.touches.length === 2){
+      tracking = true;
+      fired = false;
+      const t0 = e.touches[0], t1 = e.touches[1];
+      startX = (t0.clientX + t1.clientX) / 2;
+      startY = (t0.clientY + t1.clientY) / 2;
+    }
+  }, {passive:true});
+
+  document.addEventListener("touchmove", (e)=>{
+    if (!tracking || fired) return;
+    if (e.touches.length < 2){ tracking = false; return; }
+    const t0 = e.touches[0], t1 = e.touches[1];
+    const curX = (t0.clientX + t1.clientX) / 2;
+    const curY = (t0.clientY + t1.clientY) / 2;
+    const dx = curX - startX;
+    const dy = Math.abs(curY - startY);
+    if (dx > MIN_DX && dy < dx * MAX_DY_RATIO){
+      if (window.__touchLocked) return;
+      fired = true;
+      tracking = false;
+      try{ e.preventDefault(); }catch(_){}
+      handleSwipeBack();
+    }
+  }, {passive:false});
+
+  document.addEventListener("touchend", ()=>{
+    tracking = false;
+  }, {passive:true});
+
+  document.addEventListener("touchcancel", ()=>{
+    tracking = false;
+    fired = false;
+  }, {passive:true});
+
+  function handleSwipeBack(){
+    if (window.__touchLocked) return;
+    if (isPlayerActive()){
+      exitPlayer();
+      if (player.returnPath) navigateToPath(player.returnPath);
+      return;
+    }
+    const p = (typeof state !== "undefined") ? state.path : pathFromHash();
+    if (p && p !== "/"){
+      const parent = p.replace(/\/[^\/]*\/?$/, "") || "/";
+      navigateToPath(parent);
+    }
+  }
+})();
+
+/* --- 双指双击锁定/解锁触摸 --- */
+(function installTwoFingerDoubleTapLock(){
+  let _touchLocked = false;
+  window.__touchLocked = false;
+  let _lastTwoFingerTap = 0;
+  let _twoFingerDown = 0;
+  const DBL_TAP_MS = 400, MAX_HOLD_MS = 350;
+
+  document.addEventListener("touchstart", (e)=>{
+    if (e.touches.length === 2){
+      _twoFingerDown = Date.now();
+    }
+  }, {passive:true, capture:true});
+
+  document.addEventListener("touchend", (e)=>{
+    if (_twoFingerDown && e.touches.length === 0){
+      const hold = Date.now() - _twoFingerDown;
+      _twoFingerDown = 0;
+      if (hold > MAX_HOLD_MS) return;
+      const now = Date.now();
+      if (now - _lastTwoFingerTap < DBL_TAP_MS){
+        _lastTwoFingerTap = 0;
+        _touchLocked = !_touchLocked;
+        window.__touchLocked = _touchLocked;
+        return;
+      }
+      _lastTwoFingerTap = now;
+    }
+  }, {passive:true, capture:true});
+
+  function blockAll(e){
+    if (!_touchLocked) return;
+    if (e.touches && e.touches.length === 2) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  for (const evt of ["touchstart","touchmove","touchend",
+                      "pointerdown","pointermove","pointerup",
+                      "click","contextmenu","mousedown","mouseup"]){
+    document.addEventListener(evt, blockAll, {capture:true, passive:false});
+  }
+})();
+
 /* --- 禁用 PIP --- */
 function enforceNoPIP(v){
   if (!v) return;
@@ -741,7 +856,18 @@ function enforceNoPIP(v){
 }
 
 /* --- play 封装 --- */
-async function safePlay(el){ try { await el.play(); return true; } catch { return false; } }
+async function safePlay(el){
+  try { await el.play(); return true; } catch(_) {
+    // fallback: muted autoplay always succeeds, then unmute
+    try{
+      const wasMuted = el.muted;
+      el.muted = true;
+      await el.play();
+      el.muted = wasMuted;
+      return true;
+    }catch(_2){ return false; }
+  }
+}
 
 /* ---------- 源地址 ---------- */
 function mediaVideoSrcOf(id, cacheBust=false){ return `/media/video/${id}` + (cacheBust ? `?v=${Date.now()}` : ""); }
@@ -762,8 +888,8 @@ function computeAudioBias(a){
 /* ========== 后台保活（增强版：多重保护机制） ========== */
 const keepAlive = { 
   ctx:null, gain:null, src:null, pingTimer:null, active:false,
-  wakeLock:null, wakeLockTimer:null,  // Wake Lock API
-  playWatchTimer:null, lastPlayTime:0  // 播放状态监控
+  wakeLock:null,
+  playWatchTimer:null, lastMediaTime:0, lastCheckTime:0
 };
 async function startBgKeepAlive(){
   if (keepAlive.active) return;
@@ -789,33 +915,13 @@ async function startBgKeepAlive(){
     }
   }catch(_){}
   
-  // 2. Wake Lock API（防止设备休眠）
+  // 2. Wake Lock API - single request, no periodic re-request (fails when hidden anyway)
   try{
-    if ('wakeLock' in navigator){
-      const requestWakeLock = async ()=>{
-        try{
-          if (keepAlive.wakeLock) return;
-          keepAlive.wakeLock = await navigator.wakeLock.request('screen');
-          keepAlive.wakeLock.addEventListener('release', ()=>{
-            keepAlive.wakeLock = null;
-          });
-        }catch(err){
-          console.warn("[KeepAlive] Wake Lock failed:", err);
-          keepAlive.wakeLock = null;
-        }
-      };
-      await requestWakeLock();
-      // 定期检查并重新获取（某些浏览器会自动释放）
-      if (keepAlive.wakeLockTimer) clearInterval(keepAlive.wakeLockTimer);
-      keepAlive.wakeLockTimer = setInterval(async ()=>{
-        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
-          if (!keepAlive.wakeLock || keepAlive.wakeLock.released){
-            await requestWakeLock();
-          }
-        }
-      }, 30000); // 每30秒检查一次
+    if ('wakeLock' in navigator && !keepAlive.wakeLock){
+      keepAlive.wakeLock = await navigator.wakeLock.request('screen');
+      keepAlive.wakeLock.addEventListener('release', ()=>{ keepAlive.wakeLock = null; });
     }
-  }catch(_){}
+  }catch(_){ keepAlive.wakeLock = null; }
   
   // 3. 更频繁的服务器心跳（从45秒改为20秒）
   if (keepAlive.pingTimer) clearInterval(keepAlive.pingTimer);
@@ -831,40 +937,33 @@ async function startBgKeepAlive(){
   // 4. 播放状态监控（检测播放是否被系统杀死）
   if (keepAlive.playWatchTimer) clearInterval(keepAlive.playWatchTimer);
   keepAlive.playWatchTimer = setInterval(()=>{
+    if (_userPaused) return;
     if (document.visibilityState !== "hidden") return;
     if (!isPlayerActive() || playbackMode !== "audio") return;
     const a = media.a || $("bgAudio");
     if (!a) return;
     
     const now = Date.now();
+    const currentTime = a.currentTime || 0;
     const wasPlaying = !a.paused;
-    const timeAdvanced = (a.currentTime || 0) > (keepAlive.lastPlayTime || 0);
+    const timeAdvanced = currentTime > (keepAlive.lastMediaTime || 0) + 0.05;
     
-    // 如果应该播放但时间没前进，说明被系统杀死了
-    if (wasPlaying && !timeAdvanced && (now - (keepAlive.lastPlayTime || 0)) > 3000){
-      console.warn("[KeepAlive] 检测到播放被系统暂停，尝试恢复...");
-      try{
-        a.play().catch(()=>{
-          // 如果直接play失败，尝试重启
-          const id = player.ids[player.index];
-          if (id){
-            const resumeAt = Math.max(0, (a.currentTime || 0) - (audioBias || 0));
-            attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
-          }
-        });
-      }catch(_){}
+    if (wasPlaying && !timeAdvanced && keepAlive.lastCheckTime && (now - keepAlive.lastCheckTime) > 3000){
+      if (stallHB.active) return;  // stallHB is monitoring; defer heavy recovery to it
+      console.warn("[KeepAlive] playback stalled, attempting lightweight a.play()");
+      try{ a.play().catch(()=>{}); }catch(_){}
     }
     
     if (wasPlaying && timeAdvanced){
-      keepAlive.lastPlayTime = a.currentTime || 0;
+      keepAlive.lastMediaTime = currentTime;
     }
-  }, 2000); // 每2秒检查一次
+    keepAlive.lastCheckTime = now;
+  }, 2000);
 }
 function stopBgKeepAlive(){
   keepAlive.active = false;
   
   if (keepAlive.pingTimer){ clearInterval(keepAlive.pingTimer); keepAlive.pingTimer = null; }
-  if (keepAlive.wakeLockTimer){ clearInterval(keepAlive.wakeLockTimer); keepAlive.wakeLockTimer = null; }
   if (keepAlive.playWatchTimer){ clearInterval(keepAlive.playWatchTimer); keepAlive.playWatchTimer = null; }
   
   // 释放 Wake Lock
@@ -886,7 +985,8 @@ function stopBgKeepAlive(){
       keepAlive.ctx = null; }
   }catch(_){}
   
-  keepAlive.lastPlayTime = 0;
+  keepAlive.lastMediaTime = 0;
+  keepAlive.lastCheckTime = 0;
 }
 
 /* === 附加/预热（带 seek 策略） === */
@@ -957,17 +1057,22 @@ async function detachVideoSrc(){
 let fgSyncTimer = null;
 function startFgSync(){
   if (fgSyncTimer) return;
-  const v = media.v||$("fsVideo"), a = media.a||$("bgAudio");
-  if (!v || !a) return;
   fgSyncTimer = setInterval(()=>{
     if (document.visibilityState !== "visible") return;
-    if (a.paused) return;
-    if (a.muted && Number.isFinite(v.currentTime)) {
-      const target = (v.currentTime||0) + (audioBias||0);
-      const dv = Math.abs((a.currentTime||0) - target);
-      if (dv > 0.5) { try{ a.currentTime = target; }catch(_){ } }
+    const v = media.v||$("fsVideo"), a = media.a||$("bgAudio");
+    if (!v || !a) return;
+    if (!Number.isFinite(v.currentTime)) return;
+    const target = (v.currentTime||0) + (audioBias||0);
+    const dv = Math.abs((a.currentTime||0) - target);
+    // 音频在前台静音持续播放，偏移 > 0.5s 时对齐
+    if (!a.paused && a.muted && dv > 0.5){
+      try{ a.currentTime = target; }catch(_){ }
     }
-  }, 1500);
+    // 兜底：若音频被暂停（异常），偏移过大时也对齐
+    if (a.paused && dv > 5){
+      try{ a.currentTime = target; }catch(_){ }
+    }
+  }, 2000);
 }
 function stopFgSync(){ if (fgSyncTimer){ clearInterval(fgSyncTimer); fgSyncTimer=null; } }
 
@@ -975,10 +1080,9 @@ function stopFgSync(){ if (fgSyncTimer){ clearInterval(fgSyncTimer); fgSyncTimer
 const bgAdvanceGuard = { timer:null };
 function startBgAdvanceGuard(){
   if (bgAdvanceGuard.timer) return;
-  const a = media.a || $("bgAudio");
-  if (!a) return;
   bgAdvanceGuard.timer = setInterval(()=>{
     if (!isPlayerActive() || playbackMode !== "audio") return;
+    const a = media.a || $("bgAudio");
     if (!a) return;
     const dur = a.duration, t = a.currentTime || 0;
     const finite = Number.isFinite(dur) && dur > 0;
@@ -1033,13 +1137,26 @@ async function promoteToVideoNow(reason="unknown"){
   const vSrc = mediaVideoSrcOf(id);
   const resumeAt = Number.isFinite(a.currentTime) ? Math.max(0, a.currentTime - (audioBias||0)) : 0;
 
+  // 用户已暂停：只切换模式，不自动播放
+  if (_userPaused){
+    try{ a.pause(); a.muted = true; a.volume = 0; }catch(_){}
+    await attachVideoSrc(vSrc, resumeAt);
+    try{ v.pause(); v.muted = false; }catch(_){}
+    playbackMode = "video";
+    stopBgKeepAlive();
+    updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
+    stopBgAdvanceGuard();
+    return;
+  }
+
   await attachVideoSrc(vSrc, resumeAt);
 
   let ok = false;
   try{
     v.muted = true;
-    const onPlaying = ()=>{ try{ v.muted = false; }catch(_){}
-      try{ a.pause(); a.muted = true; }catch(_){}
+    const onPlaying = ()=>{
+      try{ v.muted = false; }catch(_){}
+      setTimeout(()=>{ try{ a.muted = true; a.volume = 0; }catch(_){} }, 60);
       v.removeEventListener("playing", onPlaying);
     };
     v.addEventListener("playing", onPlaying, { once:true });
@@ -1052,7 +1169,7 @@ async function promoteToVideoNow(reason="unknown"){
   stopBgAdvanceGuard();
 
   if (!ok){
-    try{ a.pause(); a.muted = true; }catch(_){}
+    try{ a.muted = true; a.volume = 0; }catch(_){}
     const ok2 = await safePlay(v);
     if (!ok2){ showNotice("前台播放被阻止，点一下屏幕继续"); installUserGestureUnlock(); }
   }
@@ -1063,88 +1180,70 @@ const switchToAudio = withSwitchLock(async function(){
   if (scrubGuard.active) return;
 
   const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
   const id = player.ids[player.index];
-  const aSrc = audioSrcOf(id);
-  const vSrc = mediaVideoSrcOf(id);
+  const autoPlay = !_userPaused;
 
-  const wasVideoPaused = !!(v && v.paused);
-  const autoPlay = !_userPaused; // 最小化修复：仅以用户是否主动暂停为准，避免二次切后台被误判
-  const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : 0;
-
-  try{
-    await attachAudioSrc(aSrc, resumeAt, {
-      muted: true,
-      ensurePlay: !!autoPlay,
-      seek: 'force'
-    });
-  }catch(_){}
-  try{
-    await attachVideoSrc(vSrc, resumeAt);
-    try{ v.pause(); }catch(_){}
-  }catch(_){}
-
-  try{
+  if (!autoPlay){
+    // 用户已暂停：保持暂停状态，不启动后台播放
+    try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
+    try{ if (v){ v.muted = true; v.pause(); } }catch(_){}
+  } else if (a && !a.paused){
+    // ★ 快速路径：音频已在前台静音播放且 fgSync 保持了位置同步
+    // 交叉切换前做一次精确对齐（数据在缓冲区内，seek 瞬间完成）
+    try{
+      const target = (v.currentTime||0) + (audioBias||0);
+      if (Math.abs((a.currentTime||0) - target) > 0.05){
+        a.currentTime = target;
+      }
+    }catch(_){}
+    try{ a.muted = false; a.volume = Math.max(0.6, a.volume || 0.6); }catch(_){}
+    try{ if (v) v.muted = true; }catch(_){}
+    try{ if (v) v.pause(); }catch(_){}
+  } else {
+    // 慢速兜底：音频未就绪（首次 / 元素被替换 / 异常），完整加载
+    const aSrc = audioSrcOf(id);
+    const resumeAt = Number.isFinite(v?.currentTime) ? v.currentTime : 0;
+    try{ if (v) v.muted = true; }catch(_){}
+    try{
+      await attachAudioSrc(aSrc, resumeAt, {
+        muted: false,
+        ensurePlay: true,
+        seek: 'force'
+      });
+    }catch(_){}
+    try{ if (v) v.pause(); }catch(_){}
+    // 兜底重试
     const aEl = media.a || $("bgAudio");
-    if (autoPlay && aEl){
-      const unmute = ()=>{ try{ aEl.muted = false; aEl.volume = Math.max(0.6, aEl.volume||0.6); }catch(_){}
-        aEl.removeEventListener("playing", unmute);
-      };
-      if (!aEl.paused && aEl.readyState >= 1) unmute();
-      else aEl.addEventListener("playing", unmute);
+    if (aEl && aEl.paused){
+      try{ await aEl.play(); }catch(_){
+        try{
+          await attachAudioSrc(audioSrcOf(id, true), resumeAt,
+            { muted:false, ensurePlay:true, seek:'smart' });
+        }catch(_){}
+      }
     }
   }
-  catch(_){ }
 
-  // 二次兜底：部分 UA 在第二次切到后台时会短暂停止播放，这里延迟重试一次
-  try{
-    const aEl2 = media.a || $("bgAudio");
-    if (autoPlay && aEl2 && aEl2.paused){
-      setTimeout(()=>{ 
-        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && aEl2.paused){ 
-          aEl2.play().catch(()=>{
-            // 如果直接play失败，尝试重新加载源
-            const id = player.ids[player.index];
-            if (id){
-              const resumeAt = Math.max(0, (aEl2.currentTime || 0) - (audioBias || 0));
-              attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
-            }
-          }); 
-        } 
-      }, 250);
-      // 增强：多次重试机制（250ms, 500ms, 1000ms）
-      setTimeout(()=>{ 
-        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
-          const aEl3 = media.a || $("bgAudio");
-          if (aEl3 && aEl3.paused && autoPlay){ 
-            aEl3.play().catch(()=>{});
-          }
-        } 
-      }, 500);
-      setTimeout(()=>{ 
-        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
-          const aEl4 = media.a || $("bgAudio");
-          if (aEl4 && aEl4.paused && autoPlay){ 
-            aEl4.play().catch(()=>{});
-          }
-        } 
-      }, 1000);
-    }
-  }catch(_){ }
-
-  clearUserPaused();
+  if (autoPlay) clearUserPaused();
   playbackMode = "audio";
   updateMediaSessionPlaybackState(); updatePositionState(); startPosTicker();
-  if (autoPlay){ 
-    startBgAdvanceGuard(); 
-    startBgKeepAlive(); 
-    // 增强：确保保活机制已启动，并记录播放时间
+  if (autoPlay){
+    startBgAdvanceGuard();
+    startBgKeepAlive();
     const aFinal = media.a || $("bgAudio");
-    if (aFinal && !aFinal.paused){
-      keepAlive.lastPlayTime = aFinal.currentTime || 0;
+    if (aFinal){
+      resetStallHeartbeat(aFinal);
+      startStallHeartbeat();
+      if (!aFinal.paused){
+        keepAlive.lastMediaTime = aFinal.currentTime || 0;
+        keepAlive.lastCheckTime = Date.now();
+      }
     }
-  } else { 
-    stopBgAdvanceGuard(); 
-    stopBgKeepAlive(); 
+  } else {
+    stopBgAdvanceGuard();
+    stopBgKeepAlive();
+    stopStallHeartbeat();
   }
 });
 
@@ -1183,6 +1282,9 @@ function kickVisWatch(reason="return"){
     }
 
     if (playbackMode === "video" && v){
+      if (_userPaused){
+        clearInterval(visWatchTimer); visWatchTimer=null; return;
+      }
       const ok = await safePlay(v);
       if (!ok){
         showNotice("播放被系统暂停，点一下屏幕继续");
@@ -1200,27 +1302,22 @@ document.addEventListener("visibilitychange", async ()=>{
   if (_repairInProgress) return;  // ★ 修复期间不自动切换到 audio
   if (document.visibilityState === "hidden"){
     await switchToAudio();
-    // 增强：切到后台后立即启动保活和监控
-    const a = media.a || $("bgAudio");
-    if (a && !a.paused && playbackMode === "audio"){
-      startBgKeepAlive();
-      // 延迟检查一次，确保播放真的在继续
-      setTimeout(()=>{
-        if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode === "audio"){
-          const a2 = media.a || $("bgAudio");
-          if (a2 && a2.paused){
-            console.warn("[Visibility] 后台播放被暂停，尝试恢复...");
-            a2.play().catch(()=>{
-              const id = player.ids[player.index];
-              if (id){
-                const resumeAt = Math.max(0, (a2.currentTime || 0) - (audioBias || 0));
-                attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
-              }
-            });
+    // 延迟兜底：检查播放是否被浏览器静默中断（仅在用户没有主动暂停时）
+    setTimeout(()=>{
+      if (_userPaused) return;
+      if (document.visibilityState !== "hidden" || !isPlayerActive() || playbackMode !== "audio") return;
+      const a = media.a || $("bgAudio");
+      if (a && a.paused){
+        console.warn("[Visibility] 后台播放被暂停，尝试恢复...");
+        a.play().catch(()=>{
+          const id = player.ids[player.index];
+          if (id){
+            const resumeAt = Math.max(0, (a.currentTime || 0) - (audioBias || 0));
+            attachAudioSrc(audioSrcOf(id, true), resumeAt, { muted:false, ensurePlay:true, seek:'smart' }).catch(()=>{});
           }
-        }
-      }, 500);
-    }
+        });
+      }
+    }, 800);
   }else{
     await switchToVideo();
     setTimeout(()=> kickVisWatch("visible"), 50);
@@ -1241,11 +1338,12 @@ document.addEventListener("resume", ()=> kickVisWatch("resume"));
 // Page Lifecycle API 支持（更现代的页面状态管理）
 if ('onpageshow' in window){
   window.addEventListener("pageshow", (e)=>{
+    if (_userPaused) return;
     if (e.persisted && isPlayerActive() && playbackMode === "audio"){
-      // 页面从 bfcache 恢复，检查播放状态
       const a = media.a || $("bgAudio");
       if (a && !a.paused){
         setTimeout(()=>{
+          if (_userPaused) return;
           if (a.paused){
             console.warn("[PageLifecycle] 从 bfcache 恢复后播放被暂停，尝试恢复...");
             a.play().catch(()=>{});
@@ -1278,7 +1376,7 @@ document.addEventListener("freeze", ()=>{
   }
 });
 document.addEventListener("resume", ()=>{
-  // 页面从冻结恢复
+  if (_userPaused) return;
   if (isPlayerActive() && playbackMode === "audio"){
     const a = media.a || $("bgAudio");
     if (a && a.paused){
@@ -1317,8 +1415,9 @@ function setMediaSessionMeta(id){
   const title = player.titles[id] || `视频 ${id}`;
   const origin = location.origin;
   const artwork = [
-    { src: `${origin}/media/preview/${id}?s=512`, sizes:"512x512", type:"image/png" },
-    { src: `${origin}/media/preview/${id}?s=128`, sizes:"128x128", type:"image/png" },
+    // 固定 fmt=webp，避免 Accept/Vary 导致的多份缓存
+    { src: `${origin}/media/preview/${id}?s=512&fmt=webp&q=80`, sizes:"512x512", type:"image/webp" },
+    { src: `${origin}/media/preview/${id}?s=128&fmt=webp&q=80`, sizes:"128x128", type:"image/webp" },
   ];
   try { navigator.mediaSession.metadata = new MediaMetadata({ title, artist:"Wallpaper Engine", album: state.path, artwork }); } catch(_){}
   if (!setMediaSessionMeta._installed){
@@ -1350,6 +1449,8 @@ function setMediaSessionMeta(id){
       try{ v.pause(); }catch(_){}
       try{ a.pause(); }catch(_){}
       stopBgKeepAlive();
+      stopBgAdvanceGuard();
+      try{ stopMinuteResync(); }catch(_){}
       updateMediaSessionPlaybackState(); updatePositionState(); stopPosTicker();
     });
 
@@ -1402,7 +1503,6 @@ function installStallListeners(v, a){
   if (!a._stallBound){
     const ah = async ()=> await maybeRepairFromEl('audio', a);
     a.addEventListener('stalled', ah); a.addEventListener('waiting', ah); a.addEventListener('error',   ah);
-    a.addEventListener('playing', ()=> clearUserPaused());
     a._stallBound = true;
   }
 }
@@ -1660,11 +1760,13 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
       el.addEventListener("loadedmetadata", updatePositionState);
       el.addEventListener("durationchange", updatePositionState);
       el.addEventListener("playing", ()=>{
-        clearUserPaused(); updatePositionState(); startPosTicker();
-        if (!isVideo && playbackMode==="audio") startBgKeepAlive();  
+        if (isVideo) clearUserPaused();
+        updatePositionState(); startPosTicker();
+        if (!isVideo && playbackMode==="audio" && !_userPaused) startBgKeepAlive();
       });
       el.addEventListener("pause",   ()=>{
-        if (document.visibilityState==='visible') markUserPaused();
+        // 仅当该元素是主播放源时才标记用户暂停（音频在前台静音跟随时 pause 不算用户意图）
+        if (document.visibilityState==='visible' && (isVideo || playbackMode==='audio')) markUserPaused();
         updatePositionState();
         if (!isVideo) stopBgKeepAlive();                             
       });
@@ -1686,25 +1788,17 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
     a.muted = true; a.volume = 0;
   }catch(_){}
 
-  try{
-    if (wrap.requestFullscreen) await wrap.requestFullscreen({ navigationUI: "hide" });
-    else if (wrap.webkitRequestFullscreen) await wrap.webkitRequestFullscreen();
-  }catch(_){}
-  try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
-
   const btnMenu = $("btnMenu");
   if (btnMenu) btnMenu.onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
 
   const waitReady = new Promise(res=>{
     let done=false;
     const finish=()=>{ if(done) return; done=true; res(); };
-    const vPlaying = ()=> finish();
-    const aPlaying = ()=> finish();
     const killTimer = setTimeout(finish, 2000);
     const cleanup = ()=>{
       clearTimeout(killTimer);
-      try{ v.removeEventListener("playing", vPlaying); }catch(_){}
-      try{ a.removeEventListener("playing", aPlaying); }catch(_){}
+      try{ v.removeEventListener("playing", cleanup); }catch(_){}
+      try{ a.removeEventListener("playing", cleanup); }catch(_){}
     };
     v.addEventListener("playing", ()=>{ cleanup(); finish(); }, {once:true});
     a.addEventListener("playing", ()=>{ cleanup(); finish(); }, {once:true});
@@ -1713,10 +1807,19 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
   wrap.addEventListener("mousemove", wakeOverlay);
   wrap.addEventListener("touchstart", wakeOverlay);
   wakeOverlay();
-
   suspendGridImageLoads();
-  unlockPlaybackOnUserGesture();
+
+  // playIndex BEFORE requestFullscreen: play() needs the user gesture token,
+  // and requestFullscreen() would consume it.
   await playIndex(player.index);
+
+  // fullscreen after playback started (fire-and-forget, user gesture may have expired
+  // but many browsers allow fullscreen shortly after user interaction)
+  try{
+    if (wrap.requestFullscreen) wrap.requestFullscreen({ navigationUI: "hide" }).catch(()=>{});
+    else if (wrap.webkitRequestFullscreen) wrap.webkitRequestFullscreen();
+  }catch(_){}
+  try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
 
   await waitReady;
   hideBusy();
@@ -1763,12 +1866,12 @@ async function playIndex(i, {cacheBust=false, resumeAt=0, forceVideo=false} = {}
   } else {
     // 前台视频模式：先声明 playbackMode，避免 MediaSession/进度条误绑到 audio
     playbackMode = "video";
-    // ★ 确保音频完全停止并静音（避免后台播放音频）
-    try{ if (a){ a.pause(); a.muted = true; a.volume = 0; a.removeAttribute("src"); a.load(); } }catch(_){}
+    // 音频以静音状态持续播放（保持缓冲区热，切后台时只需取消静音、零 seek）
+    try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
+    attachAudioSrc(aSrc, resumeAt||0, { muted:true, ensurePlay:true, seek:'smart' }).catch(()=>{});
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
-    prewarmAudio(aSrc, resumeAt||0, false);
     setMediaSessionMeta(id);
     updatePositionState(); startPosTicker();
     stopBgAdvanceGuard();
@@ -2688,35 +2791,30 @@ async function expandSelectionToItems(){
 const stallHB = {
   active:false,
   timer:null,
-  intervalMs:3000,     // 3s 心跳
+  intervalMs:3000,     // 3s fast-tier heartbeat
   eps:0.2,             // 认为“几乎不动”的阈值（秒）
   needCount:6,         // 连续 6 次（≈18s）
   cooldownMs:45000,    // 掐断间隔 45s
   lastPos:0,
   stallCount:0,
   cooldownUntil:0,
-  lastGoodLogical:0,   // ★ 锚点缓存（逻辑时间）
-  lastWall: 0          // [MIN-FIX#2] 上次墙钟心跳时间（ms, performance.now）
+  lastGoodLogical:0,
+  lastWall: 0,
+  slowPos:0, slowWall:0  // slow-tier: 60s-scale stall detection (replaces minuteResync)
 };
 /* ========================= Gate Heartbeat（前置门卫） =========================
    说明：当前版本有代码在多处调用 start/stop/resetGateBaseline，但函数缺失会导致 JS 直接崩溃，
    进而出现“点修复没任何通知/播放流程异常”等连锁问题。
    这里提供一个“保守实现”：只负责不报错 + 维护基线 + 安全启停（不主动改动播放逻辑）。
 */
-const gateHB = { active:false, timer:null, intervalMs:2000, lastPos:0, lastWall:0 };
-function resetGateBaseline(aEl){
-  try{
-    gateHB.lastPos = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
-    gateHB.lastWall = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
-  }catch(_){
-    gateHB.lastPos = 0;
-    gateHB.lastWall = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
-  }
-}
-function startGateHeartbeat(){
-  if (gateHB.timer) return;
-  gateHB.active = true;
-  gateHB.timer = setInterval(()=>{
+/* gateHB removed: was a dead-end watchdog that interrupted stallHB on every
+   `playing` event, creating ~5s monitoring gaps after each doSilentRestart.
+   Stub functions kept to prevent crashes from any residual call sites. */
+function resetGateBaseline(){}
+function startGateHeartbeat(){}
+function stopGateHeartbeat(){}
+/* dead gateHB code below - wrapped in if(false) to preserve diff history */
+if(false){(function(){
     // 保守：仅保持心跳存在，避免缺失函数导致的崩溃；不在这里触发任何“修复/重启”动作。
     try{
       const aEl = media.a || $("bgAudio");
@@ -2726,11 +2824,7 @@ function startGateHeartbeat(){
       // 轻量更新基线，给未来扩展留接口
       resetGateBaseline(aEl);
     }catch(_){}
-  }, gateHB.intervalMs);
-}
-function stopGateHeartbeat(){
-  gateHB.active = false;
-  if (gateHB.timer){ clearInterval(gateHB.timer); gateHB.timer = null; }
+  })();
 }
 function _logicalAudioTime(aEl){
   const t = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
@@ -2741,7 +2835,9 @@ function resetStallHeartbeat(aEl){
   stallHB.lastPos = Number.isFinite(aEl?.currentTime) ? aEl.currentTime : 0;
   stallHB.cooldownUntil = 0; 
   stallHB.lastGoodLogical = _logicalAudioTime(aEl);
-  stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+  stallHB.lastWall = performance.now();
+  stallHB.slowPos = stallHB.lastPos;
+  stallHB.slowWall = stallHB.lastWall;
 }
 
 /* ★ 抽出：心跳模块音频事件（可在替换音频后重复绑定） */
@@ -2751,32 +2847,22 @@ function bindAudioEventsForStallHBOn(a){
 
   a.addEventListener("playing", ()=>{
     if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
-      // 先 Gate 观察，避免直接进入重型心跳
-      resetGateBaseline(a);
-      stopStallHeartbeat();
-      startGateHeartbeat();
+      resetStallHeartbeat(a);
+      startStallHeartbeat();
     }
   });
   a.addEventListener("pause", ()=>{
-    resetGateBaseline(a);
-    stopGateHeartbeat();
     resetStallHeartbeat(a);
     stopStallHeartbeat();
-    try{ stopMinuteResync(); }catch(_){}
   });
   a.addEventListener("ended", ()=>{
-    resetGateBaseline(a);
-    stopGateHeartbeat();
     resetStallHeartbeat(a);
     stopStallHeartbeat();
-    try{ stopMinuteResync(); }catch(_){}
   });
   a.addEventListener("seeking", ()=>{
-    resetGateBaseline(a);
     resetStallHeartbeat(a);
   });
   a.addEventListener("loadedmetadata", ()=>{
-    resetGateBaseline(a);
     resetStallHeartbeat(a);
   });
 }
@@ -2798,12 +2884,12 @@ function bindAudioCoreEventsAfterReplace(a){
   a.addEventListener("loadedmetadata", updatePositionState);
   a.addEventListener("durationchange", updatePositionState);
   a.addEventListener("playing", ()=>{
-    clearUserPaused(); updatePositionState(); startPosTicker();
-    if (playbackMode==="audio") startBgKeepAlive();
-    try{ startMinuteResync(); }catch(_){}
+    updatePositionState(); startPosTicker();
+    if (playbackMode==="audio" && !_userPaused) startBgKeepAlive();
+    try{ if (!_userPaused) startMinuteResync(); }catch(_){}
   });
   a.addEventListener("pause",   ()=>{
-    if (document.visibilityState==='visible') markUserPaused();
+    if (document.visibilityState==='visible' && playbackMode==='audio') markUserPaused();
     updatePositionState(); stopBgKeepAlive();
   });
 
@@ -2828,10 +2914,10 @@ async function doSilentRestart(oldAudio, phase="stallHB"){
   // [MIN-FIX#1] —— 用墙钟时间推算 resumeAtLogical，避免锚点滞后累积
   const nowMs = performance.now();
   const elapsed = Math.max(0, (nowMs - (stallHB.lastWall || nowMs)) / 1000);
-  const predictedLogical = Math.max(0, (stallHB.lastGoodLogical || 0) + elapsed * 0.9);
+  const predictedLogical = Math.max(0, (stallHB.lastGoodLogical || 0) + elapsed);
   const resumeAtLogical = predictedLogical;
 
-  console.log(`[StallHB] ${phase} restart → resume at ${resumeAtLogical.toFixed(3)}s (logical, +${elapsed.toFixed(2)}s*0.9)`);
+  console.log(`[StallHB] ${phase} restart → resume at ${resumeAtLogical.toFixed(3)}s (logical, +${elapsed.toFixed(2)}s)`);
 
   try{
     // 1) 只创建新元素与 src，不立即播放
@@ -2842,14 +2928,15 @@ async function doSilentRestart(oldAudio, phase="stallHB"){
     newAudio.muted = wasMuted;
     newAudio.volume = wasMuted ? 0 : Math.max(0.6, oldAudio?.volume || 0.6);
 
-    // 2) 等待元数据（可安全 seek）
-    await new Promise((resolve, reject)=>{
-      const onMeta = ()=>{ newAudio.removeEventListener("loadedmetadata", onMeta); resolve(); };
-      const onErr  = (e)=>{ newAudio.removeEventListener("error", onErr); reject(e); };
-      newAudio.addEventListener("loadedmetadata", onMeta);
-      newAudio.addEventListener("error", onErr);
-      newAudio.load();
-    });
+    // 2) 等待元数据（可安全 seek），带 8s 超时防止后台网络节流导致永久挂起
+    await Promise.race([
+      new Promise((resolve, reject)=>{
+        newAudio.addEventListener("loadedmetadata", resolve, { once:true });
+        newAudio.addEventListener("error", reject, { once:true });
+        newAudio.load();
+      }),
+      new Promise((_, reject)=> setTimeout(()=> reject(new Error("metadata timeout")), 8000))
+    ]);
 
     // 同步/计算新的 bias
     audioBias = computeAudioBias(newAudio);
@@ -2870,17 +2957,21 @@ async function doSilentRestart(oldAudio, phase="stallHB"){
     };
     newAudio.addEventListener("timeupdate", verifyOnce, { once:true });
 
-    // 4) 替换旧的 bgAudio 元素
+    // 4) 显式清理旧元素（停止缓冲/网络），然后替换
     const old = $("bgAudio");
-    if (old && old.parentNode) old.parentNode.replaceChild(newAudio, old);
+    if (old){
+      try{ old.pause(); }catch(_){}
+      try{ old.removeAttribute("src"); old.load(); }catch(_){}
+      if (old.parentNode) old.parentNode.replaceChild(newAudio, old);
+    }
     newAudio.id = "bgAudio";
     media.a = newAudio;
 
     // 5) 重新绑定项目依赖的所有音频事件
     bindAudioCoreEventsAfterReplace(newAudio);
 
-    // 6) 播放（如原先在播放）
-    if (!wasPaused){
+    // 6) 播放（如原先在播放，且用户没有主动暂停）
+    if (!wasPaused && !_userPaused){
       try { await newAudio.play(); } catch (err) {
         console.warn("[StallHB] play() failed:", err);
       }
@@ -2889,7 +2980,13 @@ async function doSilentRestart(oldAudio, phase="stallHB"){
     // 7) 刷新心跳基线与锚点 & 记下墙钟
     stallHB.lastPos = Number.isFinite(newAudio.currentTime) ? newAudio.currentTime : 0;
     stallHB.lastGoodLogical = resumeAtLogical;
-    stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+    stallHB.lastWall = performance.now();
+
+    // 8) 刷新 MediaSession（Chrome 在进度停滞后可能移除通知，需要主动恢复）
+    try{ setMediaSessionMeta(id); }catch(_){}
+    updateMediaSessionPlaybackState();
+    updatePositionState();
+    startPosTicker();
 
     console.log(`[StallHB] restart complete, playing from ${resumeAtLogical.toFixed(3)}s (logical), bias=${(audioBias||0).toFixed(3)}s`);
   }catch(err){
@@ -2907,7 +3004,6 @@ function startStallHeartbeat(){
   if (!a) return;
   if (document.visibilityState !== "hidden") return;
   if (playbackMode !== "audio") return;
-  if (a.paused) return;
 
   resetStallHeartbeat(a);
   stallHB.active = true;
@@ -2916,7 +3012,30 @@ function startStallHeartbeat(){
   stallHB.timer = setInterval(async ()=>{
     const aEl = media.a || $("bgAudio");
     if (!isPlayerActive() || playbackMode!=="audio" || !aEl){ stopStallHeartbeat(); return; }
-    if (document.visibilityState!=="hidden" || aEl.paused) return;
+    if (document.visibilityState!=="hidden") return;
+    if (_userPaused) return;
+
+    // browser-paused: Chrome may pause the audio element without user intent
+    if (aEl.paused){
+      stallHB.lastWall = performance.now();
+      stallHB.stallCount++;
+      if (stallHB.stallCount >= stallHB.needCount){
+        if (performance.now() >= stallHB.cooldownUntil){
+          console.warn("[StallHB] audio paused by browser, restarting");
+          await doSilentRestart(aEl, "browser-paused");
+          const aa = media.a || $("bgAudio");
+          stallHB.cooldownUntil = performance.now() + stallHB.cooldownMs;
+          stallHB.stallCount = 0;
+          stallHB.lastPos = Number.isFinite(aa?.currentTime) ? aa.currentTime : 0;
+          stallHB.lastGoodLogical = _logicalAudioTime(aa);
+          stallHB.lastWall = performance.now();
+          stallHB.slowPos = stallHB.lastPos;
+          stallHB.slowWall = stallHB.lastWall;
+        } else { stallHB.stallCount = 0; }
+      }
+      return;
+    }
+
     if (aEl.seeking) { resetStallHeartbeat(aEl); return; }
     if (scrubGuard.active) return;
     if (stallRepair.inFlight) return;
@@ -2932,11 +3051,11 @@ function startStallHeartbeat(){
       // ★ 进度在向前，更新锚点为“最近一次可靠播放时间（逻辑）”
       stallHB.lastGoodLogical = _logicalAudioTime(aEl);
       stallHB.stallCount = 0;
-      return;
     } else {
       stallHB.stallCount++;
     }
 
+    // fast-tier: 6 consecutive stalls (~18s) -> restart
     if (stallHB.stallCount >= stallHB.needCount){
       if (performance.now() < stallHB.cooldownUntil){
         stallHB.stallCount = 0;
@@ -2944,23 +3063,49 @@ function startStallHeartbeat(){
       }
       // ★ 改为“硬重启”以保证后台 seek 生效
       await doSilentRestart(aEl, "stallHB");
-
-      // 进入冷却并刷新基线
       const aa = media.a || $("bgAudio");
       stallHB.cooldownUntil = performance.now() + stallHB.cooldownMs;
       stallHB.stallCount = 0;
       stallHB.lastPos = Number.isFinite(aa?.currentTime) ? aa.currentTime : 0;
       stallHB.lastGoodLogical = _logicalAudioTime(aa);
-      stallHB.lastWall = performance.now(); // [MIN-FIX#2]
+      stallHB.lastWall = performance.now();
+      stallHB.slowPos = stallHB.lastPos;
+      stallHB.slowWall = stallHB.lastWall;
+      return;
+    }
+
+    // slow-tier (~60s check, replaces standalone minuteResync)
+    const _slowElapsed = stallHB.lastWall - stallHB.slowWall;
+    if (_slowElapsed >= 60000){
+      const _slowAdv = pos - stallHB.slowPos;
+      stallHB.slowPos = pos;
+      stallHB.slowWall = stallHB.lastWall;
+      if (_slowAdv < 1 && performance.now() >= stallHB.cooldownUntil){
+        console.warn("[StallHB] slow-tier: <1s progress in 60s, restarting");
+        await doSilentRestart(aEl, "slow-tier");
+        const ab = media.a || $("bgAudio");
+        stallHB.cooldownUntil = performance.now() + stallHB.cooldownMs;
+        stallHB.stallCount = 0;
+        stallHB.lastPos = Number.isFinite(ab?.currentTime) ? ab.currentTime : 0;
+        stallHB.lastGoodLogical = _logicalAudioTime(ab);
+        stallHB.lastWall = performance.now();
+        stallHB.slowPos = stallHB.lastPos;
+        stallHB.slowWall = stallHB.lastWall;
+      }
     }
   }, stallHB.intervalMs);
 }
 
 /* === 静音每分钟重播对齐（Minute Resync） === */
-const _minuteResync = { timer:null, active:false, periodMs:60000 };
-function startMinuteResync(){
+/* minuteResync logic merged into stallHB slow-tier. Stub functions kept for call-site compat. */
+function startMinuteResync(){}
+function stopMinuteResync(){}
+if(false){
+const _minuteResync = { timer:null, active:false, periodMs:60000, lastPos:undefined };
+function _startMinuteResync_removed(){
   if (_minuteResync.active) return;
   _minuteResync.active = true;
+  _minuteResync.lastPos = undefined;
   if (_minuteResync.timer) clearInterval(_minuteResync.timer);
   _minuteResync.timer = setInterval(async ()=>{
     try{
@@ -2970,35 +3115,33 @@ function startMinuteResync(){
       if (aEl.paused || aEl.seeking) return;
       if (scrubGuard.active || stallRepair.inFlight) return;
       // 每周期进行一次“硬重播+对齐”以防 UA 挂起静音段
-      await doSilentRestart(aEl, "minute-resync");
+      const _mr_now = aEl.currentTime || 0;
+      const _mr_prev = _minuteResync.lastPos;
+      _minuteResync.lastPos = _mr_now;
+      if (_mr_prev !== undefined && (_mr_now - _mr_prev) < 1){
+        await doSilentRestart(aEl, "minute-resync");
+      }
     }catch(_){}
   }, _minuteResync.periodMs);
 }
-function stopMinuteResync(){
-  _minuteResync.active = false;
-  if (_minuteResync.timer){ clearInterval(_minuteResync.timer); _minuteResync.timer = null; }
-}
-/* === 静音每分钟重播对齐（Minute Resync）·完 === */
+} /* end if(false) - dead minuteResync code */
 
-/* —— 生命周期：使用 Gate 作为前置，再决定是否进入 stallHB —— */
+/* —— stallHB lifecycle: start/stop on visibility change —— */
 document.addEventListener("visibilitychange", ()=>{
   if (_repairInProgress) return;  // ★ 修复期间不触发心跳切换
   const a = media.a || $("bgAudio");
   if (!a) return;
-  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && !a.paused){
-    resetGateBaseline(a);
-    stopStallHeartbeat();
-    startGateHeartbeat();     startMinuteResync(); // 先门卫，再纯心跳
+  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
+    resetStallHeartbeat(a);
+    startStallHeartbeat();
   } else {
-    stopGateHeartbeat();
     stopStallHeartbeat();
-  stopMinuteResync(); }
+  }
 });
 
 /* —— 兜底：极少设备不发 visibilitychange，这里每 5s 尝试一次 —— */
 setInterval(()=>{
-  const a = media.a || $("bgAudio");
-  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio" && a && !a.paused){
+  if (document.visibilityState === "hidden" && isPlayerActive() && playbackMode==="audio"){
     startStallHeartbeat();
   }
 }, 5000);
