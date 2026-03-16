@@ -183,10 +183,9 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 .icon-btn.menu{ right:14px; }
 
 /* 默认隐藏返回按钮 */
-.icon-btn.back{ display:none !important; }
+.icon-btn.back{ display:flex !important; left:14px; }
 
 /* ★ 仅在“桌面 UA”下显示返回按钮（左上角） */
-html.is-desktop .icon-btn.back{ display:flex !important; left:14px; }
 
 .playerfs.idle .icon-btn{ opacity:0; }
 
