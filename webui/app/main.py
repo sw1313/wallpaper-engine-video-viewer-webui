@@ -38,6 +38,9 @@ APP_DIR       = os.path.dirname(__file__)
 DATA_DIR      = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# SW 脚本路径（放根路径以便 scope='/' 拦截 /media/preview）
+SW_FILE = os.path.join(APP_DIR, "static", "sw.js")
+
 # === 新增：纯音频缓存目录 ===
 AUDIO_CACHE_DIR = os.getenv("AUDIO_CACHE_DIR", os.path.join(DATA_DIR, "audio_cache"))
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
@@ -1397,6 +1400,50 @@ def _start_audio_cache_cleaner():
 # 启动后台清理线程（模块加载即启动；daemon 不阻塞退出）
 _start_audio_cache_cleaner()
 
+def _verify_audio_timestamps(audio_path: str, video_src: str, vid: str) -> bool:
+    """Check that extracted audio starts near t=0 and duration matches the source video."""
+    try:
+        probe_audio = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", "-select_streams", "a:0",
+             audio_path],
+            capture_output=True, text=True, timeout=10)
+        ainfo = json.loads(probe_audio.stdout)
+
+        fmt_start = float(ainfo.get("format", {}).get("start_time", "0") or "0")
+        streams = ainfo.get("streams", [])
+        stream_start = float(streams[0].get("start_time", "0") or "0") if streams else 0.0
+        audio_dur = float(ainfo.get("format", {}).get("duration", "0") or "0")
+
+        start = max(fmt_start, stream_start)
+        if start > 0.5:
+            print(f"[AUDIO_CACHE] copy has start_time={start:.2f}s, "
+                  f"falling back to transcode for {vid}")
+            return False
+
+        # Also compare durations: if audio is significantly longer than the
+        # source video, there's a hidden timestamp offset (e.g. edit lists).
+        try:
+            probe_video = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_format", video_src],
+                capture_output=True, text=True, timeout=10)
+            vinfo = json.loads(probe_video.stdout)
+            video_dur = float(vinfo.get("format", {}).get("duration", "0") or "0")
+            if video_dur > 0 and audio_dur > 0:
+                diff = audio_dur - video_dur
+                if diff > 1.0:
+                    print(f"[AUDIO_CACHE] audio duration ({audio_dur:.1f}s) exceeds "
+                          f"video ({video_dur:.1f}s) by {diff:.1f}s, "
+                          f"falling back to transcode for {vid}")
+                    return False
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return True
+
 def _ensure_audio_cached(vid: str, src_path: str) -> Tuple[str, str]:
     """
     返回 (cached_path, mime)。
@@ -1445,8 +1492,19 @@ def _ensure_audio_cached(vid: str, src_path: str) -> Tuple[str, str]:
         ok = False
         try:
             subprocess.run(cmd_copy, check=True)
-            ok = True
+            if os.path.isfile(tmp_path):
+                ok = _verify_audio_timestamps(tmp_path, src_path, vid)
+            else:
+                ok = False
         except Exception:
+            ok = False
+
+        if not ok:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
             try:
                 subprocess.run(cmd_transcode, check=True)
                 ok = True
@@ -1569,6 +1627,21 @@ def health():
     "workshop_exists": work_ok,
     "workshop_has_digit_dirs": work_has_dirs
   }
+
+# =======================
+# Service Worker（/sw.js）
+# =======================
+@app.get("/sw.js")
+def service_worker():
+  """
+  Service Worker 必须在根路径或更高层级，才能覆盖 /media/*。
+  这里从 static/sw.js 直出，禁止强缓存以便更新。
+  """
+  if not os.path.isfile(SW_FILE):
+    raise HTTPException(404, detail="sw-not-found")
+  return FileResponse(SW_FILE, media_type="application/javascript", headers={
+    "Cache-Control": "no-cache",
+  })
 
 # =======================
 # ★ 新增：取消订阅（服务器端队列 + 脚本回调），最小化集成
