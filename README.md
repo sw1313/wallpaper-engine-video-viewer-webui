@@ -11,9 +11,6 @@
   - **双指右滑**：返回上一级（目录内返回上一目录；播放器内退出播放并返回来源目录）
   - **双指双击**：锁定/解锁所有触摸操作
 
-## 移动端动态壁纸
-
-可配合 [Lively Wallpapers-With Website](https://play.google.com/store/apps/details?id=com.nuko.livewebwallpaper)（Android）将本 WebUI 的页面设为桌面动态壁纸，从而**无需使用官方 Wallpaper Engine 手动转换壁纸格式、无需官方手机版壁纸引擎、无需在手机本地存储壁纸文件**，即可在手机上使用视频格式的动态壁纸（由服务端流式提供）。
 
 ## 环境与配置
 
