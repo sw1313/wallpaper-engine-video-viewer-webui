@@ -128,10 +128,26 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 @keyframes skel { 0%{background-position:200% 0;} 100%{background-position:-200% 0;} }
 
 /* 右键菜单 */
-.ctxmenu{ position:fixed; z-index:1000; min-width:210px; background:#fff; border:1px solid #e0e0e0; border-radius:8px; box-shadow:0 10px 24px rgba(0,0,0,.12); overflow:hidden; }
-.ctxmenu .item{ padding:10px 12px; font-size:14px; color:#222; cursor:pointer; white-space:nowrap; }
+.ctxmenu{
+  position:fixed; z-index:1000; min-width:210px;
+  background:#fff; border:1px solid #e0e0e0; border-radius:8px;
+  box-shadow:0 10px 24px rgba(0,0,0,.12); overflow:hidden;
+}
+.ctxmenu .item{
+  padding:10px 12px; font-size:14px; color:#222;
+  cursor:pointer; white-space:nowrap; position:relative;
+}
 .ctxmenu .item:hover{ background:#f0f6ff; }
 .ctxmenu .sep{ height:1px; background:#efefef; margin:4px 0; }
+.ctxmenu .item.has-submenu::after{
+  content:"▶"; position:absolute; right:10px; top:50%;
+  transform:translateY(-50%); font-size:11px; color:#888;
+}
+
+/* 二级菜单容器：与主菜单样式相同，但 z-index 更高 */
+.ctxsubmenu{
+  z-index:1001;
+}
 
 /* 二级菜单（用于“移动到…”）：限制高度≈5行，并允许滚轮/滚动条/触摸滑动 */
 .ctxmenu.move-submenu{
@@ -187,7 +203,7 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 
 /* ★ 仅在“桌面 UA”下显示返回按钮（左上角） */
 
-.playerfs.idle .icon-btn{ opacity:0; }
+.playerfs.idle .icon-btn{ opacity:0; pointer-events:none; }
 
 /* 半透明遮罩：点击可收起播放列表 */
 .shade{
@@ -231,10 +247,20 @@ img { -webkit-user-drag:none; user-select:none; -webkit-touch-callout:none; }
 #plist .dot{ width:8px; height:8px; border-radius:8px; background:#bbb; }
 #plist li.active .dot{ background:#007fff; }
 
+.switch-cover{
+  position:absolute; left:0; top:0; width:100vw; height:100vh;
+  object-fit:contain; z-index:15; display:none; background:#000;
+}
+.playerfs.switching .switch-cover{ display:block; }
+.playerfs.switching video{ visibility:hidden; }
+.playerfs.switching .overlay{ visibility:hidden; pointer-events:none; }
+
 .playerfs.locked{
   touch-action:none; overscroll-behavior:contain;
 }
 .playerfs.locked video{ pointer-events:none; }
+.playerfs.touch-locked video{ pointer-events:none !important; }
+.playerfs.touch-locked .overlay{ pointer-events:none !important; visibility:hidden !important; }
 
 .inf-status{ text-align:center; padding:12px 10px; color:#666; font-size:13px; }
 .sentinel{ width:100%; height:1px; }
