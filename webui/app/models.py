@@ -27,5 +27,8 @@ class ScanResponse(BaseModel):
 class DeleteRequest(BaseModel):
     ids: List[str]
 
+class FolderDeleteRequest(BaseModel):
+    paths: List[str]
+
 class PlaylistRequest(BaseModel):
     ids: List[str]
