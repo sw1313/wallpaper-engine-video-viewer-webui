@@ -24,12 +24,10 @@ from pydantic import BaseModel
 
 from .we_scan import (
     load_we_config, extract_folders_list, build_folder_tree, scan_workshop_items,
-    collect_unassigned_items, find_node_by_path, all_ids_recursive, delete_id_dir
+    collect_unassigned_items, find_node_by_path, all_ids_recursive, delete_id_dir,
+    create_folder as ws_create_folder, move_items as ws_move_items, delete_folders as ws_delete_folders,
 )
-from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest
-
-# ★ 新增：导入 we_scan 的写操作（生成 .bak 再写入）
-from .we_scan import create_folder as ws_create_folder, move_items as ws_move_items  # ★ 新增
+from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest, FolderDeleteRequest
 
 # === 可配置路径 ===
 WORKSHOP_PATH = os.getenv("WORKSHOP_PATH", "/data/workshop/content/431960")
@@ -221,6 +219,12 @@ def _invalidate_scan_cache():  # ★ 新增
   with _SCAN_LOCK:
     _SCAN_CACHE["ts"] = 0.0
     _SCAN_CACHE["path_map"] = None
+
+@app.post("/api/scan/refresh")
+def api_scan_refresh():
+  """使扫描缓存失效，下次 /api/scan 将重新扫描文件列表。供前端「刷新」按钮调用。"""
+  _invalidate_scan_cache()
+  return {"ok": True}
 
 def _build_video_out(id_map, vid_id) -> VideoOut:
   v = id_map[vid_id]
@@ -454,6 +458,13 @@ def api_delete(req: DeleteRequest):
     if ok: deleted.append(vid)
     else: skipped.append(vid)
   return {"deleted": deleted, "skipped": skipped}
+
+# === 从 config.json 的 folders 结构中删除若干文件夹（不碰物理文件）===
+@app.post("/api/folder/delete")
+def api_folder_delete(req: FolderDeleteRequest):
+  removed = ws_delete_folders(WE_PATH, req.paths or [])
+  _invalidate_scan_cache()
+  return {"removed": removed}
 
 # （保留 m3u 接口）
 @app.post("/api/playlist")
