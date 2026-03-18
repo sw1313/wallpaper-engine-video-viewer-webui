@@ -7,7 +7,7 @@ let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:""
   selV:new Set(), selF:new Set(), lastIdx:null, tiles:[], dragging:false, dragStart:null, keepSelection:false,
   isLoading:false, hasMore:true, queryKey:"" };
 
-let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/" };
+let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/", loop:false, returnScrollY:0 };
 
 let media = { v: null, a: null };
 let playbackMode = "video";
@@ -717,8 +717,10 @@ let userGestureUnlocked = false;
 async function unlockPlaybackOnUserGesture(){
   if (userGestureUnlocked) return;
   const a = $("bgAudio"), v = $("fsVideo");
-  try { await a.play(); a.pause(); userGestureUnlocked = true; }
-  catch { try { await v.play(); v.pause(); userGestureUnlocked = true; } catch{} }
+  // Only attempt unlock if elements have a valid src; calling play() on empty elements
+  // wastes the user gesture token on some browsers.
+  if (a && a.src) { try { await a.play(); a.pause(); userGestureUnlocked = true; return; } catch{} }
+  if (v && v.src) { try { await v.play(); v.pause(); userGestureUnlocked = true; return; } catch{} }
 }
 function installUserGestureUnlock(){
   const once = async ()=>{
@@ -733,15 +735,20 @@ function installUserGestureUnlock(){
   document.addEventListener("click", once, {passive:true});
   document.addEventListener("keydown", once, {passive:true});
 }
-window.addEventListener("load", installUserGestureUnlock);
 
 /* --- 全屏返回栈 --- */
+let _lastPlayIndexTS = 0;
 function installPopStateGuard(){
   window.addEventListener("popstate", () => {
-    if (isPlayerActive()){
-      fsOverlayInHistory = false;
-      exitPlayer();
+    if (!isPlayerActive()) return;
+    // During or shortly after track switching, Android Chrome may fire spurious
+    // popstate events (e.g. fullscreen state changes). Block them and re-push.
+    if (_switchingAdvanceLock || (Date.now() - _lastPlayIndexTS < 3000)) {
+      try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
+      return;
     }
+    fsOverlayInHistory = false;
+    exitPlayer();
   });
 }
 installPopStateGuard();
@@ -791,7 +798,12 @@ installPopStateGuard();
     if (window.__touchLocked) return;
     if (isPlayerActive()){
       exitPlayer();
-      if (player.returnPath) navigateToPath(player.returnPath);
+      // 同一路径下仅退出播放器并恢复滚动，不刷新列表
+      let curPath = "/";
+      try{ curPath = (typeof state !== "undefined") ? state.path : pathFromHash(); }catch(_){}
+      if (player.returnPath && player.returnPath !== curPath){
+        navigateToPath(player.returnPath);
+      }
       return;
     }
     const p = (typeof state !== "undefined") ? state.path : pathFromHash();
@@ -826,6 +838,8 @@ installPopStateGuard();
         _lastTwoFingerTap = 0;
         _touchLocked = !_touchLocked;
         window.__touchLocked = _touchLocked;
+        const pfs = document.getElementById("playerFS");
+        if (pfs) pfs.classList.toggle("touch-locked", _touchLocked);
         return;
       }
       _lastTwoFingerTap = now;
@@ -858,12 +872,11 @@ function enforceNoPIP(v){
 /* --- play 封装 --- */
 async function safePlay(el){
   try { await el.play(); return true; } catch(_) {
-    // fallback: muted autoplay always succeeds, then unmute
     try{
-      const wasMuted = el.muted;
       el.muted = true;
       await el.play();
-      el.muted = wasMuted;
+      // Unmute after a short delay — immediate unmute may be blocked on some browsers
+      setTimeout(()=>{ try{ el.muted = false; }catch(_){} }, 80);
       return true;
     }catch(_2){ return false; }
   }
@@ -1389,6 +1402,7 @@ document.addEventListener("resume", ()=>{
 /* —— 结束→下一集 —— */
 let lastAdvanceId = null;
 function advanceToNextOnce(){
+  if (_switchingAdvanceLock) return;
   const curId = player.ids[player.index];
   if (lastAdvanceId === curId) return;
   lastAdvanceId = curId;
@@ -1700,15 +1714,23 @@ function removeFsGuards(){
 }
 
 /* 进入播放器 */
-async function startPlaylist(items, startIndex=0, returnPath=null){
+async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   cancelProgressive();
 
   showBusy("正在准备播放器…");
+
+  // 记录进入播放器前的滚动位置，便于退出时恢复
+  try{
+    if (typeof window !== "undefined"){
+      player.returnScrollY = window.scrollY || document.documentElement.scrollTop || 0;
+    }
+  }catch(_){}
 
   player.ids = items.map(x=>x.id);
   player.titles = {}; items.forEach(x=> player.titles[x.id] = x.title || `视频 ${x.id}`);
   player.index = Math.max(0, Math.min(startIndex, player.ids.length-1));
   player.returnPath = returnPath || state.path;
+  player.loop = !!options.loop;
 
   const wrap = $("playerFS");
   const v = $("fsVideo");
@@ -1730,11 +1752,17 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
     wrap.appendChild(backBtn);
   }
   backBtn.onclick = ()=>{
-    try{
-      if (fsOverlayInHistory){ history.back(); fsOverlayInHistory = false; return; }
-    }catch(_){}
     exitPlayer();
-    if (player.returnPath) navigateToPath(player.returnPath);
+    // 如果仍在同一路径，仅退出播放器并恢复滚动，不重新刷新列表
+    let curPath = "/";
+    try{ curPath = (typeof state !== "undefined") ? state.path : pathFromHash(); }catch(_){}
+    if (player.returnPath && player.returnPath !== curPath){
+      navigateToPath(player.returnPath);
+    }
+    if (fsOverlayInHistory){
+      fsOverlayInHistory = false;
+      try { history.back(); } catch(_) {}
+    }
   };
 
   document.documentElement.classList.add("noscroll");
@@ -1826,29 +1854,47 @@ async function startPlaylist(items, startIndex=0, returnPath=null){
 }
 
 /* ★ 切集 / 首次播放 */
+let _switchingAdvanceLock = false;
 async function playIndex(i, {cacheBust=false, resumeAt=0, forceVideo=false} = {}){
+  _switchingAdvanceLock = true;
+  _lastPlayIndexTS = Date.now();
   player.index = i;
   stallRepair.startedOnce = false;
   lastAdvanceId = null;
   disarmFirstPlayWatch();
   stallRepair.startedAt = Date.now();
 
+  const wrap = $("playerFS");
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  const cover = $("switchCover");
+
+  // Capture last frame onto canvas overlay so video element stays hidden during src switch
+  if (document.visibilityState !== "hidden" && cover){
+    try{
+      if (v.videoWidth > 0 && v.readyState >= 2){
+        cover.width = v.videoWidth; cover.height = v.videoHeight;
+        cover.getContext("2d").drawImage(v, 0, 0);
+      }
+    }catch(_){}
+  }
+  wrap.classList.add("switching");
+
   const a0 = media.a || $("bgAudio");
   if (a0){ try{ a0.muted = true; a0.volume = 0; }catch(_){ } }
 
   const id = player.ids[i];
-  // ★ 如果这个视频刚修复过，强制 cacheBust + 强制视频模式
   if (_repairedVideos.has(String(id))){
     cacheBust = true;
-    forceVideo = true;  // 修复后首次播放强制使用视频模式
-    // 播放一次后就从集合里移除（避免永远 cacheBust）
+    forceVideo = true;
     _repairedVideos.delete(String(id));
   }
-  const v = media.v || $("fsVideo");
-  const a = media.a || $("bgAudio");
   const vSrc = mediaVideoSrcOf(id, cacheBust);
   const aSrc = audioSrcOf(id, cacheBust);
   injectVideoPreload(vSrc);
+
+  // Single-video loop: let browser handle it natively
+  v.loop = (player.loop && player.ids.length === 1);
 
   if (document.visibilityState === "hidden" && !forceVideo) {
     audioBias = 0;
@@ -1864,13 +1910,13 @@ async function playIndex(i, {cacheBust=false, resumeAt=0, forceVideo=false} = {}
     startBgKeepAlive();
     armFirstPlayWatch(id, a);
   } else {
-    // 前台视频模式：先声明 playbackMode，避免 MediaSession/进度条误绑到 audio
     playbackMode = "video";
-    // 音频以静音状态持续播放（保持缓冲区热，切后台时只需取消静音、零 seek）
     try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
-    attachAudioSrc(aSrc, resumeAt||0, { muted:true, ensurePlay:true, seek:'smart' }).catch(()=>{});
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
+    // Audio preload AFTER video play: v.play() must consume the user gesture first,
+    // otherwise a.play() (even muted) may consume it on some Chrome builds.
+    attachAudioSrc(aSrc, resumeAt||0, { muted:true, ensurePlay:true, seek:'smart' }).catch(()=>{});
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
     setMediaSessionMeta(id);
     updatePositionState(); startPosTicker();
@@ -1881,6 +1927,9 @@ async function playIndex(i, {cacheBust=false, resumeAt=0, forceVideo=false} = {}
   startFgSync();
   renderPlaylistPanel();
 
+  wrap.classList.remove("switching");
+
+  _switchingAdvanceLock = false;
   resetStallHeartbeat(a);
 }
 
@@ -1905,7 +1954,10 @@ function renderPlaylistPanel(){
     ul.appendChild(li);
   });
 }
-async function nextInPlaylist(){ if (player.index < player.ids.length - 1) await playIndex(player.index + 1, { resumeAt: 0 }); }
+async function nextInPlaylist(){
+  if (player.index < player.ids.length - 1){ await playIndex(player.index + 1, { resumeAt: 0 }); return; }
+  if (player.loop && player.ids.length > 0){ await playIndex(0, { resumeAt: 0 }); }
+}
 
 async function exitPlayer(){
   cancelProgressive();
@@ -1918,6 +1970,8 @@ async function exitPlayer(){
   try { v.removeAttribute("src"); v.load(); } catch(_){}
   try { a.removeAttribute("src"); a.load(); } catch(_){}
   wrap.style.display = "none";
+  wrap.classList.remove("touch-locked", "switching");
+  window.__touchLocked = false;
   $("playlistPanel").classList.add("hidden");
   stopBgAdvanceGuard(); stopPosTicker(); stopFgSync(); stopBgKeepAlive();
   resumeGridImageLoads();
@@ -1925,6 +1979,14 @@ async function exitPlayer(){
   document.documentElement.classList.remove("noscroll");
   document.body.classList.remove("noscroll");
   removeFsGuards();
+
+  // 恢复进入播放器前的滚动位置
+  try{
+    if (typeof window !== "undefined"){
+      const y = player.returnScrollY || 0;
+      window.scrollTo(0, y);
+    }
+  }catch(_){}
 }
 
 function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
@@ -2462,8 +2524,26 @@ function bindDelegatedEvents(){
   })();
 }
 
+function positionMenuEl(menu, x, y){
+  const vw = window.innerWidth, vh = window.innerHeight;
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+  // 读出实际尺寸后再微调，保证完全落在可视区域内
+  const rect = menu.getBoundingClientRect();
+  let nx = rect.left, ny = rect.top;
+  if (rect.right > vw) nx = Math.max(4, vw - rect.width - 4);
+  if (rect.bottom > vh) ny = Math.max(4, vh - rect.height - 4);
+  if (rect.left < 0) nx = 4;
+  if (rect.top < 0) ny = 4;
+  menu.style.left = nx + "px";
+  menu.style.top  = ny + "px";
+}
+
 function openContextMenu(x,y){
-  const menu = $("ctxmenu"); menu.innerHTML=""; menu.style.display="block";
+  const menu = $("ctxmenu");
+  const submenu = $("ctxsubmenu");
+  menu.innerHTML=""; menu.style.display="block";
+  if (submenu){ submenu.style.display="none"; }
   try{ menu.classList.remove("move-submenu"); }catch(_){}
   const selCount = state.selV.size + state.selF.size;
   const onlyOne = selCount === 1;
@@ -2476,7 +2556,107 @@ function openContextMenu(x,y){
     menu.addEventListener("pointerdown", (e)=>{ try{ e.stopPropagation(); }catch(_){} }, {passive:true});
   }
 
-  function add(text, fn, {keepOpen=false}={}){
+  function hideSubmenu(){
+    const sm = $("ctxsubmenu");
+    if (sm) sm.style.display = "none";
+  }
+
+  function openInlineSubMenu(anchorEl, entries, opts={}){
+    const sm = $("ctxsubmenu");
+    if (!sm) return;
+    const paged = !!opts.paged;
+    const all = entries || [];
+    const vh = window.innerHeight || 800;
+    const vw = window.innerWidth || 1200;
+    const ar = anchorEl.getBoundingClientRect();
+
+    function renderItems(list){
+      list.forEach(ent=>{
+        const d = document.createElement("div");
+        d.className = "item";
+        d.textContent = ent.text;
+        d.onclick = ()=>{ hideMenu(); ent.fn && ent.fn(); };
+        sm.appendChild(d);
+      });
+    }
+
+    function positionSm(){
+      const r = sm.getBoundingClientRect();
+      let left = ar.right;
+      if (left + r.width > vw) left = ar.left - r.width - 2;
+      let top = ar.top;
+      if (top + r.height > vh) top = Math.max(4, vh - r.height - 4);
+      if (top < 0) top = 4;
+      sm.style.left = left + "px";
+      sm.style.top  = top + "px";
+    }
+
+    if (!paged){
+      sm.innerHTML = "";
+      renderItems(all);
+      sm.style.display = "block";
+      positionSm();
+      return;
+    }
+
+    // 先尝试全部渲染，测量实际高度
+    sm.innerHTML = "";
+    renderItems(all);
+    sm.style.display = "block";
+    sm.style.left = "-9999px"; sm.style.top = "0";
+    const actualH = sm.getBoundingClientRect().height;
+    const maxH = vh - 20;
+
+    if (actualH <= maxH){
+      // 实际高度可以放下：不分页，只调整位置
+      anchorEl._submenuOffset = 0;
+      positionSm();
+      return;
+    }
+
+    // 实际高度放不下：需要分页
+    const itemCount = sm.querySelectorAll(".item").length;
+    const lineH = itemCount > 0 ? actualH / itemCount : 36;
+    const MAX_VISIBLE = Math.max(4, Math.floor(maxH / lineH));
+    let start = anchorEl._submenuOffset || 0;
+    start = Math.max(0, Math.min(start, all.length - MAX_VISIBLE));
+    const end = Math.min(all.length, start + MAX_VISIBLE);
+
+    sm.innerHTML = "";
+    if (start > 0){
+      const up = document.createElement("div");
+      up.className = "item";
+      up.textContent = "▲";
+      up.onclick = (e)=>{
+        e.stopPropagation();
+        anchorEl._submenuOffset = Math.max(0, start - MAX_VISIBLE);
+        openInlineSubMenu(anchorEl, all, {paged:true});
+      };
+      sm.appendChild(up);
+    }
+    for (let i=start;i<end;i++){
+      const ent = all[i];
+      const d = document.createElement("div");
+      d.className = "item";
+      d.textContent = ent.text;
+      d.onclick = ()=>{ hideMenu(); ent.fn && ent.fn(); };
+      sm.appendChild(d);
+    }
+    if (end < all.length){
+      const down = document.createElement("div");
+      down.className = "item";
+      down.textContent = "▼";
+      down.onclick = (e)=>{
+        e.stopPropagation();
+        anchorEl._submenuOffset = Math.min(all.length - MAX_VISIBLE, start + MAX_VISIBLE);
+        openInlineSubMenu(anchorEl, all, {paged:true});
+      };
+      sm.appendChild(down);
+    }
+    positionSm();
+  }
+
+  function add(text, fn, {keepOpen=false, submenuEntries=null, submenuAsyncLoader=null}={}){
     const d=document.createElement("div");
     d.className="item";
     d.textContent=text;
@@ -2484,6 +2664,28 @@ function openContextMenu(x,y){
       if (!keepOpen) hideMenu();
       fn && fn();
     };
+    // 鼠标移入时自动弹出二级菜单
+    if (submenuEntries){
+      d.classList.add("has-submenu");
+      d.addEventListener("mouseenter", ()=> openInlineSubMenu(d, submenuEntries, {paged:false}));
+    } else if (submenuAsyncLoader){
+      d.classList.add("has-submenu");
+      let loaded = false;
+      let cached = [];
+      d.addEventListener("mouseenter", async ()=>{
+        if (!loaded){
+          try{
+            cached = await submenuAsyncLoader();
+            loaded = true;
+            d._submenuOffset = 0;
+          }catch(_){
+            cached = [{ text:"加载失败", fn: ()=>{} }];
+            loaded = true;
+          }
+        }
+        openInlineSubMenu(d, cached, {paged:true});
+      });
+    }
     menu.appendChild(d);
   }
   // ★ 二级菜单：复用同一个 ctxmenu，提供“返回”
@@ -2574,13 +2776,6 @@ function openContextMenu(x,y){
         const label = `${indent}${n.title} (${n.path})`;
         entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
       }
-      if (tree.length > MAX){
-        entries.push({ text:`（仅显示前 ${MAX} 项…）`, fn: ()=>{} });
-      }
-      // 兜底：仍保留原“浮层选择器”
-      entries.push({ text:"打开完整选择器…", fn: async ()=>{
-        showFolderPicker(x,y, async (dest)=>{ await moveIdsAndRefresh(ids, dest); });
-      }});
       return entries;
     }, {moveStyle:true});
   }
@@ -2589,8 +2784,14 @@ function openContextMenu(x,y){
   if (oneVideo) {
     const vid = [...state.selV][0];
     const title = (state.tiles.find(t=>t.vid===vid)?.title) || `视频 ${vid}`;
-    add("播放此视频", ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); });
-    add("从该处开始播放（忽略已完成）", async ()=>{ await handlePlayFromHereProgressive(vid, title); });
+    add("播放", ()=>{}, {
+      keepOpen:true,
+      submenuEntries:[
+        { text:"播放此视频", fn: ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path); } },
+        { text:"循环播放", fn: ()=> { primeBusy("正在启动播放器…"); startPlaylist([{id:vid, title}], 0, state.path, {loop:true}); } },
+        { text:"从该处开始播放（忽略已完成）", fn: async ()=>{ await handlePlayFromHereProgressive(vid, title); } },
+      ]
+    });
     add("打开创意工坊链接", ()=> window.open(`https://steamcommunity.com/sharedfiles/filedetails/?id=${vid}`, "_blank"));
     add("修复…", ()=> openSubMenu("修复", [
       { text:"强制转码修复（推荐）", fn: async ()=>{ await repairVideoAndReload(vid, "reencode"); } },
@@ -2598,7 +2799,26 @@ function openContextMenu(x,y){
     ]), {keepOpen:true});
     add("取消订阅", ()=> openBulkUnsub([vid], 0));  // batch=0 表示单项模式
     sep();
-    add("移动到…", ()=> openMoveSubMenu(async ()=> [String(vid)]), {keepOpen:true});
+    add("移动到…", ()=>{}, {
+      keepOpen:true,
+      submenuAsyncLoader: async ()=>{
+        const ids = [String(vid)];
+        if (!ids || !ids.length){
+          return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
+        }
+        const entries = [];
+        entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(ids, "/"); } });
+        const tree = flattenFolderTree(await getFoldersMenuTree());
+        const MAX = 240;
+        for (let i=0;i<tree.length && i<MAX;i++){
+          const n = tree[i];
+          const indent = "　".repeat(Math.min(10, n.depth||0));
+          const label = `${indent}${n.title} (${n.path})`;
+          entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
+        }
+        return entries;
+      }
+    });
     sep();
     add("删除", async ()=>{
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
@@ -2612,13 +2832,83 @@ function openContextMenu(x,y){
   } else if (oneFolder) {
     const path = [...state.selF][0];
     add("打开此文件夹", ()=> navigateToPath(path));
-    add("播放此文件夹", async ()=>{ await progressivePlayFolder(path); });
+    add("播放", ()=>{}, {
+      keepOpen:true,
+      submenuEntries:[
+        { text:"播放此文件夹", fn: async ()=>{ await progressivePlayFolder(path); } },
+        { text:"循环播放此文件夹", fn: async ()=>{
+            const all = await getFolderItems(path);
+            if (!all.length){ alert("该文件夹没有可播放视频"); return; }
+            primeBusy("正在启动播放器…");
+            await startPlaylist(all, 0, path, {loop:true});
+          } },
+      ]
+    });
     sep();
     add("在该文件夹下新建子文件夹…", ()=> promptCreateFolder(path));
     sep();
+    add("删除", ()=>{}, {
+      keepOpen:true,
+      submenuEntries:[
+        {
+          text:"删除所有视频",
+          fn: async ()=>{
+            const items = await getFolderItems(path);
+            if (!items.length){ alert("该文件夹下没有可删除的视频"); return; }
+            if (!confirm(`确认永久删除该文件夹下的 ${items.length} 个视频？此操作不可恢复。`)) return;
+            const ids = items.map(x=>String(x.id));
+            const ok = await deleteByIds(ids);
+            if (!ok){ alert("删除失败，请稍后重试"); return; }
+            removeTilesByVideoIds(ids);
+            clearSel();
+          }
+        },
+        {
+          text:"删除文件夹及所有视频",
+          fn: async ()=>{
+            const items = await getFolderItems(path);
+            const ids = items.map(x=>String(x.id));
+            if (!ids.length){
+              if (!confirm("确认从分类中删除此文件夹？此操作不可恢复。")) return;
+            }else{
+              if (!confirm(`确认永久删除该文件夹及其中 ${ids.length} 个视频？此操作不可恢复。`)) return;
+            }
+            if (ids.length){
+              const ok = await deleteByIds(ids);
+              if (!ok){ alert("删除视频失败，请稍后重试"); return; }
+              removeTilesByVideoIds(ids);
+            }
+            await fetch("/api/folder/delete", {
+              method:"POST",
+              headers:{"Content-Type":"application/json"},
+              body: JSON.stringify({ paths:[path] })
+            });
+            clearSel();
+            changeContext({});
+          }
+        },
+      ]
+    });
+    sep();
     add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
   } else {
-    add("批量播放", async ()=>{ await progressivePlaySelection(); });
+    add("播放", ()=>{}, {
+      keepOpen:true,
+      submenuEntries:[
+        { text:"批量播放", fn: async ()=>{ await progressivePlaySelection(); } },
+        { text:"批量循环播放", fn: async ()=>{
+            const selVideos = [...state.selV].map(String), selFolders = [...state.selF];
+            let items = selVideos.map(id => ({ id, title: (state.tiles.find(t=>t.vid===id)?.title) || `视频 ${id}` }));
+            for (const folderPath of selFolders){
+              const folderItems = await getFolderItems(folderPath);
+              items = items.concat(folderItems);
+            }
+            if (!items.length){ alert("所选没有可播放视频"); return; }
+            primeBusy("正在启动播放器…");
+            await startPlaylist(items, 0, state.path, {loop:true});
+          } },
+      ]
+    });
     add("批量取消订阅", async ()=>{
       const items = await expandSelectionToItems();
       const ids = items.map(x=>String(x.id));
@@ -2626,27 +2916,85 @@ function openContextMenu(x,y){
       await openBulkUnsub(ids, 2);  // batch=2 表示批量模式
     });
     sep();
-    add("移动到…", ()=> openMoveSubMenu(async ()=> await collectSelectedIds()), {keepOpen:true});
+    add("移动到…", ()=>{}, {
+      keepOpen:true,
+      submenuAsyncLoader: async ()=>{
+        const ids = await collectSelectedIds();
+        if (!ids || !ids.length){
+          return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
+        }
+        const entries = [];
+        entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(ids, "/"); } });
+        const tree = flattenFolderTree(await getFoldersMenuTree());
+        const MAX = 240;
+        for (let i=0;i<tree.length && i<MAX;i++){
+          const n = tree[i];
+          const indent = "　".repeat(Math.min(10, n.depth||0));
+          const label = `${indent}${n.title} (${n.path})`;
+          entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
+        }
+        return entries;
+      }
+    });
     sep();
-    add("删除所选", async ()=>{
-      const items = await expandSelectionToItems();
-      if (!items.length) return alert("所选没有可删除的视频");
-      if (!confirm(`确认永久删除 ${items.length} 项？此操作不可恢复。`)) return;
-      const ids = items.map(x=>x.id);
-      const ok = await deleteByIds(ids);
-      if (!ok){ alert("删除失败，请稍后重试"); return; }
-      removeTilesByVideoIds(ids);
-      clearSel();
+    add("删除", ()=>{}, {
+      keepOpen:true,
+      submenuEntries:[
+        {
+          text:"删除所有视频",
+          fn: async ()=>{
+            const items = await expandSelectionToItems();
+            if (!items.length) return alert("所选没有可删除的项目");
+            if (!confirm(`确认永久删除所选 ${items.length} 个视频？此操作不可恢复。`)) return;
+            const ids = items.map(x=>x.id);
+            const ok = await deleteByIds(ids);
+            if (!ok){ alert("删除失败，请稍后重试"); return; }
+            removeTilesByVideoIds(ids);
+            clearSel();
+          }
+        },
+        {
+          text:"删除文件夹及所有视频",
+          fn: async ()=>{
+            const items = await expandSelectionToItems();
+            const ids = items.map(x=>x.id);
+            const folderPaths = [...state.selF];
+            if (!ids.length && !folderPaths.length){
+              alert("所选没有可删除的项目"); return;
+            }
+            const total = ids.length;
+            if (!confirm(`确认永久删除所选文件夹及其中 ${total} 个视频？此操作不可恢复。`)) return;
+            if (ids.length){
+              const ok = await deleteByIds(ids);
+              if (!ok){ alert("删除视频失败，请稍后重试"); return; }
+              removeTilesByVideoIds(ids);
+            }
+            if (folderPaths.length){
+              await fetch("/api/folder/delete", {
+                method:"POST",
+                headers:{"Content-Type":"application/json"},
+                body: JSON.stringify({ paths: folderPaths })
+              });
+            }
+            clearSel();
+            changeContext({});
+          }
+        },
+      ]
     });
     sep();
     add("在当前路径新建文件夹…", ()=> promptCreateFolder(state.path));
   }
 
-  const vw=window.innerWidth,vh=window.innerHeight;
-  menu.style.left = Math.min(x, vw-220)+"px"; menu.style.top = Math.min(y, vh-240)+"px";
+  positionMenuEl(menu, x, y);
   setTimeout(()=> document.addEventListener("click", hideMenu, {once:true}), 0);
 }
-function hideMenu(){ $("ctxmenu").style.display="none"; }
+function hideMenu(){
+  const m = $("ctxmenu");
+  const sm = $("ctxsubmenu");
+  if (m) m.style.display = "none";
+  if (sm) sm.style.display = "none";
+}
 
 /* ============== 抽屉/遮罩/框选 ============== */
 
@@ -2757,7 +3105,13 @@ function bindRubber(){
 
 $("sort").onchange = ()=> changeContext({sort_idx: parseInt($("sort").value,10)});
 $("mature").onchange = ()=> changeContext({mature_only: $("mature").checked});
-$("refresh").onclick = ()=> changeContext({});
+$("refresh").onclick = async ()=>{
+  setInfStatus("正在重新扫描…");
+  try {
+    await fetch("/api/scan/refresh", { method: "POST" });
+  } catch (_) {}
+  changeContext({});
+};
 let qTimer=null;
 $("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContext({q:$("q").value.trim()}), 250); };
 $("playUnwatched").onclick = handlePlayUnwatched;
