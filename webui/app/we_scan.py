@@ -275,6 +275,77 @@ def _prune_ids(node_list: List[dict], ids: List[str]) -> None:
         subs = f.get("subfolders") or []
         _prune_ids(subs, ids)
 
+def _delete_folder_by_parts(node_list: List[dict], parts: List[str]) -> bool:
+    """
+    从 folders 树中删除指定路径的 folder 节点（不递归删除其中 items 的 id，只改结构）。
+    parts 形如 ["A","B","C"] 对应 /A/B/C。
+    返回是否删除了至少一个节点。
+    """
+    if not parts:
+        return False
+    name = parts[0]
+    deleted = False
+    # 最后一段：直接在当前层删除匹配的 folder
+    if len(parts) == 1:
+        i = 0
+        while i < len(node_list):
+            f = node_list[i]
+            if isinstance(f, dict) and f.get("title") == name:
+                node_list.pop(i)
+                deleted = True
+                continue
+            i += 1
+        return deleted
+
+    # 还有后续路径：下钻到对应子节点
+    for f in node_list:
+        if not isinstance(f, dict):
+            continue
+        if f.get("title") != name:
+            continue
+        subs = f.get("subfolders") or []
+        if _delete_folder_by_parts(subs, parts[1:]):
+            deleted = True
+            # 如果该 folder 已经没有子文件夹和 items，可选地清理掉
+            if not subs and not (f.get("items") or {}):
+                try:
+                    node_list.remove(f)
+                except ValueError:
+                    pass
+        break
+    return deleted
+
+def delete_folders(we_path: str, paths: List[str]) -> int:
+    """
+    从 config.json 的 folders 树中删除若干路径对应的 folder 节点。
+    仅修改结构，不碰 items 对应的 id；由调用方决定是否删除实际视频文件。
+    返回成功删除的 folder 数量。
+    """
+    norm_paths = []
+    for p in paths or []:
+        p = (p or "").strip()
+        if not p or p == "/":
+            continue
+        parts = [seg for seg in p.split("/") if seg]
+        if parts:
+            norm_paths.append(parts)
+    if not norm_paths:
+        return 0
+
+    with _WRITE_LOCK:
+        cfg = load_we_config(we_path)
+        container, key = _locate_folders_slot(cfg)
+        folders = container.setdefault(key, [])
+
+        removed = 0
+        for parts in norm_paths:
+            if _delete_folder_by_parts(folders, parts):
+                removed += 1
+
+        if removed:
+            _write_config_atomic_with_backup(we_path, cfg)
+        return removed
+
 def create_folder(we_path: str, parent_path: str, title: str) -> None:
     """
     在 parent_path 下创建名为 title 的子文件夹。
