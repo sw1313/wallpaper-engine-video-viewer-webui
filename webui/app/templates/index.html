@@ -42,11 +42,13 @@
   </main>
 
   <div id="ctxmenu" class="ctxmenu" style="display:none;"></div>
+  <div id="ctxsubmenu" class="ctxmenu ctxsubmenu" style="display:none;"></div>
   <div id="rubber" class="rubber" style="display:none;"></div>
 
   <!-- 全屏播放器容器 -->
   <div id="playerFS" class="playerfs" style="display:none;">
     <video id="fsVideo" controls playsinline webkit-playsinline preload="metadata" crossorigin="anonymous"></video>
+    <canvas id="switchCover" class="switch-cover"></canvas>
 
     <div id="overlay" class="overlay">
       <div id="shade" class="shade hidden" aria-hidden="true"></div>
