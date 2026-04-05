@@ -24,7 +24,10 @@ from pydantic import BaseModel
 
 from .we_scan import (
     load_we_config, extract_folders_list, build_folder_tree, scan_workshop_items,
+    scan_single_workshop_item, scan_single_myproject_item,
+    scan_myprojects_items, scan_config_linked_project_videos,
     collect_unassigned_items, find_node_by_path, all_ids_recursive, delete_id_dir,
+    delete_myprojects_local_dir, delete_we_projects_path_video,
     create_folder as ws_create_folder, move_items as ws_move_items, delete_folders as ws_delete_folders,
 )
 from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest, FolderDeleteRequest
@@ -167,76 +170,390 @@ def _sort_key(idx: int):
   if idx == 4: return (lambda v: v.title.casefold(), True)
   return (lambda v: v.title.casefold(), False)
 
-# ======== ★ 新增：扫描结果内存缓存（TTL，默认 120s）========
-SCAN_CACHE_TTL = int(os.getenv("SCAN_CACHE_TTL", "120"))
-_SCAN_CACHE = {"ts": 0.0, "folder_roots": None, "id_map": None, "root_unassigned": None, "path_map": None}
+# ======== 扫描结果内存缓存（按需扫描：三源独立指纹检测）========
+# 将数据拆为三个独立源，各自有独立的 mtime 指纹 + 防抖，互不干扰：
+#   cfg  — config.json（文件夹结构 + config 内链接的 projects 视频）
+#   ws   — WORKSHOP_PATH（创意工坊下载目录）
+#   mp   — WE_PATH/projects/myprojects（本地项目目录）
+#
+# 好处：WE 订阅壁纸时 config.json 和 workshop 目录同时变化，
+#       但 config 变化只重读 config，workshop 变化只重扫 workshop，不会交叉触发。
+SCAN_DEBOUNCE_SEC = float(os.getenv("SCAN_DEBOUNCE_SEC", "5"))
+SCAN_FINGERPRINT_INTERVAL = float(os.getenv("SCAN_FINGERPRINT_INTERVAL", "10"))
+# Steam 下载壁纸时目录可能先创建但文件尚未就位，pending 机制定期重试这些未完成项
+SCAN_PENDING_RECHECK_SEC = float(os.getenv("SCAN_PENDING_RECHECK_SEC", "30"))
+
 _SCAN_LOCK = threading.RLock()
 
+def _make_source():
+    return {
+        "dirty": True,
+        "fp": None,
+        "change_at": 0.0,
+        "last_fp_time": 0.0,
+        "pending": set(),
+        "pending_checked_at": 0.0,
+    }
+
+_SRC_CFG = _make_source()        # config.json 源
+_SRC_CFG_DATA = {                 # config 源的扫描结果
+    "we_cfg": {},
+    "folder_roots": [],
+    "items": {},                  # config-linked project videos
+}
+
+_SRC_WS = _make_source()         # workshop 源
+_SRC_WS_DATA = {"items": {}}
+
+_SRC_MP = _make_source()         # myprojects 源
+_SRC_MP_DATA = {"items": {}}
+
+_MERGED = {                       # 合并后的最终缓存
+    "valid": False,
+    "folder_roots": None,
+    "id_map": None,
+    "root_unassigned": None,
+    "path_map": None,
+}
+
+# ---- 指纹采集（每个源只 stat 自己关心的路径）----
+
+def _fp_config():
+    p = os.path.join(WE_PATH, "config.json")
+    try:
+        st = os.stat(p)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0)
+
+def _fp_workshop():
+    try:
+        st = os.stat(WORKSHOP_PATH)
+        # st_nlink 在 Windows/SMB 上始终为 1，无法感知子目录增删；
+        # 改用实际子目录计数，保证外部删除（如 Steam 取消订阅）能被检测到
+        try:
+            n = sum(1 for e in os.scandir(WORKSHOP_PATH)
+                    if e.is_dir(follow_symlinks=False) and e.name.isdigit())
+        except Exception:
+            n = -1
+        return (st.st_mtime_ns, n)
+    except OSError:
+        return (0, 0)
+
+def _fp_myprojects():
+    p = os.path.join(WE_PATH, "projects", "myprojects")
+    try:
+        st = os.stat(p)
+        try:
+            n = sum(1 for e in os.scandir(p)
+                    if e.is_dir(follow_symlinks=False)
+                    and not e.name.startswith(".") and ".." not in e.name)
+        except Exception:
+            n = -1
+        return (st.st_mtime_ns, n)
+    except OSError:
+        return (0, 0)
+
+# ---- 单源变化检测 + 防抖 ----
+
+def _check_source(src: dict, fp_fn) -> bool:
+    """检测单个源是否需要重新扫描。返回 True 表示该源现在是 dirty 的。"""
+    if src["dirty"]:
+        return True
+    now = time.time()
+    # 有未完成项（如 Steam 下载中的目录）→ 定期重试
+    if src["pending"] and (now - src["pending_checked_at"]) >= SCAN_PENDING_RECHECK_SEC:
+        src["dirty"] = True
+        return True
+    if now - src["last_fp_time"] < SCAN_FINGERPRINT_INTERVAL:
+        return False
+    fp = fp_fn()
+    src["last_fp_time"] = now
+    if fp == src["fp"]:
+        src["change_at"] = 0.0
+        return False
+    # 指纹变了 → 启动防抖
+    if src["change_at"] == 0.0:
+        src["change_at"] = now
+    if now - src["change_at"] >= SCAN_DEBOUNCE_SEC:
+        src["dirty"] = True
+        src["change_at"] = 0.0
+        return True
+    return False
+
+def _finish_source(src: dict, fp_fn):
+    """扫描完成后，更新源状态。"""
+    src["dirty"] = False
+    src["fp"] = fp_fn()
+    src["last_fp_time"] = time.time()
+    src["change_at"] = 0.0
+
+# ---- 主扫描入口 ----
+
 def _scan_state():
-  now = time.time()
-  with _SCAN_LOCK:
-    ok = (_SCAN_CACHE["id_map"] is not None) and (now - _SCAN_CACHE["ts"] <= SCAN_CACHE_TTL)
-    if not ok:
-      folder_roots = []
-      try:
-        we_cfg = load_we_config(WE_PATH)
-        folders_list = extract_folders_list(we_cfg)
-        folder_roots = build_folder_tree(folders_list)
-      except Exception:
-        folder_roots = []
-      id_map = scan_workshop_items(WORKSHOP_PATH)
-      root_unassigned = collect_unassigned_items(id_map, folder_roots)
+    with _SCAN_LOCK:
+        cfg_dirty = _check_source(_SRC_CFG, _fp_config)
+        ws_dirty = _check_source(_SRC_WS, _fp_workshop)
+        mp_dirty = _check_source(_SRC_MP, _fp_myprojects)
+        any_dirty = cfg_dirty or ws_dirty or mp_dirty
 
-      # ★ 构建子路径级缓存：{ "/A/B": {subfolders, vids, all_vids} }
-      def _build_path_map():
-        path_map = {}
+        if not any_dirty and _MERGED["valid"]:
+            return _MERGED["folder_roots"], _MERGED["id_map"], _MERGED["root_unassigned"]
 
-        def rec(parts: List[str], subfolders, vids):
-          # 规范化路径
-          path_str = "/" + "/".join(parts) if parts else "/"
-          # 聚合所有子孙视频 id（只在构建期做一次）
-          all_vids = list(vids)
-          for sf in (subfolders or []):
-            child_parts = parts + [sf.title]
-            child_subfolders, child_vids = find_node_by_path(folder_roots, child_parts)
-            # 递归对子路径建映射
-            _, _, child_all = rec(child_parts, child_subfolders, child_vids)
-            all_vids.extend(child_all)
-          path_map[path_str] = {"subfolders": subfolders, "vids": list(vids), "all_vids": all_vids}
-          return subfolders, vids, all_vids
+        # --- 按需扫描各源（只扫描变化的部分）---
+        if cfg_dirty:
+            print("[scan] config.json 变化，重新读取配置与 linked-projects ...")
+            try:
+                we_cfg = load_we_config(WE_PATH)
+                folders_list = extract_folders_list(we_cfg)
+                folder_roots = build_folder_tree(folders_list)
+            except Exception as e:
+                print(f"[scan] ⚠ 读取 config.json 失败: {e}")
+                print(f"[scan]   WE_PATH={WE_PATH!r}, config.json 路径={os.path.join(WE_PATH, 'config.json')!r}")
+                print(f"[scan]   WE_PATH 是否存在: {os.path.isdir(WE_PATH)}")
+                we_cfg = {}
+                folder_roots = []
+            linked = {}
+            try:
+                linked = dict(scan_config_linked_project_videos(
+                    WE_PATH, we_cfg if isinstance(we_cfg, dict) else {}))
+            except Exception:
+                pass
+            _SRC_CFG_DATA.update(we_cfg=we_cfg, folder_roots=folder_roots, items=linked)
+            _finish_source(_SRC_CFG, _fp_config)
 
-        # 根路径
-        rec([], folder_roots, root_unassigned[:])
-        return path_map
+        if ws_dirty:
+            old_items = _SRC_WS_DATA["items"]
+            if not old_items:
+                print("[scan] workshop 首次全量扫描 ...")
+                if not os.path.isdir(WORKSHOP_PATH):
+                    print(f"[scan] ⚠ WORKSHOP_PATH 不存在或不是目录: {WORKSHOP_PATH!r}")
+                _SRC_WS_DATA["items"] = dict(scan_workshop_items(WORKSHOP_PATH))
+            else:
+                # 增量：只列根目录取目录名，diff 出新增/删除
+                current_dirs = set()
+                try:
+                    with os.scandir(WORKSHOP_PATH) as entries:
+                        for e in entries:
+                            if e.is_dir(follow_symlinks=False) and e.name.isdigit():
+                                current_dirs.add(e.name)
+                except Exception:
+                    pass
+                old_ids = set(old_items.keys())
+                added = current_dirs - old_ids
+                removed = old_ids - current_dirs
+                to_scan = added | _SRC_WS["pending"]
 
-      path_map = _build_path_map()
+                for rid in removed:
+                    old_items.pop(rid, None)
 
-      _SCAN_CACHE.update(ts=now, folder_roots=folder_roots, id_map=id_map, root_unassigned=root_unassigned, path_map=path_map)
-    return _SCAN_CACHE["folder_roots"], _SCAN_CACHE["id_map"], _SCAN_CACHE["root_unassigned"]
+                scanned, pending = 0, set()
+                for nid in to_scan:
+                    if nid not in current_dirs:
+                        continue
+                    item = scan_single_workshop_item(WORKSHOP_PATH, nid)
+                    if item:
+                        old_items[nid] = item
+                        scanned += 1
+                    else:
+                        pending.add(nid)
 
-# ★ 新增：修改 config.json 后失效扫描缓存（让前端立即看到变化）
-def _invalidate_scan_cache():  # ★ 新增
-  with _SCAN_LOCK:
-    _SCAN_CACHE["ts"] = 0.0
-    _SCAN_CACHE["path_map"] = None
+                _SRC_WS["pending"] = pending
+                _SRC_WS["pending_checked_at"] = time.time()
+                parts = []
+                if scanned: parts.append(f"+{scanned}")
+                if removed: parts.append(f"-{len(removed)}")
+                if pending: parts.append(f"待完成:{len(pending)}")
+                print(f"[scan] workshop 增量扫描: {' '.join(parts) or '无变化'}")
+
+            _finish_source(_SRC_WS, _fp_workshop)
+
+        if mp_dirty:
+            we_cfg = _SRC_CFG_DATA.get("we_cfg", {})
+            old_items = _SRC_MP_DATA["items"]
+            if not old_items:
+                print("[scan] myprojects 首次全量扫描 ...")
+                mp_root = os.path.join(WE_PATH, "projects", "myprojects")
+                if not os.path.isdir(mp_root):
+                    print(f"[scan] ⚠ myprojects 目录不存在: {mp_root!r}")
+                try:
+                    _SRC_MP_DATA["items"] = dict(
+                        scan_myprojects_items(WE_PATH, we_cfg if isinstance(we_cfg, dict) else {}))
+                except Exception:
+                    _SRC_MP_DATA["items"] = {}
+            else:
+                mp_root = os.path.join(WE_PATH, "projects", "myprojects")
+                current_dirs = set()
+                try:
+                    with os.scandir(mp_root) as entries:
+                        for e in entries:
+                            if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and ".." not in e.name:
+                                current_dirs.add(e.name)
+                except Exception:
+                    pass
+                old_ids = {k[3:] for k in old_items.keys()}  # "mp:xxx" → "xxx"
+                added = current_dirs - old_ids
+                removed = old_ids - current_dirs
+                pending_dirs = {p[3:] if p.startswith("mp:") else p for p in _SRC_MP["pending"]}
+                to_scan = added | pending_dirs
+
+                for rdir in removed:
+                    old_items.pop(f"mp:{rdir}", None)
+
+                scanned, pending = 0, set()
+                for ndir in to_scan:
+                    if ndir not in current_dirs:
+                        continue
+                    item = scan_single_myproject_item(WE_PATH, we_cfg if isinstance(we_cfg, dict) else {}, ndir)
+                    if item:
+                        old_items[item.id] = item
+                        scanned += 1
+                    else:
+                        pending.add(f"mp:{ndir}")
+
+                _SRC_MP["pending"] = pending
+                _SRC_MP["pending_checked_at"] = time.time()
+                parts = []
+                if scanned: parts.append(f"+{scanned}")
+                if removed: parts.append(f"-{len(removed)}")
+                if pending: parts.append(f"待完成:{len(pending)}")
+                print(f"[scan] myprojects 增量扫描: {' '.join(parts) or '无变化'}")
+
+            _finish_source(_SRC_MP, _fp_myprojects)
+
+        # --- 合并三源结果 ---
+        folder_roots = _SRC_CFG_DATA["folder_roots"]
+        id_map = {}
+        id_map.update(_SRC_WS_DATA["items"])
+        id_map.update(_SRC_MP_DATA["items"])
+        id_map.update(_SRC_CFG_DATA["items"])
+
+        root_unassigned = collect_unassigned_items(id_map, folder_roots)
+
+        def _build_path_map():
+            path_map = {}
+            def rec(parts: List[str], subfolders, vids):
+                path_str = "/" + "/".join(parts) if parts else "/"
+                all_vids = list(vids)
+                for sf in (subfolders or []):
+                    child_parts = parts + [sf.title]
+                    child_subfolders, child_vids = find_node_by_path(folder_roots, child_parts)
+                    _, _, child_all = rec(child_parts, child_subfolders, child_vids)
+                    all_vids.extend(child_all)
+                path_map[path_str] = {"subfolders": subfolders, "vids": list(vids), "all_vids": all_vids}
+                return subfolders, vids, all_vids
+            rec([], folder_roots, root_unassigned[:])
+            return path_map
+
+        path_map = _build_path_map()
+        _MERGED.update(valid=True, folder_roots=folder_roots, id_map=id_map,
+                       root_unassigned=root_unassigned, path_map=path_map)
+
+        changed = []
+        if cfg_dirty: changed.append("config")
+        if ws_dirty: changed.append("workshop")
+        if mp_dirty: changed.append("myprojects")
+        print(f"[scan] 扫描完成 [{'+'.join(changed)}]，共 {len(id_map)} 个视频项")
+
+        return _MERGED["folder_roots"], _MERGED["id_map"], _MERGED["root_unassigned"]
+
+
+def _invalidate_scan_cache():
+    """使所有扫描源失效并清空数据（供前端「刷新」按钮调用，下次走全量扫描）。"""
+    with _SCAN_LOCK:
+        for src in (_SRC_CFG, _SRC_WS, _SRC_MP):
+            src["dirty"] = True
+            src["change_at"] = 0.0
+            src["pending"] = set()
+        _SRC_WS_DATA["items"] = {}
+        _SRC_MP_DATA["items"] = {}
+        _MERGED["valid"] = False
+        _MERGED["path_map"] = None
+
+def _invalidate_config_cache():
+    """仅使 config.json 源失效（供 UI 端文件夹增删移动后调用，不触发 workshop/myprojects 重扫描）。"""
+    with _SCAN_LOCK:
+        _SRC_CFG["dirty"] = True
+        _SRC_CFG["change_at"] = 0.0
+        _MERGED["valid"] = False
+        _MERGED["path_map"] = None
 
 @app.post("/api/scan/refresh")
 def api_scan_refresh():
-  """使扫描缓存失效，下次 /api/scan 将重新扫描文件列表。供前端「刷新」按钮调用。"""
-  _invalidate_scan_cache()
-  return {"ok": True}
+    """使扫描缓存失效，下次 /api/scan 将重新扫描文件列表。供前端「刷新」按钮调用。"""
+    _invalidate_scan_cache()
+    return {"ok": True}
+
+@app.get("/api/diag")
+def api_diag():
+    """诊断端点：返回路径存在性、扫描状态、视频计数等，帮助排查扫描不出结果的问题。"""
+    config_path = os.path.join(WE_PATH, "config.json")
+    mp_root = os.path.join(WE_PATH, "projects", "myprojects")
+    ws_count = len(_SRC_WS_DATA.get("items", {}))
+    mp_count = len(_SRC_MP_DATA.get("items", {}))
+    cfg_count = len(_SRC_CFG_DATA.get("items", {}))
+    id_map = _MERGED.get("id_map") or {}
+
+    ws_subdirs = 0
+    if os.path.isdir(WORKSHOP_PATH):
+        try:
+            with os.scandir(WORKSHOP_PATH) as it:
+                ws_subdirs = sum(1 for e in it if e.is_dir(follow_symlinks=False) and e.name.isdigit())
+        except Exception:
+            pass
+
+    checks = []
+    if not os.path.isdir(WE_PATH):
+        checks.append(f"WE_PATH 不存在或不是目录: {WE_PATH}")
+    if not os.path.isfile(config_path):
+        checks.append(f"config.json 不存在: {config_path}")
+    if not os.path.isdir(WORKSHOP_PATH):
+        checks.append(f"WORKSHOP_PATH 不存在或不是目录: {WORKSHOP_PATH}")
+    elif ws_subdirs == 0:
+        checks.append(f"WORKSHOP_PATH 下没有数字子目录（创意工坊项目）: {WORKSHOP_PATH}")
+    if not os.path.isdir(mp_root):
+        checks.append(f"myprojects 目录不存在: {mp_root}")
+
+    return JSONResponse(content={
+        "workshop_path": WORKSHOP_PATH,
+        "we_path": WE_PATH,
+        "config_json": config_path,
+        "myprojects_path": mp_root,
+        "exists": {
+            "workshop_path": os.path.isdir(WORKSHOP_PATH),
+            "we_path": os.path.isdir(WE_PATH),
+            "config_json": os.path.isfile(config_path),
+            "myprojects": os.path.isdir(mp_root),
+        },
+        "counts": {
+            "workshop_items": ws_count,
+            "myprojects_items": mp_count,
+            "config_linked_items": cfg_count,
+            "total_merged": len(id_map),
+            "workshop_subdirs": ws_subdirs,
+        },
+        "scan_merged_valid": _MERGED.get("valid", False),
+        "issues": checks,
+    })
+
+def _fs_safe_vid_token(vid_id: str) -> str:
+  """用于缓存文件名等本地路径片段（避免 Windows 非法字符）。"""
+  return re.sub(r'[<>:"/\\|?*]', "_", str(vid_id))
 
 def _build_video_out(id_map, vid_id) -> VideoOut:
   v = id_map[vid_id]
+  is_ws = bool(re.fullmatch(r"\d{10}", str(vid_id)))
+  qid = quote(str(vid_id), safe="")
   return VideoOut(
-    id=vid_id,
+    id=str(vid_id),
     title=v.title,
     mtime=v.mtime,
     size=v.size,
     rating=v.rating or "",
-    preview_url=f"/media/preview/{vid_id}",
-    video_url=f"/media/video/{vid_id}",
-    workshop_url=f"https://steamcommunity.com/sharedfiles/filedetails/?id={vid_id}" if vid_id.isdigit() and len(vid_id) == 10 else ""
+    preview_url=f"/media/preview/{qid}",
+    video_url=f"/media/video/{qid}",
+    workshop_url=f"https://steamcommunity.com/sharedfiles/filedetails/?id={vid_id}" if is_ws else "",
+    is_workshop=is_ws,
   )
 
 @app.get("/", response_class=HTMLResponse)
@@ -300,7 +617,7 @@ def api_scan(
   parts = [p for p in path.split("/") if p]
   norm_path = ("/" + "/".join(parts)) if parts else "/"
   with _SCAN_LOCK:
-    pm = _SCAN_CACHE.get("path_map") or {}
+    pm = _MERGED.get("path_map") or {}
     entry = pm.get(norm_path)
 
   if entry:
@@ -435,14 +752,15 @@ def api_folders_menu():
 @app.post("/api/folder/create")  # ★ 新增
 def api_folder_create(req: CreateFolderRequest):
   ws_create_folder(WE_PATH, req.parent or "/", req.title)
-  _invalidate_scan_cache()  # 失效缓存，前端刷新立即可见
+  _invalidate_config_cache()
   return {"ok": True}
 
 # === 移动所选项目（支持多选）到目标路径；"/" 表示移动到主页 ===
 @app.post("/api/move")  # ★ 新增
 def api_move(req: MoveRequest):
-  ws_move_items(WE_PATH, req.ids or [], req.dest_path or "/")
-  _invalidate_scan_cache()
+  _, id_map, _ = _scan_state()
+  ws_move_items(WE_PATH, req.ids or [], req.dest_path or "/", id_map)
+  _invalidate_config_cache()
   return {"ok": True, "moved": len(req.ids or [])}
 
 # === 直接删除（危险操作，已在前端加确认框） ===
@@ -452,18 +770,36 @@ def api_delete(req: DeleteRequest):
   deleted = []
   skipped = []
   for vid in req.ids:
-    if vid not in id_map:
-      skipped.append(vid); continue
-    ok = delete_id_dir(WORKSHOP_PATH, vid)
-    if ok: deleted.append(vid)
-    else: skipped.append(vid)
+    s = str(vid)
+    if s.startswith("mp:"):
+      ok = delete_myprojects_local_dir(WE_PATH, s)
+      if ok:
+        deleted.append(s)
+      else:
+        skipped.append(s)
+      continue
+    if s.startswith("p:"):
+      v = id_map.get(s)
+      if not v:
+        skipped.append(s); continue
+      ok = delete_we_projects_path_video(WE_PATH, s, v.video_path)
+      if ok:
+        deleted.append(s)
+      else:
+        skipped.append(s)
+      continue
+    if s not in id_map:
+      skipped.append(s); continue
+    ok = delete_id_dir(WORKSHOP_PATH, s)
+    if ok: deleted.append(s)
+    else: skipped.append(s)
   return {"deleted": deleted, "skipped": skipped}
 
 # === 从 config.json 的 folders 结构中删除若干文件夹（不碰物理文件）===
 @app.post("/api/folder/delete")
 def api_folder_delete(req: FolderDeleteRequest):
   removed = ws_delete_folders(WE_PATH, req.paths or [])
-  _invalidate_scan_cache()
+  _invalidate_config_cache()
   return {"removed": removed}
 
 # （保留 m3u 接口）
@@ -1099,10 +1435,11 @@ def media_preview(vid_id: str, request: Request,
 
   # 生成缓存 key
   st = os.stat(src_path)
+  fs_vid = _fs_safe_vid_token(vid_id)
   key_raw = f"{vid_id}|{int(st.st_mtime)}|{st.st_size}|{s or 0}|{target_fmt or 'orig'}|{q}"
   key_hash = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:20]
   out_ext = ".webp" if (target_fmt == "webp") else (".jpg" if target_fmt in ("jpg","jpeg") else (".png" if target_fmt=="png" else _ext_from_mime(src_mime)))
-  cache_path = os.path.join(PREVIEW_CACHE_DIR, f"{vid_id}_{key_hash}{out_ext}")
+  cache_path = os.path.join(PREVIEW_CACHE_DIR, f"{fs_vid}_{key_hash}{out_ext}")
   etag = f'W/"prev-{key_hash}"'
 
   # 条件缓存（对加工品）
@@ -1155,16 +1492,15 @@ def media_preview(vid_id: str, request: Request,
       w, h = img.size
       if w == 0 or h == 0: return img
       # 先等比缩放使“短边”>= s（尽量少放大）
-      scale = max(s / float(min(w, h)), 1.0)
-      new_w, new_h = int(w * scale), int(h * scale)
+      short = float(min(w, h))
+      scale = s / short
+      new_w = max(s, int(w * scale))
+      new_h = max(s, int(h * scale))
       if (new_w, new_h) != (w, h):
         img = img.resize((new_w, new_h), Image.LANCZOS)
-      # 居中裁切为 s×s
       left = max((img.width - s) // 2, 0)
       top  = max((img.height - s) // 2, 0)
-      right = left + s
-      bottom = top + s
-      img = img.crop((left, top, right, bottom))
+      img = img.crop((left, top, left + s, top + s))
       return img
 
     tmp_path = cache_path + ".tmp"
