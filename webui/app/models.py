@@ -15,6 +15,7 @@ class VideoOut(BaseModel):
     preview_url: str
     video_url: str
     workshop_url: str
+    is_workshop: bool = True
 
 class ScanResponse(BaseModel):
     breadcrumb: List[str]
