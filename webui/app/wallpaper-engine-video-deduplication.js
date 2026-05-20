@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Workshop 取消订阅·固定池轮转（server/local兼容）+ 错误页面处理 + 单页面模式
 // @namespace    local.bulk-unsub
-// @version      19.1.0
+// @version      20.0.0
 // @description  自动退订（URL 含 #bulk_unsub=1）+ 订阅主页 postMessage 投递队列 + ★新增：油猴菜单“手动取消订阅…（输入ID）”，方便取消已下架物品。
 // @match        https://steamcommunity.com/sharedfiles/filedetails/*
 // @match        https://steamcommunity.com/my/myworkshopfiles*
@@ -15,7 +15,12 @@
 
 (function () {
   'use strict';
-  const IS_BULK_UNSUB = /(\b|#|&)bulk[_-]?unsub=1\b/i.test(location.hash||'');
+  const BULK_UNSUB_VAL = (function(){
+    const m = (location.hash||'').match(/(\b|#|&)bulk[_-]?unsub=([12])\b/i);
+    return m ? m[2] : '';
+  })();
+  const IS_BULK_UNSUB = !!BULK_UNSUB_VAL;
+  const IS_DELISTED_MODE = BULK_UNSUB_VAL === '2';
 
   function parseHashParam(name){
     // 值里可能包含 '='（例如 cb=http://...?...=...），不能 split('=') 直接拆
@@ -679,7 +684,8 @@
       progressDiv = document.createElement('div');
       progressDiv.id = 'bulk-unsub-progress';
       progressDiv.style.cssText = 'position:fixed;top:10px;right:10px;padding:15px 20px;background:rgba(0,0,0,0.85);color:#fff;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:99999;font-family:Arial,sans-serif;font-size:14px;min-width:250px;';
-      progressDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:8px;">🔄 批量取消订阅中...</div><div id="progress-text">初始化...</div>';
+      const _modeLabel = IS_DELISTED_MODE ? '下架物品批量取消订阅' : '批量取消订阅';
+      progressDiv.innerHTML = '<div style="font-weight:bold;margin-bottom:8px;">🔄 ' + _modeLabel + '中...</div><div id="progress-text">初始化...</div>';
       document.body.appendChild(progressDiv);
     } catch(e) {
       console.warn('无法创建进度显示:', e);
