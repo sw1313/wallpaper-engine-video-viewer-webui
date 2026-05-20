@@ -80,7 +80,7 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v8"
+HLS_PIPELINE_VERSION = "hls-av-job-v9"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
@@ -2119,6 +2119,14 @@ def _hls_keyframe_args(src_path: str, mode: str, start_number: int = 0) -> list[
     return keyframes
   return keyframes + gop_args
 
+def _hls_color_normalize_filter(pix_fmt: str = "yuv420p") -> list[str]:
+  return [
+    "-vf",
+    f"scale=in_range=tv:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709,"
+    f"format={pix_fmt},"
+    "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+  ]
+
 def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, start_number: int = 0, start_time: float = 0.0) -> list[str]:
   """生成单个连续 HLS job 的 ffmpeg 命令。"""
   muxer = _hls_base_muxer_args(seg_pat, playlist, start_number)
@@ -2145,20 +2153,22 @@ def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, sta
       "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
       "-rc", "vbr", "-cq", "24", "-b:v", "0",
       *keyframes,
+      *_hls_color_normalize_filter("yuv420p"),
       "-c:a", "aac", "-b:a", "192k",
     ] + muxer
   if mode == "qsv":
     return base + [
       "-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "22",
       *keyframes,
+      *_hls_color_normalize_filter("nv12"),
       "-c:a", "aac", "-b:a", "192k",
     ] + muxer
   return base + [
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
     *keyframes,
     # 有些创意工坊视频带异常/缺失色彩元数据，ffmpeg 自动 scale/filter 会报
-    # "Invalid color space"。CPU 兜底路径统一成 bt709 + yuv420p，避免首段完全产不出。
-    "-vf", "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p",
+    # "Invalid color space"。转码路径显式指定输入/输出矩阵，避免首段完全产不出。
+    *_hls_color_normalize_filter("yuv420p"),
     "-c:a", "aac", "-b:a", "192k",
   ] + muxer
 
@@ -2397,7 +2407,6 @@ def _hls_monitor_job(key: str, run_id: str, vid_id: str, start_idx: int, mode: s
     logging.info("[hls] job encoded %s start=%s mode=%s in %.1fs", vid_id, start_idx, mode, time.time() - started_at)
     threading.Thread(target=_cleanup_hls_cache_dir, daemon=True).start()
   else:
-    _hls_disable_mode(mode, err)
     logging.warning("[hls] job mode=%s failed for %s start=%s rc=%s: %s", mode, vid_id, start_idx, rc, err)
 
 def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: int, timeout_s: float | None = None, keep_running_on_timeout: bool = False) -> dict:
