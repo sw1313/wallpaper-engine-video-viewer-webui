@@ -39,6 +39,95 @@ html.noscroll, body.noscroll { height:100%; overflow:hidden; position:relative; 
   .controls input[type=search] { min-width:160px; flex:0 0 auto; }
   .controls select { flex:0 0 auto; }
 }
+/* 壁纸模式：隐藏管理 UI，只保留内容/播放器本体。 */
+html.wallpaper-mode .topbar,
+html.wallpaper-mode .notice,
+html.wallpaper-mode .inf-status,
+html.wallpaper-mode .sentinel,
+html.wallpaper-mode .tile-menu,
+html.wallpaper-mode .watched-btn,
+html.wallpaper-mode .meta {
+  display:none !important;
+}
+html.wallpaper-mode .grid {
+  padding:0;
+  gap:0;
+}
+html.wallpaper-mode .tile {
+  border-radius:0;
+  border-color:transparent;
+}
+html.wallpaper-mode .tile:not(.folder) .title {
+  display:none;
+}
+html.wallpaper-mode .tile.folder .title {
+  display:block;
+  position:absolute;
+  left:8px;
+  right:8px;
+  bottom:8px;
+  z-index:12;
+  min-height:0;
+  padding:6px 8px;
+  border-radius:10px;
+  background:rgba(255,255,255,.86);
+  color:#222;
+  font-size:13px;
+  line-height:1.25;
+  text-align:center;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  box-shadow:0 2px 8px rgba(0,0,0,.12);
+}
+html.wallpaper-mode .wallpaper-tile-menu {
+  position:absolute;
+  left:6px;
+  right:6px;
+  top:6px;
+  z-index:20;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  border-radius:12px;
+  background:rgba(255,255,255,.96);
+  border:1px solid rgba(0,0,0,.10);
+  box-shadow:0 10px 28px rgba(0,0,0,.20);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+html.wallpaper-mode .wallpaper-tile-menu-item {
+  display:block;
+  width:100%;
+  padding:10px 12px;
+  border:0;
+  border-bottom:1px solid rgba(0,0,0,.08);
+  background:transparent;
+  color:#222;
+  text-align:left;
+  font:500 14px/1.25 system-ui,-apple-system,"PingFang SC","Microsoft Yahei",sans-serif;
+  white-space:normal;
+  word-break:break-word;
+}
+html.wallpaper-mode .wallpaper-tile-menu-item:last-child {
+  border-bottom:0;
+}
+html.wallpaper-mode .wallpaper-tile-menu-item:active,
+html.wallpaper-mode .wallpaper-tile-menu-item:hover {
+  background:rgba(0,0,0,.06);
+}
+html.wallpaper-mode .playerfs .overlay,
+html.wallpaper-mode .playerfs .icon-btn,
+html.wallpaper-mode .playerfs .playlist,
+html.wallpaper-mode .playerfs video::-webkit-media-controls {
+  display:none !important;
+}
+html.wallpaper-mode .playerfs {
+  cursor:none;
+}
+html.wallpaper-mode .playerfs video {
+  object-fit:cover;
+}
 
 /* ===== 提示条 ===== */
 .notice { background:#fff5e6; border:1px solid #ffd199; color:#663c00; padding:10px 12px; margin:10px; border-radius:8px; }

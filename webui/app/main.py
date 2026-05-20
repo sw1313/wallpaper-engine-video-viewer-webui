@@ -2,7 +2,7 @@
 import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil, json
 import time, logging  # ★ 新增：用于 /api/keepalive 时间与日志过滤
 import secrets  # ★ 新增
-from urllib.parse import quote  # ★ 新增
+from urllib.parse import quote
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
@@ -11,7 +11,6 @@ from email.utils import parsedate_to_datetime
 from fastapi import FastAPI, Query, Request, HTTPException, Body  # ★ 添加 Body
 from fastapi.responses import (
     FileResponse,
-    StreamingResponse,
     PlainTextResponse,
     HTMLResponse,
     RedirectResponse,
@@ -21,6 +20,20 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+
+
+class FastFileResponse(FileResponse):
+  """与 FileResponse 一致，但 chunk 调大到 8MB，提升大文件 + HTTPS 吞吐。
+
+  Starlette 默认 chunk_size 是 64KB。对 2GB 级别的视频，每次 chunk 都要走
+  一遍 asyncio + SSL 加密 + ASGI send 的热路径，HTTPS 下单连接吞吐很容易
+  被打到几 MB/s。改成 8MB 后同样的数据量循环次数 / 加密调用次数减 128 倍，
+  对 2.5G LAN 这种高带宽场景效果非常明显。
+
+  现代 uvicorn 对非 Range 响应会自动走 `http.response.pathsend`（sendfile
+  零拷贝），跟这里 chunk_size 无关；这里主要优化的是 Range（206）路径。
+  """
+  chunk_size = 8 * 1024 * 1024
 
 from .we_scan import (
     load_we_config, extract_folders_list, build_folder_tree, scan_workshop_items,
@@ -50,6 +63,26 @@ os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 VIDEO_CACHE_DIR = os.getenv("VIDEO_CACHE_DIR", os.path.join(DATA_DIR, "video_cache"))
 os.makedirs(VIDEO_CACHE_DIR, exist_ok=True)
 
+# === HLS 切片缓存：ffmpeg -c copy 把原 MP4 remux 成 HLS 播放列表 + ts 段 ===
+# 不再前端用 mp4box+MSE 拼，直接让浏览器/HLS.js 按段拉，Jellyfin 同款思路
+# 配置项：
+# - HLS_CACHE_DIR：缓存目录
+# - HLS_SEGMENT_SEC：每段时长（秒），ffmpeg 会就近往 GOP 边界对齐
+# - HLS_CACHE_MAX_TOTAL_GB：超过总大小 LRU 删
+# - HLS_CACHE_MAX_AGE_DAYS：超过天数直接删
+# - HLS_TRANSCODE_FALLBACK：当 -c copy 失败（如 HEVC/VP9 没法塞 mpegts）时的兜底模式
+#       auto    → 试 nvenc → qsv → libx264（推荐，有显卡走显卡）
+#       nvenc   → 只用 NVIDIA NVENC
+#       qsv     → 只用 Intel iGPU QSV
+#       libx264 → 纯 CPU
+#       none    → 不兜底，直接报错
+HLS_CACHE_DIR = os.getenv("HLS_CACHE_DIR", os.path.join(DATA_DIR, "hls_cache"))
+os.makedirs(HLS_CACHE_DIR, exist_ok=True)
+HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "6"))
+HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
+HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
+HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
+
 # === 音频缓存定时清理（避免 audio_cache 无限膨胀） ===
 # - AUDIO_CACHE_MAX_AGE_DAYS：超过多少天的缓存直接删除
 # - AUDIO_CACHE_MAX_TOTAL_MB：目录总大小超过多少 MB 时，从最旧开始删到低于阈值
@@ -68,6 +101,7 @@ def _get_conn():
     统一在同一个 SQLite 里维护：
     - watched(id, watched)
     - faststart(workshop_id, done)
+    - progress(id, position, duration)    —— 播放进度（断点续播）
     """
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     # watched 表（原有）
@@ -78,7 +112,7 @@ def _get_conn():
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
-    # ★ faststart 表（新增）：记录某个创意工坊 ID 是否已 faststart 过
+    # ★ faststart 表：记录某个创意工坊 ID 是否已 faststart 过
     conn.execute("""
     CREATE TABLE IF NOT EXISTS faststart (
         workshop_id TEXT PRIMARY KEY,
@@ -86,7 +120,24 @@ def _get_conn():
         updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
+    # ★ progress 表：播放进度（断点续播）
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS progress (
+        id         TEXT PRIMARY KEY,
+        position   REAL NOT NULL DEFAULT 0,
+        duration   REAL NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
     return conn
+
+# ========= 播放进度相关阈值 =========
+# 播放完成阈值：超过总时长 90% 视为已看完，清除进度并自动标记为 watched
+PROGRESS_COMPLETE_RATIO = float(os.getenv("PROGRESS_COMPLETE_RATIO", "0.90"))
+# 起始忽略阈值：进度小于 5% 不保存（防止误点）
+PROGRESS_START_RATIO = float(os.getenv("PROGRESS_START_RATIO", "0.05"))
+# 绝对最低进度（秒）：即使 5% 对应 < 此值，也需达到才保存
+PROGRESS_MIN_POSITION_SEC = float(os.getenv("PROGRESS_MIN_POSITION_SEC", "5"))
 
 def _faststart_is_done(vid_id: str) -> bool:
     with _db_lock:
@@ -109,6 +160,14 @@ def _faststart_mark_done(vid_id: str):
 class WatchedSet(BaseModel):
     ids: List[str]
     watched: bool = True
+
+class ProgressSet(BaseModel):
+    id: str
+    position: float
+    duration: float = 0
+
+class ProgressClear(BaseModel):
+    ids: List[str]
 
 # ★ 新增：文件夹相关的请求模型
 class CreateFolderRequest(BaseModel):  # ★ 新增
@@ -556,6 +615,60 @@ def _build_video_out(id_map, vid_id) -> VideoOut:
     is_workshop=is_ws,
   )
 
+_video_orientation_cache = {}
+def _video_orientation_meta(v):
+  """
+  返回用于前端壁纸模式筛选竖屏/横屏的轻量元数据。
+  只在用户打开文件夹播放菜单时按需 ffprobe，并按 path+mtime+size 缓存。
+  """
+  path = getattr(v, "video_path", "") or ""
+  if not path or not os.path.isfile(path):
+    return {"width": 0, "height": 0, "orientation": "unknown"}
+  key = (path, float(getattr(v, "mtime", 0) or 0), int(getattr(v, "size", 0) or 0))
+  cached = _video_orientation_cache.get(key)
+  if cached:
+    return cached
+  meta = {"width": 0, "height": 0, "orientation": "unknown"}
+  try:
+    p = subprocess.run(
+      [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+        "-of", "json",
+        path,
+      ],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      text=True,
+      timeout=5,
+    )
+    info = json.loads(p.stdout or "{}")
+    streams = info.get("streams") or []
+    st = streams[0] if streams else {}
+    w = int(st.get("width") or 0)
+    h = int(st.get("height") or 0)
+    rot = 0
+    try:
+      rot = int((st.get("tags") or {}).get("rotate") or 0)
+    except Exception:
+      rot = 0
+    for sd in (st.get("side_data_list") or []):
+      if "rotation" in sd:
+        try:
+          rot = int(float(sd.get("rotation") or 0))
+        except Exception:
+          pass
+        break
+    if abs(rot) % 180 == 90:
+      w, h = h, w
+    if w > 0 and h > 0:
+      meta = {"width": w, "height": h, "orientation": "portrait" if h > w else "landscape"}
+  except Exception:
+    pass
+  _video_orientation_cache[key] = meta
+  return meta
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
   # 给模板一个 cache-bust 参数，避免前端 app.js 被浏览器长期缓存导致功能不更新
@@ -563,7 +676,7 @@ def index(request: Request):
     request.scope["ts"] = str(int(time.time()))
   except Exception:
     request.scope["ts"] = "0"
-  return templates.TemplateResponse("index.html", {"request": request})
+  return templates.TemplateResponse(request, "index.html", {"request": request})
 
 # ★ 启动异步预扫描（预热缓存）
 @app.on_event("startup")
@@ -597,6 +710,96 @@ def api_set_watched(payload: WatchedSet):
   with _db_lock:
     conn = _get_conn()
     conn.executemany(sql, data)
+    # 用户切换观看状态 → 同步清除该视频的播放进度
+    # - 标记已看：避免留着旧进度，下次恢复到半截位置
+    # - 标记未看：常见用法"已看→未看"表达"想重新看一次"，清零以从头播放
+    q = ",".join("?" for _ in ids)
+    conn.execute(f"DELETE FROM progress WHERE id IN ({q})", ids)
+    conn.commit()
+    conn.close()
+  return {"ok": True, "count": len(ids)}
+
+# ========== 播放进度 API ==========
+@app.get("/api/progress")
+def api_get_progress(ids: str = ""):
+  """批量获取播放进度：ids 为逗号分隔的视频 id。"""
+  ids_list = [x.strip() for x in ids.split(",") if x.strip()]
+  if not ids_list:
+    return {"progress": {}}
+  q = ",".join("?" for _ in ids_list)
+  with _db_lock:
+    conn = _get_conn()
+    rows = conn.execute(
+      f"SELECT id, position, duration FROM progress WHERE id IN ({q})",
+      ids_list,
+    ).fetchall()
+    conn.close()
+  return {
+    "progress": {
+      r[0]: {"position": float(r[1] or 0), "duration": float(r[2] or 0)}
+      for r in rows
+    }
+  }
+
+@app.post("/api/progress")
+def api_set_progress(payload: ProgressSet):
+  """
+  上报播放进度。
+  - 若 position/duration 达到完成阈值（>=90%）：删除进度并自动标记 watched=1
+  - 若过短（<5% 且 < PROGRESS_MIN_POSITION_SEC）：丢弃
+  - 否则：插入/更新
+  """
+  vid = str(payload.id or "").strip()
+  if not vid:
+    return {"ok": False, "error": "missing-id"}
+  pos = max(0.0, float(payload.position or 0))
+  dur = max(0.0, float(payload.duration or 0))
+
+  # 完成 → 清进度 + 标记 watched
+  if dur > 0 and pos / dur >= PROGRESS_COMPLETE_RATIO:
+    with _db_lock:
+      conn = _get_conn()
+      conn.execute("DELETE FROM progress WHERE id=?", (vid,))
+      conn.execute(
+        """INSERT INTO watched(id, watched, updated_at)
+           VALUES(?, 1, CURRENT_TIMESTAMP)
+           ON CONFLICT(id) DO UPDATE SET watched=1, updated_at=CURRENT_TIMESTAMP""",
+        (vid,),
+      )
+      conn.commit()
+      conn.close()
+    return {"ok": True, "completed": True}
+
+  # 进度过短 → 忽略（但不删除已有记录，避免抖动覆盖）
+  ratio_ok = (dur <= 0) or (pos / dur >= PROGRESS_START_RATIO)
+  if pos < PROGRESS_MIN_POSITION_SEC or not ratio_ok:
+    return {"ok": True, "skipped": True}
+
+  with _db_lock:
+    conn = _get_conn()
+    conn.execute(
+      """INSERT INTO progress(id, position, duration, updated_at)
+         VALUES(?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(id) DO UPDATE SET
+           position=excluded.position,
+           duration=excluded.duration,
+           updated_at=CURRENT_TIMESTAMP""",
+      (vid, pos, dur),
+    )
+    conn.commit()
+    conn.close()
+  return {"ok": True}
+
+@app.post("/api/progress/clear")
+def api_clear_progress(payload: ProgressClear):
+  """清除若干视频的播放进度。"""
+  ids = [str(i) for i in (payload.ids or []) if str(i)]
+  if not ids:
+    return {"ok": True, "count": 0}
+  q = ",".join("?" for _ in ids)
+  with _db_lock:
+    conn = _get_conn()
+    conn.execute(f"DELETE FROM progress WHERE id IN ({q})", ids)
     conn.commit()
     conn.close()
   return {"ok": True, "count": len(ids)}
@@ -623,7 +826,6 @@ def api_scan(
   if entry:
     current_subfolders = entry["subfolders"] or []
     current_item_ids = list(entry["vids"] or [])
-    all_item_ids = list(entry["all_vids"] or [])
     breadcrumb = parts
   else:
     # 兜底（理论上不会走到）
@@ -634,36 +836,40 @@ def api_scan(
     else:
       current_subfolders, current_item_ids = find_node_by_path(folder_roots, parts)
       breadcrumb = parts
-    # 回退时仅在需要时做递归
-    all_item_ids = list(current_item_ids) + all_ids_recursive(current_subfolders)
 
   tokens = [t.casefold() for t in q.split() if t.strip()]
-  if tokens:
-    base_ids = list(dict.fromkeys(all_item_ids))  # 去重保持顺序
-  else:
-    base_ids = list(current_item_ids)
 
-  vids: List[str] = []
-  for vid in base_ids:
+  def _passes(vid: str) -> bool:
     v = id_map.get(vid)
     if not v:
-      continue
+      return False
     if mature_only and (v.rating or "").lower() != "mature":
-      continue
+      return False
     if tokens:
       title_cf = v.title.casefold()
       if not all(tok in title_cf for tok in tokens):
-        continue
-    vids.append(vid)
+        return False
+    return True
+
+  # 当前目录「直属」视频按过滤条件保留；搜索时也只平铺当前层，不把子文件夹里
+  # 的命中项拉上来，避免用户反馈的「搜索后全部被拍平」。
+  vids: List[str] = [vid for vid in current_item_ids if _passes(vid)]
 
   key, rev = _sort_key(sort_idx)
   vids.sort(key=lambda _id: key(id_map[_id]), reverse=rev)
 
+  # 文件夹渲染：
+  #   - 无搜索词：展示所有子文件夹（原行为）
+  #   - 有搜索词：仅展示「其下（递归）存在匹配视频」的子文件夹；点进去后因为
+  #     前端仍会携带 q 参数请求，内部照样按关键词过滤。这样就保留了目录结构。
   folders_out: List[FolderOut] = []
-  if not tokens:
+  for sf in current_subfolders:
+    if tokens:
+      sub_ids = all_ids_recursive([sf])
+      if not any(_passes(i) for i in sub_ids):
+        continue
     # ★ 激进加速：不再递归统计数量（前端已不显示），统一返回 0
-    for sf in current_subfolders:
-      folders_out.append(FolderOut(title=sf.title, count=0))
+    folders_out.append(FolderOut(title=sf.title, count=0))
 
   total_tiles = len(folders_out) + len(vids)
   total_pages = max(1, math.ceil(total_tiles / per_page))
@@ -701,7 +907,8 @@ def api_folder_videos(
   path: str = Query("/", description="形如 /A/B"),
   sort_idx: int = Query(0, ge=0, le=5),
   mature_only: bool = Query(False),
-  with_meta: bool = Query(False)
+  with_meta: bool = Query(False),
+  with_orientation: bool = Query(False)
 ):
   folder_roots, id_map, root_unassigned = _scan_state()
   parts = [p for p in path.split("/") if p]
@@ -726,7 +933,22 @@ def api_folder_videos(
   key, rev = _sort_key(sort_idx)
   vids.sort(key=lambda _id: key(id_map[_id]), reverse=rev)
   if with_meta:
-    return {"items": [{"id": i, "title": id_map[i].title} for i in vids]}
+    items = []
+    for i in vids:
+      v = id_map[i]
+      item = {
+        "id": i,
+        "title": v.title,
+      }
+      if with_orientation:
+        meta = _video_orientation_meta(v)
+        item.update({
+          "width": meta.get("width", 0),
+          "height": meta.get("height", 0),
+          "orientation": meta.get("orientation", "unknown"),
+        })
+      items.append(item)
+    return {"items": items}
   return {"ids": vids}
 
 # === 右键/菜单用：列出“移动到 …”二级菜单（包含已有文件夹与子文件夹） ===
@@ -1176,9 +1398,6 @@ def api_repair_inplace(vid_id: str, mode: str = Query("auto", description="auto|
 # =======================
 # 媒体传输（预览 & 视频）
 # =======================
-CHUNK = 8 * 1024 * 1024  # LAN 下更大的块
-_range_re = re.compile(r"bytes=(\d*)-(\d*)$")
-
 def _etag_for(path: str) -> str:
   st = os.stat(path)
   return f'W/"{st.st_ino}-{st.st_size}-{int(st.st_mtime)}"'
@@ -1187,6 +1406,99 @@ def _last_modified_str(path: str) -> str:
   st = os.stat(path)
   dt = datetime.utcfromtimestamp(st.st_mtime)
   return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+# === 媒体文件 OS page cache 预热 ===
+# 关键瓶颈：浏览器 buffer 见底 -> 发新 Range 请求 -> 服务端到磁盘 seek (HDD 上百 ms) -> 数据到达。
+# 提前让内核把整段文件读进 page cache，后续 Range 请求只走内存，能从根本上消除"卡一下"的空窗期。
+#
+# 策略：
+#   - 同一个绝对路径在一次容器生命周期内只预热一次（_prewarmed 记忆）
+#   - 限制总体并发，防止用户连续点几十个视频时把磁盘打爆
+#   - 限制单文件大小（默认 < 2GB），避免极端大文件挤掉别的缓存
+#   - 后台线程，daemon=True，不阻塞请求响应
+_prewarmed_paths: set[str] = set()
+_prewarm_lock = threading.Lock()
+_prewarm_sem = threading.BoundedSemaphore(2)  # 最多 2 个文件同时预热
+_PREWARM_MAX_BYTES = int(os.getenv("PREWARM_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2GB
+
+def _prewarm_into_page_cache(path: str):
+  """异步把整个文件读一遍喂进 OS page cache。
+
+  - 用 posix_fadvise(WILLNEED) 给内核异步 readahead 提示，立即生效。
+  - 再起一个后台线程把文件完整读一遍，确保覆盖大型 mp4 的所有 cluster，
+    之后任何 Range 请求都能秒级命中 page cache。
+  - 同一路径只做一次。
+  """
+  try:
+    ap = os.path.abspath(path)
+  except Exception:
+    return
+  with _prewarm_lock:
+    if ap in _prewarmed_paths:
+      return
+    _prewarmed_paths.add(ap)
+
+  # 1) 立即下发非阻塞 readahead 提示，由内核自己决定怎么读。
+  try:
+    if hasattr(os, "posix_fadvise"):
+      fd = os.open(ap, os.O_RDONLY)
+      try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+      finally:
+        os.close(fd)
+  except Exception:
+    pass
+
+  # 2) 后台线程整段读一次，确保 page cache 真的落上。
+  def _do():
+    if not _prewarm_sem.acquire(blocking=False):
+      # 并发上限到了，让出（已经下过 fadvise 提示，内核也会自己 readahead）
+      return
+    try:
+      st = os.stat(ap)
+      if st.st_size <= 0 or st.st_size > _PREWARM_MAX_BYTES:
+        return
+      with open(ap, "rb", buffering=0) as f:
+        while True:
+          chunk = f.read(4 * 1024 * 1024)  # 4MB
+          if not chunk:
+            break
+    except Exception:
+      # 预热失败不影响播放，移出已预热集合，下次还可以再试。
+      with _prewarm_lock:
+        _prewarmed_paths.discard(ap)
+    finally:
+      try:
+        _prewarm_sem.release()
+      except Exception:
+        pass
+
+  threading.Thread(target=_do, daemon=True, name=f"prewarm-{os.path.basename(ap)[:32]}").start()
+
+
+def _send_media_file(path: str, media_type: str, etag: str, last_mod: str):
+  """直接由 FastAPI 发送媒体文件。
+
+  现代 Starlette FileResponse 已经原生支持：
+    - HTTP Range（206 Partial Content）
+    - 304 If-None-Match / If-Modified-Since（这里也额外做了一道）
+    - 与 uvicorn 配合的 zero-copy `http.response.pathsend`（即 sendfile）
+
+  我们额外：
+    - chunk 调大到 1MB（FastFileResponse）
+    - 触发 OS page cache 预热，消除浏览器 Range 拉取空窗期的磁盘 seek 延迟
+  """
+  if not os.path.isfile(path):
+    raise HTTPException(404)
+  _prewarm_into_page_cache(path)
+  return FastFileResponse(path, media_type=media_type, headers={
+    "Accept-Ranges": "bytes",
+    "ETag": etag,
+    "Last-Modified": last_mod,
+    "Cache-Control": "public, max-age=31536000, immutable",
+  })
 
 # =======================
 # 视频转码缓存（video_cache/<vid_id>/...）
@@ -1333,33 +1645,6 @@ def _reencode_to_video_cache(vid_id: str, src_path: str) -> dict:
     except Exception:
       pass
     return {"ok": False, "error": f"ffmpeg-reencode-cache-failed:{e}", "path": src_path}
-
-def _parse_range_header(range_header: str, file_size: int):
-  if not range_header:
-    return None, None
-  if "," in range_header:
-    return None, "MULTI"
-  m = _range_re.match(range_header.strip())
-  if not m:
-    return None, "BAD"
-  start_s, end_s = m.groups()
-  if start_s == "" and end_s == "":
-    return None, "BAD"
-  if start_s == "":  # bytes=-N
-    length = int(end_s or "0")
-    if length <= 0:
-      return None, "BAD"
-    start = max(0, file_size - length)
-    end = file_size - 1
-  else:
-    start = int(start_s)
-    end = int(end_s) if end_s else file_size - 1
-  if start >= file_size:
-    return None, "OUT"
-  end = min(end, file_size - 1)
-  if start > end:
-    return None, "BAD"
-  return (start, end), None
 
 # ======= 预览图（新增：缩放/转码/缓存） =======
 def _client_supports_webp(request: Request) -> bool:
@@ -1571,6 +1856,225 @@ def media_preview(vid_id: str, request: Request,
         "Vary": "Accept",
       })
 
+# =======================
+# HLS 切片（jellyfin 同款思路：ffmpeg remux 成 m3u8 + ts 段，HLS.js 播）
+# =======================
+def _hls_dir_for(vid_id: str) -> str:
+  return os.path.join(HLS_CACHE_DIR, str(vid_id))
+
+# 同 vid_id 同时只跑一个 ffmpeg
+_hls_locks: dict[str, threading.Lock] = {}
+_hls_locks_guard = threading.Lock()
+
+def _hls_lock(vid_id: str) -> threading.Lock:
+  with _hls_locks_guard:
+    if vid_id not in _hls_locks:
+      _hls_locks[vid_id] = threading.Lock()
+    return _hls_locks[vid_id]
+
+def _hls_is_ready(out_dir: str, src_path: str | None = None) -> bool:
+  pl = os.path.join(out_dir, "playlist.m3u8")
+  if not os.path.isfile(pl):
+    return False
+  # 源文件比缓存新（被修复/替换了）→ 失效
+  if src_path and os.path.isfile(src_path):
+    try:
+      if os.path.getmtime(src_path) > os.path.getmtime(pl):
+        return False
+    except Exception:
+      pass
+  # 完成的 playlist 末尾会有 #EXT-X-ENDLIST
+  try:
+    with open(pl, "rb") as f:
+      f.seek(max(0, os.path.getsize(pl) - 256))
+      tail = f.read().decode("utf-8", errors="ignore")
+      return "#EXT-X-ENDLIST" in tail
+  except Exception:
+    return False
+
+def _hls_base_muxer_args(seg_pat: str, playlist: str) -> list[str]:
+  return [
+    "-f", "hls",
+    "-hls_time", str(HLS_SEGMENT_SEC),
+    "-hls_list_size", "0",
+    "-hls_segment_type", "mpegts",
+    "-hls_playlist_type", "vod",
+    "-hls_flags", "independent_segments",
+    "-hls_segment_filename", seg_pat,
+    playlist,
+  ]
+
+def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str) -> list[str]:
+  """生成不同编码模式的 ffmpeg 命令。"""
+  muxer = _hls_base_muxer_args(seg_pat, playlist)
+  if mode == "copy":
+    # 纯 remux，秒切、零 GPU
+    return [
+      "ffmpeg", "-loglevel", "error", "-y",
+      "-i", src_path,
+      "-map", "0:v:0?", "-map", "0:a:0?",
+      "-c", "copy",
+    ] + muxer
+  if mode == "nvenc":
+    # NVIDIA NVENC：有独显时优先用硬件编码做兜底转码
+    return [
+      "ffmpeg", "-loglevel", "error", "-y",
+      "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+      "-i", src_path,
+      "-map", "0:v:0?", "-map", "0:a:0?",
+      "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+      "-rc", "vbr", "-cq", "23", "-b:v", "0",
+      "-c:a", "aac", "-b:a", "192k",
+    ] + muxer
+  if mode == "qsv":
+    # Intel iGPU QSV：NVIDIA 不可用时用核显硬件编码兜底
+    return [
+      "ffmpeg", "-loglevel", "error", "-y",
+      "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
+      "-i", src_path,
+      "-map", "0:v:0?", "-map", "0:a:0?",
+      "-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "22",
+      "-c:a", "aac", "-b:a", "192k",
+    ] + muxer
+  # libx264 兜底（纯 CPU）
+  return [
+    "ffmpeg", "-loglevel", "error", "-y",
+    "-i", src_path,
+    "-map", "0:v:0?", "-map", "0:a:0?",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+    "-c:a", "aac", "-b:a", "192k",
+    "-pix_fmt", "yuv420p",
+  ] + muxer
+
+def _hls_attempt_chain() -> list[str]:
+  """根据 HLS_TRANSCODE_FALLBACK 决定 -c copy 失败后的尝试顺序。"""
+  if HLS_TRANSCODE_FALLBACK == "none":
+    return ["copy"]
+  if HLS_TRANSCODE_FALLBACK == "nvenc":
+    return ["copy", "nvenc"]
+  if HLS_TRANSCODE_FALLBACK == "qsv":
+    return ["copy", "qsv"]
+  if HLS_TRANSCODE_FALLBACK == "libx264":
+    return ["copy", "libx264"]
+  # auto：copy → nvenc → qsv → libx264
+  return ["copy", "nvenc", "qsv", "libx264"]
+
+def _ensure_hls_encoded(vid_id: str, src_path: str) -> str:
+  """同步：确保 HLS 已切完。返回 playlist 路径。
+  第一次切 -c copy 最长几十秒（取决于磁盘速度），之后 instant。
+  copy 失败会按 HLS_TRANSCODE_FALLBACK 链路自动回落到 GPU/CPU 真转码。
+  """
+  out_dir = _hls_dir_for(vid_id)
+  playlist = os.path.join(out_dir, "playlist.m3u8")
+  if _hls_is_ready(out_dir, src_path):
+    try: os.utime(playlist, None)
+    except Exception: pass
+    return playlist
+
+  lock = _hls_lock(vid_id)
+  with lock:
+    if _hls_is_ready(out_dir, src_path):
+      try: os.utime(playlist, None)
+      except Exception: pass
+      return playlist
+
+    seg_pat = os.path.join(out_dir, "seg_%05d.ts")
+    attempts = _hls_attempt_chain()
+    last_err = ""
+    for mode in attempts:
+      # 每次尝试前清空残留（半成品 / 上次失败的 .ts 段）
+      if os.path.isdir(out_dir):
+        try: shutil.rmtree(out_dir)
+        except Exception: pass
+      os.makedirs(out_dir, exist_ok=True)
+
+      cmd = _hls_cmd_for_mode(mode, src_path, seg_pat, playlist)
+      t0 = time.time()
+      try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+      except subprocess.TimeoutExpired:
+        last_err = f"timeout (mode={mode})"
+        logging.warning("[hls] %s for %s", last_err, vid_id)
+        continue
+      if proc.returncode == 0 and _hls_is_ready(out_dir):
+        logging.info("[hls] encoded %s mode=%s in %.1fs", vid_id, mode, time.time() - t0)
+        threading.Thread(target=_cleanup_hls_cache_dir, daemon=True).start()
+        return playlist
+      last_err = (proc.stderr or b"").decode("utf-8", errors="ignore")[-400:]
+      logging.warning("[hls] mode=%s failed for %s rc=%d: %s",
+                      mode, vid_id, proc.returncode, last_err)
+
+    raise HTTPException(500, f"hls encode failed (tried {attempts}): {last_err}")
+
+def _cleanup_hls_cache_dir():
+  """LRU + 过期清理。简单实现：按 mtime 排序，超过 GB 阈值或天数阈值的整目录删。"""
+  try:
+    entries = []
+    total = 0
+    now = time.time()
+    for name in os.listdir(HLS_CACHE_DIR):
+      d = os.path.join(HLS_CACHE_DIR, name)
+      if not os.path.isdir(d):
+        continue
+      pl = os.path.join(d, "playlist.m3u8")
+      if not os.path.isfile(pl):
+        # 残骸目录直接删
+        try: shutil.rmtree(d)
+        except Exception: pass
+        continue
+      size = 0
+      for root, _, files in os.walk(d):
+        for fn in files:
+          try: size += os.path.getsize(os.path.join(root, fn))
+          except Exception: pass
+      mtime = os.path.getmtime(pl)
+      entries.append((mtime, size, d))
+      total += size
+    # 过期
+    max_age = HLS_CACHE_MAX_AGE_DAYS * 86400
+    for mtime, size, d in list(entries):
+      if (now - mtime) > max_age:
+        try: shutil.rmtree(d); total -= size
+        except Exception: pass
+        entries.remove((mtime, size, d))
+    # 容量
+    cap = int(HLS_CACHE_MAX_TOTAL_GB * 1024 * 1024 * 1024)
+    if total > cap:
+      entries.sort(key=lambda x: x[0])  # 老的在前
+      for mtime, size, d in entries:
+        if total <= cap: break
+        try: shutil.rmtree(d); total -= size
+        except Exception: pass
+  except Exception as e:
+    logging.warning("[hls] cleanup error: %s", e)
+
+@app.get("/media/hls/{vid_id}/playlist.m3u8")
+def hls_playlist(vid_id: str):
+  _, id_map, _ = _scan_state()
+  v = id_map.get(vid_id)
+  if not v: raise HTTPException(404)
+  src_path = v.video_path
+  cache_path = _get_video_cache_path_if_any(vid_id, src_path)
+  path = cache_path or src_path
+  pl = _ensure_hls_encoded(vid_id, path)
+  return FileResponse(pl, media_type="application/vnd.apple.mpegurl", headers={
+    "Cache-Control": "no-store",
+  })
+
+# 段文件名是 ffmpeg 生成的 seg_NNNNN.ts；走静态文件 + page cache 预热
+@app.get("/media/hls/{vid_id}/{segment}")
+def hls_segment(vid_id: str, segment: str):
+  if not re.fullmatch(r"seg_\d{1,8}\.ts", segment):
+    raise HTTPException(404)
+  out_dir = _hls_dir_for(vid_id)
+  seg_path = os.path.join(out_dir, segment)
+  if not os.path.isfile(seg_path):
+    raise HTTPException(404)
+  return FastFileResponse(seg_path, media_type="video/mp2t", headers={
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "public, max-age=31536000, immutable",
+  })
+
 @app.get("/media/video/{vid_id}")
 def media_video(request: Request, vid_id: str):
   _, id_map, _ = _scan_state()
@@ -1580,7 +2084,6 @@ def media_video(request: Request, vid_id: str):
   # ★ 若存在有效的转码缓存，则优先用缓存文件（不覆盖原文件也能在 WebUI 播放）
   cache_path = _get_video_cache_path_if_any(vid_id, src_path)
   path = cache_path or src_path
-  file_size = os.path.getsize(path)
   mime, _ = mimetypes.guess_type(path)
   mime = mime or "application/octet-stream"
 
@@ -1609,46 +2112,24 @@ def media_video(request: Request, vid_id: str):
     except Exception:
       pass
 
-  range_header = request.headers.get("range")
-  rng, err = _parse_range_header(range_header, file_size) if range_header else (None, None)
+  return _send_media_file(path, mime, etag, last_mod)
 
-  if not rng:
-    if err == "MULTI" or err in ("BAD", "OUT"):
-      return Response(status_code=416, headers={
-        "Content-Range": f"bytes */{file_size}",
-        "Accept-Ranges": "bytes",
-        "ETag": etag,
-        "Last-Modified": last_mod,
-      })
-    return FileResponse(path, media_type=mime, headers={
-      "Accept-Ranges": "bytes",
-      "ETag": etag,
-      "Last-Modified": last_mod,
-      "Cache-Control": "public, max-age=31536000, immutable",
-    })
-
-  start, end = rng
-  length = end - start + 1
-
-  def iterfile():
-    with open(path, "rb") as f:
-      f.seek(start)
-      remaining = length
-      while remaining > 0:
-        data = f.read(min(CHUNK, remaining))
-        if not data: break
-        remaining -= len(data)
-        yield data
-
-  headers = {
-    "Content-Range": f"bytes {start}-{end}/{file_size}",
-    "Accept-Ranges": "bytes",
-    "Content-Length": str(length),
-    "ETag": etag,
-    "Last-Modified": last_mod,
-    "Cache-Control": "public, max-age=31536000, immutable",
+@app.get("/debug/media/{vid_id}")
+def debug_media(vid_id: str):
+  _, id_map, _ = _scan_state()
+  v = id_map.get(vid_id)
+  if not v:
+    raise HTTPException(404)
+  src_path = v.video_path
+  cache_path = _get_video_cache_path_if_any(vid_id, src_path)
+  path = cache_path or src_path
+  return {
+    "id": str(vid_id),
+    "path": path,
+    "exists": os.path.isfile(path),
+    "readable_by_fastapi": os.access(path, os.R_OK),
+    "size": os.path.getsize(path) if os.path.isfile(path) else 0,
   }
-  return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=mime)
 
 # =======================
 # 新增：/media/audio/{vid_id} 纯音频直出（缓存 + Range）
@@ -1888,7 +2369,6 @@ def media_audio(request: Request, vid_id: str):
     mime, _ = mimetypes.guess_type(src_path)
     mime = mime or "application/octet-stream"
 
-  file_size = os.path.getsize(cache_path)
   etag = _etag_for(cache_path)
   last_mod = _last_modified_str(cache_path)
 
@@ -1914,46 +2394,7 @@ def media_audio(request: Request, vid_id: str):
     except Exception:
       pass
 
-  range_header = request.headers.get("range")
-  rng, err = _parse_range_header(range_header, file_size) if range_header else (None, None)
-
-  if not rng:
-    if err == "MULTI" or err in ("BAD", "OUT"):
-      return Response(status_code=416, headers={
-        "Content-Range": f"bytes */{file_size}",
-        "Accept-Ranges": "bytes",
-        "ETag": etag,
-        "Last-Modified": last_mod,
-      })
-    return FileResponse(cache_path, media_type=mime, headers={
-      "Accept-Ranges": "bytes",
-      "ETag": etag,
-      "Last-Modified": last_mod,
-      "Cache-Control": "public, max-age=31536000, immutable",
-    })
-
-  start, end = rng
-  length = end - start + 1
-
-  def iterfile():
-    with open(cache_path, "rb") as f:
-      f.seek(start)
-      remaining = length
-      while remaining > 0:
-        data = f.read(min(CHUNK, remaining))
-        if not data: break
-        remaining -= len(data)
-        yield data
-
-  headers = {
-    "Content-Range": f"bytes {start}-{end}/{file_size}",
-    "Accept-Ranges": "bytes",
-    "Content-Length": str(length),
-    "ETag": etag,
-    "Last-Modified": last_mod,
-    "Cache-Control": "public, max-age=31536000, immutable",
-  }
-  return StreamingResponse(iterfile(), status_code=206, headers=headers, media_type=mime)
+  return _send_media_file(cache_path, mime, etag, last_mod)
 
 @app.get("/go/workshop/{vid_id}")
 def go_workshop(vid_id: str):
@@ -2019,7 +2460,7 @@ def _steam_url_with_hash(workshop_id: str, cb_url: str) -> str:
 @app.get("/unsub", response_class=HTMLResponse)
 def unsub_page(request: Request):
     # 模板 unsub.html 负责读取 ?ids= 和 batch= 并调用 /api/unsub/init
-    return templates.TemplateResponse("unsub.html", {"request": request})
+    return templates.TemplateResponse(request, "unsub.html", {"request": request})
 
 @app.post("/api/unsub/init")
 def api_unsub_init(request: Request, payload: dict = Body(..., embed=False)):
