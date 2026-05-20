@@ -80,7 +80,7 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v9"
+HLS_PIPELINE_VERSION = "hls-av-job-v10"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
@@ -2391,7 +2391,7 @@ def _hls_monitor_job(key: str, run_id: str, vid_id: str, start_idx: int, mode: s
   except Exception as e:
     rc = -1
     stderr = str(e).encode("utf-8", errors="ignore")
-  err = (stderr or b"").decode("utf-8", errors="ignore")[-800:]
+  err = (stderr or b"").decode("utf-8", errors="ignore")[-4000:]
   with _hls_jobs_guard:
     job = _hls_jobs.get(key)
     if not job or job.get("run_id") != run_id:
@@ -2440,6 +2440,7 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
       "done": False,
       "killed": False,
       "error": "",
+      "cmd": cmd,
       "proc": proc,
     }
     with _hls_jobs_guard:
@@ -2457,6 +2458,7 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
         with _hls_jobs_guard:
           cur = _hls_jobs.get(key)
           last_err = (cur or {}).get("error") or f"ffmpeg exited with {proc.returncode}"
+        logging.warning("[hls] start mode=%s exited before target seg=%s for %s: %s", mode, idx, vid_id, last_err)
         break
       time.sleep(0.1)
 
@@ -2714,6 +2716,7 @@ def hls_debug(vid_id: str):
       "killed": bool((job or {}).get("killed")),
       "error": (job or {}).get("error") or "",
       "started_at": (job or {}).get("started_at"),
+      "cmd": " ".join((job or {}).get("cmd") or []),
     },
     "disabled_modes": sorted(_hls_disabled_modes),
   }
