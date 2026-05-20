@@ -80,7 +80,7 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v10"
+HLS_PIPELINE_VERSION = "hls-av-job-v11"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
@@ -2122,9 +2122,10 @@ def _hls_keyframe_args(src_path: str, mode: str, start_number: int = 0) -> list[
 def _hls_color_normalize_filter(pix_fmt: str = "yuv420p") -> list[str]:
   return [
     "-vf",
-    f"scale=in_range=tv:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709,"
-    f"format={pix_fmt},"
-    "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+    # 先覆盖色彩属性，再进入 scale/format；否则异常源的色彩元数据会在滤镜入口报 Invalid color space。
+    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+    f"format={pix_fmt}",
   ]
 
 def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, start_number: int = 0, start_time: float = 0.0) -> list[str]:
@@ -2414,6 +2415,8 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
   target = _hls_segment_path(out_dir, idx)
   attempts = _hls_attempt_chain_for_source(src_path)
   last_err = ""
+  attempt_errors: list[str] = []
+  last_cmd: list[str] = []
   logging.info("[hls] start job vid=%s target=%s attempts=%s seg=%ss allow_copy=%s",
                vid_id, idx, attempts, HLS_SEGMENT_SEC, HLS_ALLOW_COPY)
   for mode in attempts:
@@ -2421,10 +2424,12 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
       os.makedirs(out_dir, exist_ok=True)
       _write_hls_meta(out_dir, src_path, mode)
       cmd = _hls_bg_cmd(mode, src_path, out_dir, idx)
+      last_cmd = cmd
       t0 = time.time()
       proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except Exception as e:
       last_err = str(e)
+      attempt_errors.append(f"{mode}: {last_err}")
       _hls_disable_mode(mode, last_err)
       continue
 
@@ -2458,6 +2463,7 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
         with _hls_jobs_guard:
           cur = _hls_jobs.get(key)
           last_err = (cur or {}).get("error") or f"ffmpeg exited with {proc.returncode}"
+        attempt_errors.append(f"{mode}: {last_err}")
         logging.warning("[hls] start mode=%s exited before target seg=%s for %s: %s", mode, idx, vid_id, last_err)
         break
       time.sleep(0.1)
@@ -2468,10 +2474,19 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
         return job
       _hls_kill_job(job)
       last_err = f"timeout waiting for segment {idx} (mode={mode})"
+      attempt_errors.append(f"{mode}: {last_err}")
     logging.warning("[hls] start mode=%s did not produce target seg=%s for %s: %s", mode, idx, vid_id, last_err)
 
   with _hls_jobs_guard:
-    failed = {"vid_id": vid_id, "src_path": src_path, "start_index": idx, "done": True, "error": last_err or "hls start failed", "proc": None}
+    failed = {
+      "vid_id": vid_id,
+      "src_path": src_path,
+      "start_index": idx,
+      "done": True,
+      "error": "\n\n".join(attempt_errors) or last_err or "hls start failed",
+      "cmd": last_cmd,
+      "proc": None,
+    }
     _hls_jobs[key] = failed
   raise HTTPException(504, f"hls start failed: {last_err}")
 
