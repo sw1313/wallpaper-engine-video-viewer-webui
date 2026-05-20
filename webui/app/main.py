@@ -80,7 +80,7 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v11"
+HLS_PIPELINE_VERSION = "hls-av-job-v12"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
@@ -2122,9 +2122,8 @@ def _hls_keyframe_args(src_path: str, mode: str, start_number: int = 0) -> list[
 def _hls_color_normalize_filter(pix_fmt: str = "yuv420p") -> list[str]:
   return [
     "-vf",
-    # 先覆盖色彩属性，再进入 scale/format；否则异常源的色彩元数据会在滤镜入口报 Invalid color space。
+    # 先覆盖色彩属性，再做像素格式转换；不需要缩放时避免额外 scale 触发异常源的色彩矩阵校验。
     "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
-    "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
     f"format={pix_fmt}",
   ]
 
@@ -2446,6 +2445,7 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
       "killed": False,
       "error": "",
       "cmd": cmd,
+      "attempts": attempts,
       "proc": proc,
     }
     with _hls_jobs_guard:
@@ -2485,6 +2485,7 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
       "done": True,
       "error": "\n\n".join(attempt_errors) or last_err or "hls start failed",
       "cmd": last_cmd,
+      "attempts": attempts,
       "proc": None,
     }
     _hls_jobs[key] = failed
@@ -2693,6 +2694,8 @@ def hls_info(vid_id: str):
     "use_hls": True,
     "segment_sec": HLS_SEGMENT_SEC,
     "allow_copy": HLS_ALLOW_COPY,
+    "transcode_fallback": HLS_TRANSCODE_FALLBACK,
+    "attempts": _hls_attempt_chain_for_source(path),
     "start_wait_sec": HLS_START_WAIT_SEC,
     "playlist_prime_segments": HLS_PLAYLIST_PRIME_SEGMENTS,
     "playlist_prime_wait_sec": HLS_PLAYLIST_PRIME_WAIT_SEC,
@@ -2720,6 +2723,8 @@ def hls_debug(vid_id: str):
     "segments": indexes[-20:],
     "segment_count": len(indexes),
     "current_index": _hls_current_segment_index(out_dir),
+    "transcode_fallback": HLS_TRANSCODE_FALLBACK,
+    "attempts": _hls_attempt_chain_for_source(path),
     "playlist_prime_segments": HLS_PLAYLIST_PRIME_SEGMENTS,
     "playlist_prime_wait_sec": HLS_PLAYLIST_PRIME_WAIT_SEC,
     "job": {
@@ -2732,6 +2737,7 @@ def hls_debug(vid_id: str):
       "error": (job or {}).get("error") or "",
       "started_at": (job or {}).get("started_at"),
       "cmd": " ".join((job or {}).get("cmd") or []),
+      "attempts": (job or {}).get("attempts") or [],
     },
     "disabled_modes": sorted(_hls_disabled_modes),
   }
