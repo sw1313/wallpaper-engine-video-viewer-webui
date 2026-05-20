@@ -80,7 +80,7 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v12"
+HLS_PIPELINE_VERSION = "hls-av-job-v13"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
@@ -1967,7 +1967,7 @@ def _probe_hls_codecs(src_path: str) -> dict:
     p = subprocess.run(
       [
         "ffprobe", "-v", "error",
-        "-show_entries", "stream=index,codec_type,codec_name,pix_fmt,duration,avg_frame_rate,r_frame_rate:format=duration",
+        "-show_entries", "stream=index,codec_type,codec_name,pix_fmt,duration,avg_frame_rate,r_frame_rate,color_space,color_transfer,color_primaries:format=duration",
         "-of", "json",
         src_path,
       ],
@@ -1992,6 +1992,9 @@ def _probe_hls_codecs(src_path: str) -> dict:
       if typ == "video" and not info["video"]:
         info["video"] = (s.get("codec_name") or "").lower()
         info["pix_fmt"] = (s.get("pix_fmt") or "").lower()
+        info["color_space"] = (s.get("color_space") or "").lower()
+        info["color_transfer"] = (s.get("color_transfer") or "").lower()
+        info["color_primaries"] = (s.get("color_primaries") or "").lower()
         for rate_key in ("avg_frame_rate", "r_frame_rate"):
           rate = (s.get(rate_key) or "").strip()
           if "/" in rate:
@@ -2049,6 +2052,17 @@ def _hls_can_copy_for_browser(src_path: str) -> bool:
   if audio and audio not in {"aac", "mp3"}:
     return False
   return True
+
+def _hls_needs_h264_metadata_fix(src_path: str) -> bool:
+  info = _probe_hls_codecs(src_path)
+  if (info.get("video") or "") != "h264":
+    return False
+  bad = {"", "unknown", "reserved", "unspecified"}
+  return (
+    (info.get("color_space") or "") in bad
+    or (info.get("color_transfer") or "") in bad
+    or (info.get("color_primaries") or "") in bad
+  )
 
 def _hls_is_ready(out_dir: str, src_path: str | None = None) -> bool:
   pl = os.path.join(out_dir, "playlist.m3u8")
@@ -2148,6 +2162,11 @@ def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, sta
   if mode == "copy":
     # 纯 remux，秒切、零 GPU；只在探测为浏览器可播时进入 copy。
     return base + ["-c", "copy"] + muxer
+  if mode == "copyfix":
+    return base + [
+      "-c", "copy",
+      "-bsf:v", "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
+    ] + muxer
   if mode == "nvenc":
     return base + [
       "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
@@ -2188,6 +2207,8 @@ def _hls_attempt_chain() -> list[str]:
 
 def _hls_attempt_chain_for_source(src_path: str) -> list[str]:
   attempts = _hls_attempt_chain()
+  if _hls_can_copy_for_browser(src_path) and _hls_needs_h264_metadata_fix(src_path):
+    attempts = ["copyfix"] + [x for x in attempts if x != "copy"]
   if "copy" in attempts and not _hls_can_copy_for_browser(src_path):
     # fallback=none 明确表示只想 copy，就尊重配置；其他模式直接跳过注定会被浏览器解析失败的 copy。
     if HLS_TRANSCODE_FALLBACK != "none":
