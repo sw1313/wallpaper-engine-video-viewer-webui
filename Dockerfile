@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # ↓ 给 nvidia-container-toolkit 用：docker run --gpus all 时会把 NVIDIA 驱动注入进来
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
-    # ↓ Intel iGPU 走 iHD 驱动；老的 i965 也兼容
+    # ↓ Intel iGPU 走 iHD 驱动（12400/13代/Arc）；老的 i965 也兼容
     LIBVA_DRIVER_NAME=iHD
 
 # ffmpeg：
@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-COPY webui/app /app/app
+COPY . /app/app
 RUN touch /app/app/__init__.py
 
 EXPOSE 8066

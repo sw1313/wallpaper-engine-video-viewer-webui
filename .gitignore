@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+
+# Local editor / agent state
+.idea/
+.vscode/
+.cursor/
+agent-tools/
+terminals/
+agent-transcripts/
+
+# Runtime data and caches
+data/
+preview_cache/
+audio_cache/
+video_cache/
+hls_cache/
+*.db
+*.db-*
+
+# Local Wallpaper Engine configuration can contain usernames and absolute paths.
+config.json
+
+# Local environment and logs
+.env
+.env.*
+*.log
+*.tmp
+*.bak
+
+# OS files
+Thumbs.db
+.DS_Store

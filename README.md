@@ -9,7 +9,7 @@
 - **目录浏览**：按 Wallpaper Engine 文件夹层级展示，支持面包屑、搜索、排序、分页/无限滚动。
 - **播放列表**：支持当前目录、文件夹递归、多选、未完成项目播放，以及带历史降权的随机播放。
 - **断点续播**：服务端 SQLite 保存进度；播放超过阈值后自动标记已看并清除进度。
-- **后台音频**：切到后台/锁屏后用独立音频流保持播放，支持 MediaSession 通知栏控制和进度条同步。
+- **移动端后台音频**：手机切到后台/锁屏后用独立音频流保持播放，支持 MediaSession 通知栏控制和进度条同步；桌面浏览器保持视频播放模式。
 - **HLS 视频播放**：Chrome/Edge/Firefox/Android 使用 HLS.js；Safari/iOS 使用原生 HLS；极端情况下回退原 MP4。
 - **媒体修复**：支持 faststart 无损重封装、按需 repair/reencode 缓存，不直接覆盖 Steam Workshop 原始文件的转码缓存。
 - **资源管理**：支持标记已看/未看、移动项目到文件夹、新建/删除文件夹、删除本地项目/Workshop 项目。
@@ -119,6 +119,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8066 --proxy-headers --no-access-log
 | `HLS_CACHE_MAX_TOTAL_GB` | HLS 缓存总大小上限，超过后按 LRU 清理 | `20` |
 | `HLS_CACHE_MAX_AGE_DAYS` | HLS 缓存最长保留天数 | `30` |
 | `HLS_TRANSCODE_FALLBACK` | `copy` 失败后的转码策略 | `auto` |
+| `HLS_START_WAIT_SEC` | 请求目标分片时等待 ffmpeg 产出该分片的最长秒数 | `90` |
+| `HLS_PLAYLIST_PRIME_SEGMENTS` | 首次请求 playlist 时预热等待的分片数量，设为 `0` 可关闭 | `3` |
+| `HLS_PLAYLIST_PRIME_WAIT_SEC` | 首次请求 playlist 时预热等待的最长秒数，超时不终止后台切片 | `6` |
 | `PROGRESS_COMPLETE_RATIO` | 超过总时长多少比例视为看完 | `0.90` |
 | `PROGRESS_START_RATIO` | 小于总时长多少比例不保存进度 | `0.05` |
 | `PROGRESS_MIN_POSITION_SEC` | 保存进度的最低秒数 | `5` |
@@ -139,8 +142,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8066 --proxy-headers --no-access-log
 视频播放入口仍是前端生成的 `/media/video/{id}`，但现代浏览器会被自动切到 HLS：
 
 1. 前端把 `/media/video/{id}` 转成 `/media/hls/{id}/playlist.m3u8`。
-2. 后端首次请求 playlist 时检查 `data/hls_cache/{id}`。
-3. 缓存不存在或源文件更新后，后端用 `ffmpeg` 生成 `playlist.m3u8` 和 `seg_*.ts`。
+2. 后端首次请求 playlist 时检查 `data/hls_cache/{id}`，并预启动 HLS 切片任务。
+3. 缓存不存在或源文件更新后，后端用 `ffmpeg` 生成 `playlist.m3u8` 和 `seg_*.ts`，默认会短暂等待前几个分片完成再返回。
 4. HLS.js 按需拉取切片，并保留较长前向缓冲；Safari/iOS 走原生 HLS。
 5. 如果 HLS 完全不可用，前端回退到 `/media/video/{id}` 原生 MP4 Range 播放。
 
@@ -173,7 +176,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8066 --proxy-headers --no-access-log
 
 ### 第一次播放很慢
 
-第一次请求 HLS playlist 会生成切片。H.264/AAC MP4 通常只是 remux，主要耗时是磁盘读取；如果 copy 失败并触发转码，会更慢但会缓存结果。第二次播放同一视频应直接命中缓存。
+第一次请求 HLS playlist 会预启动切片并短暂等待前几个分片。H.264/AAC MP4 通常只是 remux，主要耗时是磁盘读取；如果 copy 失败并触发转码，会更慢但会缓存结果。第二次播放同一视频应直接命中缓存。
+
+如果希望首次进入更快返回、少等预热，可调小或关闭：
+
+```bash
+-e HLS_PLAYLIST_PRIME_SEGMENTS=0
+```
 
 ### 没看到 GPU 占用
 

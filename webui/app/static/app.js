@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-57-hls-via-ffmpeg-2026-05-20");
+console.log("app.js version fs-72-mobile-only-bg-audio-2026-05-20");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -168,6 +168,7 @@ function detectByUA(){
 }
 const UA = detectByUA();
 const IS_MOBILE_UA = UA.isMobile;
+const BACKGROUND_AUDIO_MODE = IS_MOBILE_UA;
 
 /* ★ 新增：依据 UA 为 <html> 切换 is-desktop（仅桌面 UA 显示返回按钮） */
 try { document.documentElement.classList.toggle("is-desktop", !IS_MOBILE_UA); } catch(_){}
@@ -394,52 +395,29 @@ function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.p
 function showNotice(msg){ const n=$("notice"); if(!n) return; n.style.display="block"; n.innerHTML="ℹ︎ " + msg; }
 function clearNotice(){ const n=$("notice"); if(!n) return; n.style.display="none"; n.textContent=""; }
 
-// ===== Service Worker：持久缓存封面图（/media/preview/*）=====
-function _appVersionFromScript(){
+// 旧版本曾用 Service Worker 缓存媒体。HLS 方案不再需要 SW，这里只做静默清理：
+// - 不注册 /sw.js
+// - 如果浏览器里残留旧注册，尝试注销并删除旧 Cache Storage
+function cleanupLegacyServiceWorker(){
   try{
-    const scripts = Array.from(document.getElementsByTagName("script"));
-    const s = scripts.map(x=>x && x.src).filter(Boolean).find(src=>/\/static\/app\.js\?/i.test(src)) || "";
-    const u = new URL(s, location.origin);
-    return u.searchParams.get("v") || "";
-  }catch(_){ return ""; }
-}
-async function registerPreviewSW(){
-  if (!("serviceWorker" in navigator)){
-    console.warn("[wwui] this browser does not support Service Worker; media caching disabled");
-    return;
-  }
-  // SW 仅允许在安全上下文注册：HTTPS 或 http://localhost。
-  // 通过局域网 IP 访问时（如 http://192.168.x.x:8066）默认是被禁止的，
-  // 需要在 chrome://flags/#unsafely-treat-insecure-origin-as-secure 把该 origin 标记成安全，
-  // 否则下面的 register 会直接抛 SecurityError，缓存加速完全不会生效。
-  if (!window.isSecureContext){
-    console.warn(
-      "[wwui] page is not a secure context, Service Worker will be refused. " +
-      "Either visit via https://, or add this origin to " +
-      "chrome://flags/#unsafely-treat-insecure-origin-as-secure"
-    );
-  }
-  try{
-    const v = _appVersionFromScript();
-    const url = v ? (`/sw.js?v=${encodeURIComponent(v)}`) : "/sw.js";
-    const reg = await navigator.serviceWorker.register(url);
-    console.log("[wwui] Service Worker registered, scope =", reg.scope);
-  }catch(e){
-    console.warn("[wwui] Service Worker register failed:", e);
-  }
-}
-registerPreviewSW();
-
-// 文件就地变动后（faststart / repair / 缓存被替换等），让 SW 把这条媒体缓存丢掉，
-// 避免下一次播放仍然命中旧版本的 mp4 字节。
-function notifySWMediaInvalidate(){
-  try{
-    if (!("serviceWorker" in navigator)) return;
-    const sw = navigator.serviceWorker.controller;
-    if (!sw) return;
-    sw.postMessage({ type: "wwui-clear-media-cache" });
+    if ("serviceWorker" in navigator && navigator.serviceWorker.getRegistrations){
+      navigator.serviceWorker.getRegistrations()
+        .then(regs => regs.forEach(reg => { try{ reg.unregister(); }catch(_){} }))
+        .catch(()=>{});
+    }
+    if (window.caches && caches.keys){
+      caches.keys()
+        .then(keys => keys
+          .filter(k => /^wwui-(preview|media)-/i.test(k))
+          .forEach(k => { try{ caches.delete(k); }catch(_){} }))
+        .catch(()=>{});
+    }
   }catch(_){}
 }
+cleanupLegacyServiceWorker();
+
+// 兼容旧调用点：媒体修复后已靠 URL cacheBust / HLS segment 版本规避旧缓存。
+function notifySWMediaInvalidate(){}
 function _escHtml(s){
   // 注意：部分安卓 WebView/旧浏览器没有 String.prototype.replaceAll，会导致这里直接抛错，
   // 进而出现“点了修复完全没提示”的现象。用正则 replace 保守兼容。
@@ -1197,7 +1175,7 @@ function computeAudioBias(a){
 }
 
 /* ========== 后台保活（针对 Android 14+/澎湃 OS 3 AudioHardening 调优） ==========
-   关键背景（见 jellyfin/jellyfin-android#1781 日志）：
+   关键背景：
      AS.AudioService: AudioHardening background playback would be muted ..., level: partial
    系统 AudioHardening 的判定依据是 **AudioManager/MediaSession 侧的状态**，而不是 WebAudio
    的 destination 输出。也就是说：AudioContext 常量源这条路走不通（历史验证：gain 再怎么
@@ -1288,7 +1266,7 @@ function stopBgKeepAlive(){
 
 /* === 附加/预热（带 seek 策略） === */
 
-/* —— HLS 播放（jellyfin 同款思路）——
+/* —— HLS 播放 ——
  *  后端用 ffmpeg -c copy 把 MP4 实时 remux 成 HLS（.m3u8 + .ts 段），
  *  前端用 HLS.js 加载播放列表，激进缓冲 + 任意 seek 都不卡。
  *
@@ -1297,6 +1275,10 @@ function stopBgKeepAlive(){
  *    2. 原生 HLS（Safari/iOS）：video.src = playlist.m3u8 即可
  *    3. 都不支持 → 退回原生 MP4 src（旧行为）
  */
+
+// 所有视频统一走 HLS；只有浏览器不支持 HLS.js/原生 HLS 时才回退 MP4。
+const HLS_TARGET_BUFFER_SEC = 10 * 60;
+const HLS_MAX_BUFFER_BYTES = 768 * 1024 * 1024;
 
 function _videoIdFromMp4Src(src){
   // /media/video/123?v=xxx → 123
@@ -1309,6 +1291,25 @@ function _hlsPlaylistUrl(src){
   if (!vid) return null;
   // 不需要 cacheBust：HLS 段是 immutable 的，浏览器 304 命中即可
   return `/media/hls/${encodeURIComponent(vid)}/playlist.m3u8`;
+}
+
+const hlsInfoCache = new Map();
+async function _shouldUseHLSForSrc(src){
+  const vid = _videoIdFromMp4Src(src);
+  if (!vid) return false;
+  const key = String(vid);
+  const cached = hlsInfoCache.get(key);
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return true;
+  try{
+    const r = await fetch(`/media/hls/${encodeURIComponent(vid)}/info`, { cache:"no-store" });
+    if (!r.ok) return true; // 探测失败时仍走 HLS，让后端错误显性暴露
+    const j = await r.json();
+    const info = { use_hls: true, duration: Number(j.duration || 0), ts: Date.now() };
+    hlsInfoCache.set(key, info);
+    return true;
+  }catch(_){
+    return true;
+  }
 }
 
 function _hlsSupported(){
@@ -1362,20 +1363,22 @@ async function attachVideoSrc(src, resumeAt){
   const playlistUrl = _hlsPlaylistUrl(src);
 
   // 优先用 HLS.js（Chrome/Firefox/Edge/Android WebView）
-  if (playlistUrl && _hlsSupported()){
+  if (playlistUrl && _hlsSupported() && await _shouldUseHLSForSrc(src)){
     const hls = new window.Hls({
-      // 激进缓冲：内存里囤多少视频
-      maxBufferLength: 60,          // 一般情况下保持 60s 缓冲
-      maxMaxBufferLength: 600,      // 允许扩到 10 分钟（低码率视频可以整条吃完）
-      maxBufferSize: 200 * 1024 * 1024,  // 200MB 上限（不会撞 Chrome SB quota）
-      backBufferLength: 30,         // 已播过的保留 30s 用于回放
+      // 激进缓冲：尽量把短/中等长度视频整条 append 进 MSE，让进度条灰色缓存段明显前推。
+      maxBufferLength: HLS_TARGET_BUFFER_SEC,
+      maxMaxBufferLength: HLS_TARGET_BUFFER_SEC,
+      maxBufferSize: HLS_MAX_BUFFER_BYTES,
+      backBufferLength: HLS_TARGET_BUFFER_SEC,
+      autoStartLoad: true,
       // 段加载并发 + 重试
       fragLoadPolicy: {
         default: {
-          maxTimeToFirstByteMs: 20000,
-          maxLoadTimeMs: 60000,
-          timeoutRetry: { maxNumRetry: 4, retryDelayMs: 500, maxRetryDelayMs: 4000 },
-          errorRetry:   { maxNumRetry: 6, retryDelayMs: 500, maxRetryDelayMs: 4000 },
+          // 后端可能正在等连续 ffmpeg 生成目标段，首字节不能太短，否则会频繁 abort。
+          maxTimeToFirstByteMs: 120000,
+          maxLoadTimeMs: 180000,
+          timeoutRetry: { maxNumRetry: 8, retryDelayMs: 800, maxRetryDelayMs: 5000 },
+          errorRetry:   { maxNumRetry: 8, retryDelayMs: 800, maxRetryDelayMs: 5000 },
         },
       },
       manifestLoadPolicy: {
@@ -1393,29 +1396,49 @@ async function attachVideoSrc(src, resumeAt){
     });
     v._hls = hls;
     v._hlsSrc = src;
+    v.dataset.playbackEngine = "hls";
+    let fatalNetworkRetries = 0;
+    let fatalMediaRetries = 0;
+
+    const fallbackToNative = (reason)=>{
+      console.warn("[hls] fallback to native mp4:", reason);
+      showNotice("HLS 分段播放失败，已临时回退原生 MP4。请打开控制台查看 [hls] 错误。");
+      try { hls.destroy(); } catch(_){}
+      v._hls = null; v._hlsSrc = null;
+      v.dataset.playbackEngine = "native";
+      _attachVideoSrcNative(v, src, resumeAt);
+    };
 
     hls.on(window.Hls.Events.MEDIA_ATTACHED, ()=>{
       // attach 完成后让 HLS.js 接管
     });
     hls.on(window.Hls.Events.MANIFEST_PARSED, ()=>{
+      console.info("[hls] attached:", playlistUrl);
       setTimeout(fixPortraitVideoInFullscreen, 50);
     });
     hls.on(window.Hls.Events.ERROR, (_evt, data)=>{
       if (!data) return;
       if (data.fatal){
         console.warn("[hls] fatal error:", data.type, data.details, data);
-        // 致命错误才回退
+        // 致命错误才恢复；fragParsingError 通常说明后端 copy 出了浏览器不能解析的 TS，
+        // 无限 recover 只会刷屏，直接回退原 MP4，同时后端新版本会重切为 H.264/AAC。
         switch (data.type) {
           case window.Hls.ErrorTypes.NETWORK_ERROR:
-            hls.startLoad();   // 自我恢复
+            if (++fatalNetworkRetries <= 2) {
+              hls.startLoad();
+            } else {
+              fallbackToNative(data.details || data.type);
+            }
             break;
           case window.Hls.ErrorTypes.MEDIA_ERROR:
-            hls.recoverMediaError();
+            if (data.details === "fragParsingError" || ++fatalMediaRetries > 2) {
+              fallbackToNative(data.details || data.type);
+            } else {
+              hls.recoverMediaError();
+            }
             break;
           default:
-            try { hls.destroy(); } catch(_){}
-            v._hls = null; v._hlsSrc = null;
-            _attachVideoSrcNative(v, src, resumeAt);
+            fallbackToNative(data.details || data.type);
         }
       } else {
         // 非致命：log 一下就好（HLS.js 自己会重试）
@@ -1431,11 +1454,13 @@ async function attachVideoSrc(src, resumeAt){
   // 原生 HLS（Safari / iOS）
   if (playlistUrl && _nativeHlsSupported(v)){
     v._hlsSrc = src;
+    v.dataset.playbackEngine = "native-hls";
     _attachVideoSrcNative(v, playlistUrl, resumeAt);
     return;
   }
 
   // 都不支持 → 用原 MP4 直接播
+  v.dataset.playbackEngine = "native";
   _attachVideoSrcNative(v, src, resumeAt);
 }
 async function attachAudioSrc(src, resumeAt, {muted=true, ensurePlay=true, seek='smart'}={}){
@@ -1487,7 +1512,7 @@ async function detachVideoSrc(){
   try{ v.removeAttribute("src"); v.load(); }catch(_){}
 }
 
-/* —— 前台对齐（视频前台、音频静音跟随时用） —— */
+/* —— 前台对齐（视频前台、独立音轨跟随时用） —— */
 let fgSyncTimer = null;
 function startFgSync(){
   if (fgSyncTimer) return;
@@ -1498,8 +1523,8 @@ function startFgSync(){
     if (!Number.isFinite(v.currentTime)) return;
     const target = (v.currentTime||0) + (audioBias||0);
     const dv = Math.abs((a.currentTime||0) - target);
-    // 音频在前台静音持续播放，偏移 > 0.5s 时对齐
-    if (!a.paused && a.muted && dv > 0.5){
+    // HLS 画面和独立音轨分离时，用视频时间轴校准音频。
+    if (!a.paused && dv > 0.5){
       try{ a.currentTime = target; }catch(_){ }
     }
     // 兜底：若音频被暂停（异常），偏移过大时也对齐
@@ -1833,10 +1858,12 @@ document.addEventListener("visibilitychange", async ()=>{
   if (scrubGuard.active) return;
   if (_repairInProgress) return;  // ★ 修复期间不自动切换到 audio
   if (document.visibilityState === "hidden"){
+    if (!BACKGROUND_AUDIO_MODE) return;
     await switchToAudio();
     // 延迟兜底：检查播放是否被浏览器静默中断（仅在用户没有主动暂停时）
     setTimeout(()=>{
       if (_userPaused) return;
+      if (!BACKGROUND_AUDIO_MODE) return;
       if (document.visibilityState !== "hidden" || !isPlayerActive() || playbackMode !== "audio") return;
       const a = media.a || $("bgAudio");
       if (a && a.paused){
@@ -1851,7 +1878,7 @@ document.addEventListener("visibilitychange", async ()=>{
       }
     }, 800);
   }else{
-    await switchToVideo();
+    if (playbackMode === "audio") await switchToVideo();
     setTimeout(()=> kickVisWatch("visible"), 50);
   }
 });
@@ -1919,7 +1946,7 @@ function flushProgressOnLeave(){
 
 window.addEventListener("pagehide", (e)=> { 
   flushProgressOnLeave();
-  if (!WALLPAPER_MODE && isPlayerActive() && !scrubGuard.active && !_repairInProgress) switchToAudio();
+  if (BACKGROUND_AUDIO_MODE && !WALLPAPER_MODE && isPlayerActive() && !scrubGuard.active && !_repairInProgress) switchToAudio();
   // 如果是进入 bfcache，保持保活机制
   if (e.persisted){
     // 不停止保活，让它在后台继续
@@ -1995,7 +2022,7 @@ function setMediaSessionMeta(id){
     navigator.mediaSession.setActionHandler("play", async ()=>{
       clearUserPaused();
       const {v,a} = both();
-      if (document.visibilityState==="hidden"){
+      if (BACKGROUND_AUDIO_MODE && document.visibilityState==="hidden"){
         const id = player.ids[player.index];
         const aSrc = audioSrcOf(id);
         const resumeAt =
@@ -2007,7 +2034,8 @@ function setMediaSessionMeta(id){
         startBgAdvanceGuard();
         startBgKeepAlive();
       } else {
-        await promoteToVideoNow("media-session-play");
+        if (playbackMode === "audio") await promoteToVideoNow("media-session-play");
+        else { try{ await (v?.play?.()); }catch(_){} }
       }
       updateMediaSessionPlaybackState(); startPosTicker(); updatePositionState();
     });
@@ -2510,7 +2538,7 @@ async function playIndex(i, opts = {}){
   // Single-video loop: let browser handle it natively
   v.loop = (player.loop && player.ids.length === 1);
 
-  if (!WALLPAPER_MODE && document.visibilityState === "hidden" && !forceVideo) {
+  if (BACKGROUND_AUDIO_MODE && !WALLPAPER_MODE && document.visibilityState === "hidden" && !forceVideo) {
     audioBias = 0;
     try{ await attachAudioSrc(aSrc, resumeAt||0, { muted:false, ensurePlay:true, seek:'force' }); }catch(_){}
     try{
