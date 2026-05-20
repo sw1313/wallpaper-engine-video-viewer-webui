@@ -80,7 +80,7 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v7"
+HLS_PIPELINE_VERSION = "hls-av-job-v8"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
@@ -2156,8 +2156,10 @@ def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, sta
   return base + [
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
     *keyframes,
+    # 有些创意工坊视频带异常/缺失色彩元数据，ffmpeg 自动 scale/filter 会报
+    # "Invalid color space"。CPU 兜底路径统一成 bt709 + yuv420p，避免首段完全产不出。
+    "-vf", "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p",
     "-c:a", "aac", "-b:a", "192k",
-    "-pix_fmt", "yuv420p",
   ] + muxer
 
 def _hls_attempt_chain() -> list[str]:
@@ -2288,6 +2290,10 @@ def _hls_job_key(vid_id: str, src_path: str) -> str:
 def _hls_job_for(key: str) -> dict | None:
   with _hls_jobs_guard:
     return _hls_jobs.get(key)
+
+def _hls_forget_job(key: str):
+  with _hls_jobs_guard:
+    _hls_jobs.pop(key, None)
 
 def _hls_segment_path(out_dir: str, idx: int) -> str:
   return os.path.join(out_dir, f"seg_{idx:05d}.ts")
@@ -2559,7 +2565,9 @@ def _wait_for_hls_segment(vid_id: str, src_path: str, idx: int, timeout_s: float
       return seg_path
     job = _hls_job_for(key)
     if job and job.get("done") and job.get("error"):
-      raise HTTPException(504, f"hls job failed: {job.get('error')}")
+      _hls_forget_job(key)
+      job = _ensure_hls_job_for_segment(vid_id, src_path, idx) or _hls_job_for(key)
+      continue
     if job is None or (job.get("done") and not job.get("error") and not _hls_segment_file_ready(seg_path)):
       job = _ensure_hls_job_for_segment(vid_id, src_path, idx) or _hls_job_for(key)
     time.sleep(0.15)
