@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-74-soft-scan-refresh-2026-05-21");
+console.log("app.js version fs-76-hls-xhr-compat-2026-05-21");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -12,6 +12,13 @@ let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/", loop:
 let media = { v: null, a: null };
 let playbackMode = "video";
 let fsOverlayInHistory = false;
+window.addEventListener("error", (ev)=>{
+  const msg = String(ev?.message || ev?.error?.message || "");
+  if (msg.includes("responseText") && msg.includes("arraybuffer")){
+    console.warn("[hls] ignored XHR responseText/arraybuffer compatibility error", ev.error || msg);
+    try{ ev.preventDefault(); }catch(_){}
+  }
+}, true);
 const URL_PARAMS = new URLSearchParams(window.location.search || "");
 const WALLPAPER_MODE_VALUE = URL_PARAMS.get("wallpaper") || "";
 const WALLPAPER_MODE = ["1", "2"].includes(WALLPAPER_MODE_VALUE);
@@ -42,6 +49,29 @@ function beginScrubGuard(){
 function endScrubGuardSoon(){
   if (scrubGuard.timer) clearTimeout(scrubGuard.timer);
   scrubGuard.timer = setTimeout(()=>{ scrubGuard.active = false; }, 400);
+}
+
+const startupControls = { token:0, timer:null };
+function holdVideoControlsDuringStartup(v){
+  if (!v || WALLPAPER_MODE) return 0;
+  const token = ++startupControls.token;
+  if (startupControls.timer) clearTimeout(startupControls.timer);
+  try{
+    v.controls = false;
+    v.removeAttribute("controls");
+  }catch(_){}
+  return token;
+}
+function releaseVideoControlsAfterStartup(v, token, delay=700){
+  if (!v || WALLPAPER_MODE || !token) return;
+  if (startupControls.timer) clearTimeout(startupControls.timer);
+  startupControls.timer = setTimeout(()=>{
+    if (startupControls.token !== token) return;
+    try{
+      v.controls = true;
+      v.setAttribute("controls", "");
+    }catch(_){}
+  }, delay);
 }
 
 /* === 全局忙碌遮罩（转圈 + 阻塞） === */
@@ -2337,18 +2367,34 @@ async function triggerRepair(id, resumeAt){
 
 /* —— 元数据就绪再设 currentTime —— */
 function setCurrentTimeWhenReady(el, t){
-  try{
-    if (isFinite(el.duration) && el.readyState >= 1) { el.currentTime = Math.max(0, t||0); updatePositionState(); return; }
-  }catch(_){}
-  const set = ()=>{ try{ el.currentTime = Math.max(0, t||0); }catch(_){ } updatePositionState(); cleanup(); };
-  const cleanup = ()=>{
-    try{ el.removeEventListener("loadedmetadata", set); }catch(_){}
-    try{ el.removeEventListener("durationchange", set); }catch(_){}
-    try{ el.removeEventListener("canplay", set); }catch(_){}
+  const target = Math.max(0, t||0);
+  const shouldSeek = ()=>{
+    try{
+      if (!Number.isFinite(target)) return false;
+      if (target <= 0.05) return false;
+      const cur = Number(el.currentTime) || 0;
+      return Math.abs(cur - target) > 0.35;
+    }catch(_){ return false; }
   };
-  el.addEventListener("loadedmetadata", set, {once:true});
-  el.addEventListener("durationchange", set, {once:true});
-  el.addEventListener("canplay", set, {once:true});
+  let done = false;
+  const apply = ()=>{
+    if (done) return;
+    done = true;
+    try{ if (shouldSeek()) el.currentTime = target; }catch(_){ }
+    updatePositionState();
+    cleanup();
+  };
+  try{
+    if (isFinite(el.duration) && el.readyState >= 1) { apply(); return; }
+  }catch(_){}
+  const cleanup = ()=>{
+    try{ el.removeEventListener("loadedmetadata", apply); }catch(_){}
+    try{ el.removeEventListener("durationchange", apply); }catch(_){}
+    try{ el.removeEventListener("canplay", apply); }catch(_){}
+  };
+  el.addEventListener("loadedmetadata", apply, {once:true});
+  el.addEventListener("durationchange", apply, {once:true});
+  el.addEventListener("canplay", apply, {once:true});
 }
 
 /* —— 预加载提升 —— */
@@ -2732,14 +2778,16 @@ async function playIndex(i, opts = {}){
   } else {
     playbackMode = "video";
     try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
+    const controlsToken = holdVideoControlsDuringStartup(v);
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     // Audio preload AFTER video play: v.play() must consume the user gesture first,
     // otherwise a.play() (even muted) may consume it on some Chrome builds.
-    attachAudioSrc(aSrc, resumeAt||0, { muted:true, ensurePlay:!WALLPAPER_MODE, seek:'smart' }).catch(()=>{});
+    attachAudioSrc(aSrc, resumeAt||0, { muted:true, ensurePlay:false, seek:'smart' }).catch(()=>{});
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
     setMediaSessionMeta(id);
     updatePositionState(); startPosTicker();
+    releaseVideoControlsAfterStartup(v, controlsToken);
     stopBgAdvanceGuard();
     stopBgKeepAlive();
     armFirstPlayWatch(id, v);
