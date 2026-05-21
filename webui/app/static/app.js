@@ -954,10 +954,9 @@ async function refreshCurrentScanContext(reason="manual"){
   changeContext({});
 }
 
-const scanWatch = { timer:null, running:false, lastAutoRefresh:0 };
+const scanWatch = { timer:null, running:false, lastAutoRefresh:0, pending:false };
 async function checkScanChanges(){
   if (scanWatch.running) return;
-  if (isPlayerActive()) return;
   if (document.visibilityState !== "visible") return;
   scanWatch.running = true;
   try{
@@ -965,14 +964,26 @@ async function checkScanChanges(){
     if (!r.ok) return;
     const j = await r.json().catch(()=>null);
     if (!j || !j.changed) return;
+    if (isPlayerActive()){
+      scanWatch.pending = true;
+      return;
+    }
     const now = Date.now();
     if (now - scanWatch.lastAutoRefresh < 10000) return;
     scanWatch.lastAutoRefresh = now;
+    scanWatch.pending = false;
     await refreshCurrentScanContext("auto");
   }catch(_){
   }finally{
     scanWatch.running = false;
   }
+}
+async function flushPendingScanRefresh(){
+  if (!scanWatch.pending) return;
+  if (document.visibilityState !== "visible") return;
+  scanWatch.pending = false;
+  scanWatch.lastAutoRefresh = Date.now();
+  await refreshCurrentScanContext("auto");
 }
 function startScanWatch(){
   if (scanWatch.timer) return;
@@ -2694,6 +2705,7 @@ async function exitPlayer(){
   }catch(_){}
   try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
   const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
+  const shouldFlushScanRefresh = !!scanWatch.pending;
   try { v.pause(); } catch(_){}
   try { a.pause(); } catch(_){}
   // ★ 必须先 teardownMSE（设 destroyed=true）再动 v.src
@@ -2722,6 +2734,9 @@ async function exitPlayer(){
       window.scrollTo(0, y);
     }
   }catch(_){}
+  if (shouldFlushScanRefresh){
+    setTimeout(()=>{ flushPendingScanRefresh(); }, 0);
+  }
 }
 
 function isPlayerActive(){ return $("playerFS").style.display !== "none"; }
