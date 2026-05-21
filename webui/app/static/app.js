@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-76-hls-xhr-compat-2026-05-21");
+console.log("app.js version fs-78-hls-single-video-diagnose-2026-05-21");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -1531,6 +1531,8 @@ function _nativeHlsSupported(v){
 function teardownMSE(v){
   if (!v) return;
   if (v._hls){
+    try { v._hls.stopLoad(); } catch(_){}
+    try { v._hls.detachMedia(); } catch(_){}
     try { v._hls.destroy(); } catch(_){}
     v._hls = null;
   }
@@ -1611,6 +1613,8 @@ async function attachVideoSrc(src, resumeAt){
     const fallbackToNative = (reason)=>{
       console.warn("[hls] fallback to native mp4:", reason);
       showNotice("HLS 分段播放失败，已临时回退原生 MP4。请打开控制台查看 [hls] 错误。");
+      try { hls.stopLoad(); } catch(_){}
+      try { hls.detachMedia(); } catch(_){}
       try { hls.destroy(); } catch(_){}
       v._hls = null; v._hlsSrc = null;
       v.dataset.playbackEngine = "native";

@@ -80,13 +80,16 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v13"
+HLS_PIPELINE_VERSION = "hls-av-job-v14"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
 # 默认关闭 copy：copy 对长 GOP/怪时间戳视频会导致首段迟迟不落盘或 seek 不稳。
 # 如确认自己的库全是标准 H.264/AAC，可设 HLS_ALLOW_COPY=1 追求最高速度。
 HLS_ALLOW_COPY = os.getenv("HLS_ALLOW_COPY", "0").lower() in {"1", "true", "yes", "on"}
+HLS_COPY_MAX_SOURCE_BYTES = int(os.getenv("HLS_COPY_MAX_SOURCE_BYTES", str(2 * 1024 * 1024 * 1024)))
+HLS_COPY_MAX_BITRATE_BPS = int(os.getenv("HLS_COPY_MAX_BITRATE_BPS", str(30 * 1000 * 1000)))
+HLS_MAX_REASONABLE_SEGMENT_BYTES = int(os.getenv("HLS_MAX_REASONABLE_SEGMENT_BYTES", str(128 * 1024 * 1024)))
 
 # === 音频缓存定时清理（避免 audio_cache 无限膨胀） ===
 # - AUDIO_CACHE_MAX_AGE_DAYS：超过多少天的缓存直接删除
@@ -1948,6 +1951,10 @@ def _hls_cache_matches(out_dir: str, src_path: str) -> bool:
     with open(_hls_meta_path(out_dir), "r", encoding="utf-8") as f:
       meta = json.load(f)
     mtime, size = _hls_source_stat(src_path)
+    first_seg = _hls_segment_path(out_dir, 0)
+    if os.path.isfile(first_seg) and os.path.getsize(first_seg) > HLS_MAX_REASONABLE_SEGMENT_BYTES:
+      logging.warning("[hls] invalidate oversized segment cache: %s size=%s", first_seg, os.path.getsize(first_seg))
+      return False
     return (
       meta.get("pipeline_version") == HLS_PIPELINE_VERSION
       and int(meta.get("source_mtime") or 0) == mtime
@@ -2054,6 +2061,32 @@ def _probe_media_duration_fallback(src_path: str) -> float:
   except Exception:
     return 0.0
 
+def _hls_source_size(src_path: str) -> int:
+  try:
+    return int(os.path.getsize(src_path))
+  except Exception:
+    return 0
+
+def _hls_estimated_bitrate_bps(src_path: str) -> float:
+  try:
+    dur = float((_probe_hls_codecs(src_path).get("duration") or 0))
+    if dur <= 0:
+      dur = _probe_media_duration_fallback(src_path)
+    size = _hls_source_size(src_path)
+    if dur > 0 and size > 0:
+      return (size * 8.0) / dur
+  except Exception:
+    pass
+  return 0.0
+
+def _hls_copy_risky_for_browser(src_path: str) -> bool:
+  """高码率/超大 H.264 copy 可能因长 GOP 生成 GB 级首段，直接压垮 HLS.js。"""
+  size = _hls_source_size(src_path)
+  if size and size >= HLS_COPY_MAX_SOURCE_BYTES:
+    return True
+  bitrate = _hls_estimated_bitrate_bps(src_path)
+  return bool(bitrate and bitrate >= HLS_COPY_MAX_BITRATE_BPS)
+
 def _hls_can_copy_for_browser(src_path: str) -> bool:
   """只允许 HLS.js/Chrome 稳定支持的编码走 -c copy。
 
@@ -2061,6 +2094,8 @@ def _hls_can_copy_for_browser(src_path: str) -> bool:
   对 HEVC/VP9/AV1/Opus/Vorbis/AC3/10bit H.264 等直接转 H.264/AAC。
   """
   info = _probe_hls_codecs(src_path)
+  if _hls_copy_risky_for_browser(src_path):
+    return False
   video = info.get("video") or ""
   audio = info.get("audio") or ""
   pix_fmt = info.get("pix_fmt") or ""
@@ -2100,7 +2135,7 @@ def _hls_is_ready(out_dir: str, src_path: str | None = None) -> bool:
       try:
         with open(_hls_meta_path(out_dir), "r", encoding="utf-8") as f:
           meta = json.load(f)
-        if (meta.get("mode") or "") == "copy":
+        if (meta.get("mode") or "") in {"copy", "copyfix"}:
           return False
       except Exception:
         return False
@@ -2731,6 +2766,9 @@ def hls_info(vid_id: str):
   return {
     "id": str(vid_id),
     "duration": duration,
+    "source_size": _hls_source_size(path),
+    "estimated_bitrate_bps": int(_hls_estimated_bitrate_bps(path) or 0),
+    "copy_risky": _hls_copy_risky_for_browser(path),
     "use_hls": True,
     "segment_sec": HLS_SEGMENT_SEC,
     "allow_copy": HLS_ALLOW_COPY,
@@ -2762,6 +2800,13 @@ def hls_debug(vid_id: str):
     "cache_matches": _hls_cache_matches(out_dir, path),
     "segments": indexes[-20:],
     "segment_count": len(indexes),
+    "source_size": _hls_source_size(path),
+    "estimated_bitrate_bps": int(_hls_estimated_bitrate_bps(path) or 0),
+    "copy_risky": _hls_copy_risky_for_browser(path),
+    "first_segment_size": (
+      os.path.getsize(_hls_segment_path(out_dir, 0))
+      if os.path.isfile(_hls_segment_path(out_dir, 0)) else 0
+    ),
     "current_index": _hls_current_segment_index(out_dir),
     "transcode_fallback": HLS_TRANSCODE_FALLBACK,
     "attempts": _hls_attempt_chain_for_source(path),
