@@ -1,11 +1,11 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-72-mobile-only-bg-audio-2026-05-20");
+console.log("app.js version fs-73-refresh-generation-2026-05-21");
 
 /* ===================== 公共状态与工具 ===================== */
 
 let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:"",
   selV:new Set(), selF:new Set(), lastIdx:null, tiles:[], dragging:false, dragStart:null, keepSelection:false,
-  isLoading:false, hasMore:true, queryKey:"" };
+  isLoading:false, hasMore:true, queryKey:"", queryRev:0 };
 
 let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/", loop:false, returnScrollY:0 };
 
@@ -750,7 +750,7 @@ function renderSkeleton(nextBreadcrumb) {
     g.appendChild(el);
   }
 }
-function makeQueryKey(){ return `${state.path}|${state.sort_idx}|${state.mature_only?'1':'0'}|${state.q}`; }
+function makeQueryKey(){ return `${state.queryRev}|${state.path}|${state.sort_idx}|${state.mature_only?'1':'0'}|${state.q}`; }
 function snapshotOpts(){ return { path:state.path, sort_idx:state.sort_idx, mature_only:state.mature_only, q:state.q, per_page:state.per_page }; }
 
 async function showDiagIfEmpty(){
@@ -952,6 +952,7 @@ function changeContext({path, sort_idx, mature_only, q}={}){
   if (sort_idx!==undefined) state.sort_idx = sort_idx;
   if (mature_only!==undefined) state.mature_only = mature_only;
   if (q!==undefined) state.q = q;
+  state.queryRev++;
   cancelProgressive();
   clearSel(); state.page=1; state.hasMore=true; state.isLoading=false; state.queryKey=makeQueryKey();
   resetPrefetch(); renderSkeleton(buildCrumbHtml(state.path)); setInfStatus("加载中…");
