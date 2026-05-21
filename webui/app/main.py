@@ -548,6 +548,25 @@ def api_scan_refresh():
     _invalidate_scan_cache()
     return {"ok": True}
 
+@app.get("/api/scan/watch")
+def api_scan_watch():
+    """轻量检测扫描源是否变化；只做指纹判断，不主动执行全量扫描。"""
+    with _SCAN_LOCK:
+        cfg_dirty = _check_source(_SRC_CFG, _fp_config)
+        ws_dirty = _check_source(_SRC_WS, _fp_workshop)
+        mp_dirty = _check_source(_SRC_MP, _fp_myprojects)
+        changed = bool(cfg_dirty or ws_dirty or mp_dirty or not _MERGED.get("valid"))
+        return {
+            "changed": changed,
+            "sources": {
+                "config": bool(cfg_dirty),
+                "workshop": bool(ws_dirty),
+                "myprojects": bool(mp_dirty),
+            },
+            "merged_valid": bool(_MERGED.get("valid")),
+            "ts": int(time.time()),
+        }
+
 @app.get("/api/diag")
 def api_diag():
     """诊断端点：返回路径存在性、扫描状态、视频计数等，帮助排查扫描不出结果的问题。"""
