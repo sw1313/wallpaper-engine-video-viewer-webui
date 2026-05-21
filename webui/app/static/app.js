@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-73-scan-watch-2026-05-21");
+console.log("app.js version fs-74-soft-scan-refresh-2026-05-21");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -946,8 +946,142 @@ function resumeGridImageLoads(){ document.querySelectorAll("#grid img").forEach(
 
 function setInfStatus(text){ const el=$("infiniteStatus"); if(el) el.textContent = text || ""; }
 
+function tileKey(t){
+  if (!t) return "";
+  if (t.type === "parent") return `parent:${t.path || ""}`;
+  if (t.type === "folder") return `folder:${t.path || ""}`;
+  if (t.type === "video") return `video:${String(t.vid || "")}`;
+  return "";
+}
+function buildTileSpecs(data, pageNum){
+  const specs = [];
+  if (pageNum === 1 && state.path !== "/"){
+    const parts = state.path.split("/").filter(Boolean);
+    const parentPath = parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/";
+    specs.push({ type:"parent", path:parentPath, title:"..." });
+  }
+  (data.folders || []).forEach(f=>{
+    const path = (state.path.endsWith("/") ? state.path : state.path + "/") + f.title;
+    specs.push({ type:"folder", path, title:f.title });
+  });
+  (data.videos || []).forEach(v=>{
+    specs.push({ type:"video", vid:String(v.id), title:v.title, data:v });
+  });
+  return specs;
+}
+function createTileFromSpec(spec, idx){
+  const el = document.createElement("div");
+  if (spec.type === "parent"){
+    el.className = "tile folder parent-folder";
+    el.dataset.type = "parent"; el.dataset.path = spec.path; el.dataset.idx = idx;
+    el.innerHTML = `<div class="thumb"><div class="big">...</div></div>
+                    <div class="title">...</div>`;
+    return { el, type:"parent", path:spec.path, idx, title:"..." };
+  }
+  if (spec.type === "folder"){
+    el.className = "tile folder";
+    el.dataset.type = "folder"; el.dataset.path = spec.path; el.dataset.idx = idx;
+    el.innerHTML = `<div class="thumb"><div class="big">📁</div></div>
+                    <div class="title">${spec.title}</div>
+                    <button class="tile-menu" title="菜单">⋮</button>`;
+    return { el, type:"folder", path:spec.path, idx, title:spec.title };
+  }
+  const v = spec.data || {};
+  const done = isWatched(v.id);
+  const base = v.preview_url;
+  const thumb = `${base}?s=256&fmt=webp&q=80`;
+  const fallback = base;
+  el.className = "tile"; el.dataset.type = "video"; el.dataset.vid = v.id; el.dataset.idx = idx;
+  el.innerHTML = `<div class="thumb">
+                    <img
+                      src="${thumb}"
+                      alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
+                      onerror="this.onerror=null; this.src='${fallback}'"
+                    />
+                  </div>
+                  <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
+                  <div class="title">${v.title}</div>
+                  <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
+                  <button class="tile-menu" title="菜单">⋮</button>`;
+  return { el, type:"video", vid:String(v.id), idx, title:v.title };
+}
+function updateTileFromSpec(tile, spec, idx){
+  tile.idx = idx;
+  if (tile.el && tile.el.dataset) tile.el.dataset.idx = String(idx);
+  if (spec.type === "video"){
+    const v = spec.data || {};
+    tile.vid = String(v.id);
+    tile.title = v.title;
+    const titleEl = tile.el && tile.el.querySelector(".title");
+    const metaEl = tile.el && tile.el.querySelector(".meta");
+    if (titleEl && titleEl.textContent !== v.title) titleEl.textContent = v.title;
+    if (metaEl) metaEl.textContent = `${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}`;
+    updateTileWatchedUI(v.id, isWatched(v.id));
+  } else {
+    tile.title = spec.title;
+  }
+  if (tile.el) tile.el.classList.toggle("selected", isSel(tile));
+  return tile;
+}
+async function softRefreshCurrentScanContext(){
+  if (state.isLoading) return;
+  const keyAtStart = makeQueryKey();
+  const loadedPages = Math.max(1, state.page - 1);
+  const scrollX = window.scrollX || 0;
+  const scrollY = window.scrollY || 0;
+  setInfStatus("检测到文件变化，正在更新…");
+  state.isLoading = true;
+  try{
+    await fetch("/api/scan/refresh", { method: "POST", cache: "no-store" });
+    const opts = snapshotOpts();
+    const pages = [];
+    for (let p = 1; p <= loadedPages; p++){
+      const data = await apiScan(opts, p, undefined);
+      if (keyAtStart !== makeQueryKey()) return;
+      pages.push({ page:p, data });
+      if (p >= data.total_pages) break;
+    }
+    const first = pages[0] && pages[0].data;
+    const last = pages[pages.length - 1] && pages[pages.length - 1].data;
+    if (!first || !last) return;
+    const crumb = ["<a class='link' href='#/'>/</a>"].concat(
+      first.breadcrumb.map((seg,i)=>{const p="/"+first.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}'>${seg}</a>`;})
+    ).join(" / ");
+    $("crumb").innerHTML = "当前位置：" + crumb;
+
+    const specs = [];
+    pages.forEach(x=> specs.push(...buildTileSpecs(x.data, x.page)));
+    const existing = new Map();
+    state.tiles.forEach(t=>{ const key = tileKey(t); if (key) existing.set(key, t); });
+    const frag = document.createDocumentFragment();
+    const nextTiles = [];
+    const videoIds = [];
+    specs.forEach((spec, idx)=>{
+      const key = spec.type === "parent" ? `parent:${spec.path}` : spec.type === "folder" ? `folder:${spec.path}` : `video:${String(spec.vid)}`;
+      const old = existing.get(key);
+      const tile = old ? updateTileFromSpec(old, spec, idx) : createTileFromSpec(spec, idx);
+      frag.appendChild(tile.el);
+      nextTiles.push(tile);
+      if (tile.type === "video") videoIds.push(String(tile.vid));
+    });
+    grid().replaceChildren(frag);
+    state.tiles = nextTiles;
+    state.page = pages.length + 1;
+    state.hasMore = pages.length < last.total_pages;
+    setInfStatus(state.hasMore ? "下拉加载更多…" : "已到底部");
+    if (videoIds.length) syncWatched(videoIds);
+    bindDelegatedEvents(); bindRubber(); resetPrefetch(); schedulePrefetch();
+    try{ window.scrollTo(scrollX, scrollY); }catch(_){}
+  }catch(_){
+    setInfStatus("自动更新失败，稍后重试");
+  }finally{
+    state.isLoading = false;
+    queueMicrotask(()=>autoFillViewport(3));
+  }
+}
 async function refreshCurrentScanContext(reason="manual"){
-  setInfStatus(reason === "auto" ? "检测到文件变化，正在刷新…" : "正在重新扫描…");
+  if (reason === "auto") return softRefreshCurrentScanContext();
+  setInfStatus("正在重新扫描…");
   try {
     await fetch("/api/scan/refresh", { method: "POST", cache: "no-store" });
   } catch (_) {}
