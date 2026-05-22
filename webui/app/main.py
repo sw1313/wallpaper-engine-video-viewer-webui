@@ -80,13 +80,12 @@ HLS_SEGMENT_SEC = int(os.getenv("HLS_SEGMENT_SEC", "2"))
 HLS_CACHE_MAX_TOTAL_GB = float(os.getenv("HLS_CACHE_MAX_TOTAL_GB", "20"))
 HLS_CACHE_MAX_AGE_DAYS = int(os.getenv("HLS_CACHE_MAX_AGE_DAYS", "30"))
 HLS_TRANSCODE_FALLBACK = os.getenv("HLS_TRANSCODE_FALLBACK", "auto").lower()
-HLS_PIPELINE_VERSION = "hls-av-job-v14"
+HLS_PIPELINE_VERSION = "hls-av-job-v17"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
-# 默认关闭 copy：copy 对长 GOP/怪时间戳视频会导致首段迟迟不落盘或 seek 不稳。
-# 如确认自己的库全是标准 H.264/AAC，可设 HLS_ALLOW_COPY=1 追求最高速度。
-HLS_ALLOW_COPY = os.getenv("HLS_ALLOW_COPY", "0").lower() in {"1", "true", "yes", "on"}
+# 局域网优先原文件/原码率：默认允许 stream copy；若产出异常大分片，会运行时熔断并回退转码。
+HLS_ALLOW_COPY = os.getenv("HLS_ALLOW_COPY", "1").lower() in {"1", "true", "yes", "on"}
 HLS_COPY_MAX_SOURCE_BYTES = int(os.getenv("HLS_COPY_MAX_SOURCE_BYTES", str(2 * 1024 * 1024 * 1024)))
 HLS_COPY_MAX_BITRATE_BPS = int(os.getenv("HLS_COPY_MAX_BITRATE_BPS", str(30 * 1000 * 1000)))
 HLS_MAX_REASONABLE_SEGMENT_BYTES = int(os.getenv("HLS_MAX_REASONABLE_SEGMENT_BYTES", str(128 * 1024 * 1024)))
@@ -1897,6 +1896,8 @@ _hls_jobs_guard = threading.Lock()
 _hls_disabled_modes: set[str] = set()
 _hls_disabled_modes_guard = threading.Lock()
 _hls_encoder_probe_cache: dict[str, bool] = {}
+_hls_copy_blocked_sources: dict[str, str] = {}
+_hls_copy_blocked_guard = threading.Lock()
 
 def _hls_lock(vid_id: str) -> threading.Lock:
   with _hls_locks_guard:
@@ -1916,6 +1917,23 @@ def _hls_disable_mode(mode: str, err: str = ""):
       return
     _hls_disabled_modes.add(mode)
   logging.warning("[hls] disable mode=%s after failure: %s", mode, (err or "")[-300:])
+
+def _hls_copy_block_key(src_path: str) -> str:
+  return _hls_source_version(src_path)
+
+def _hls_copy_blocked_for_source(src_path: str) -> bool:
+  with _hls_copy_blocked_guard:
+    return _hls_copy_block_key(src_path) in _hls_copy_blocked_sources
+
+def _hls_copy_block_reason(src_path: str) -> str:
+  with _hls_copy_blocked_guard:
+    return _hls_copy_blocked_sources.get(_hls_copy_block_key(src_path), "")
+
+def _hls_block_copy_for_source(src_path: str, reason: str):
+  key = _hls_copy_block_key(src_path)
+  with _hls_copy_blocked_guard:
+    _hls_copy_blocked_sources[key] = reason
+  logging.warning("[hls] disable copy for source=%s: %s", src_path, reason)
 
 def _hls_encoder_available(mode: str) -> bool:
   if mode not in {"nvenc", "qsv"}:
@@ -2003,18 +2021,23 @@ def _probe_hls_codecs(src_path: str) -> dict:
       timeout=10,
     )
     data = json.loads(p.stdout or "{}")
-    durations = []
+    format_duration = 0.0
+    video_duration = 0.0
+    audio_duration = 0.0
     try:
-      durations.append(float((data.get("format") or {}).get("duration") or 0))
+      format_duration = float((data.get("format") or {}).get("duration") or 0)
     except Exception:
       pass
     for s in (data.get("streams") or []):
       typ = (s.get("codec_type") or "").lower()
       try:
         d = float(s.get("duration") or 0)
-        if d > 0: durations.append(d)
       except Exception:
-        pass
+        d = 0.0
+      if typ == "video" and d > 0 and video_duration <= 0:
+        video_duration = d
+      elif typ == "audio" and d > 0 and audio_duration <= 0:
+        audio_duration = d
       if typ == "video" and not info["video"]:
         info["video"] = (s.get("codec_name") or "").lower()
         info["pix_fmt"] = (s.get("pix_fmt") or "").lower()
@@ -2034,8 +2057,13 @@ def _probe_hls_codecs(src_path: str) -> dict:
               pass
       elif typ == "audio" and not info["audio"]:
         info["audio"] = (s.get("codec_name") or "").lower()
-    if durations:
-      info["duration"] = max(0.0, max(durations))
+    # Media-library style runtime: prefer the primary video stream, then container,
+    # then audio. This avoids long audio/container tails stretching the player UI
+    # past the point where video can actually continue.
+    info["duration"] = max(0.0, video_duration or format_duration or audio_duration)
+    info["format_duration"] = max(0.0, format_duration)
+    info["video_duration"] = max(0.0, video_duration)
+    info["audio_duration"] = max(0.0, audio_duration)
   except Exception as e:
     logging.warning("[hls] ffprobe failed for %s: %s", src_path, e)
   info["ok"] = True
@@ -2094,8 +2122,6 @@ def _hls_can_copy_for_browser(src_path: str) -> bool:
   对 HEVC/VP9/AV1/Opus/Vorbis/AC3/10bit H.264 等直接转 H.264/AAC。
   """
   info = _probe_hls_codecs(src_path)
-  if _hls_copy_risky_for_browser(src_path):
-    return False
   video = info.get("video") or ""
   audio = info.get("audio") or ""
   pix_fmt = info.get("pix_fmt") or ""
@@ -2184,7 +2210,8 @@ def _hls_keyframe_args(src_path: str, mode: str, start_number: int = 0) -> list[
   if mode in {"nvenc", "qsv"}:
     return gop_args
   if mode == "libx264":
-    return keyframes
+    # 与 Jellyfin 的 HLS 转码策略一致：libx264 用强制关键帧，并关闭场景切换关键帧干扰。
+    return keyframes + ["-sc_threshold:v:0", "0"]
   return keyframes + gop_args
 
 def _hls_color_normalize_filter(pix_fmt: str = "yuv420p") -> list[str]:
@@ -2261,12 +2288,15 @@ def _hls_attempt_chain() -> list[str]:
 
 def _hls_attempt_chain_for_source(src_path: str) -> list[str]:
   attempts = _hls_attempt_chain()
-  if _hls_can_copy_for_browser(src_path) and _hls_needs_h264_metadata_fix(src_path):
+  copy_blocked = _hls_copy_blocked_for_source(src_path)
+  if HLS_ALLOW_COPY and not copy_blocked and _hls_can_copy_for_browser(src_path) and _hls_needs_h264_metadata_fix(src_path):
     attempts = ["copyfix"] + [x for x in attempts if x != "copy"]
-  if "copy" in attempts and not _hls_can_copy_for_browser(src_path):
+  if copy_blocked:
+    attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
+  if ("copy" in attempts or "copyfix" in attempts) and not _hls_can_copy_for_browser(src_path):
     # fallback=none 明确表示只想 copy，就尊重配置；其他模式直接跳过注定会被浏览器解析失败的 copy。
     if HLS_TRANSCODE_FALLBACK != "none":
-      attempts = [x for x in attempts if x != "copy"]
+      attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
   attempts = [x for x in attempts if not _hls_mode_disabled(x)]
   attempts = [x for x in attempts if _hls_encoder_available(x)]
   if not attempts and HLS_TRANSCODE_FALLBACK != "none":
@@ -2335,6 +2365,33 @@ def _hls_source_version(src_path: str) -> str:
   except Exception:
     return str(int(time.time()))
 
+def _hls_actual_playlist_durations(out_dir: str) -> dict[int, float]:
+  """读取 ffmpeg 已生成 playlist 中的真实 EXTINF，避免 copy 模式时间轴和 MSE 实际 PTS 漂移。"""
+  pl = os.path.join(out_dir, "playlist.m3u8")
+  out: dict[int, float] = {}
+  try:
+    if not os.path.isfile(pl):
+      return out
+    pending: float | None = None
+    with open(pl, "r", encoding="utf-8", errors="ignore") as f:
+      for raw in f:
+        line = raw.strip()
+        if line.startswith("#EXTINF:"):
+          try:
+            pending = float(line.split(":", 1)[1].split(",", 1)[0])
+          except Exception:
+            pending = None
+          continue
+        if not line or line.startswith("#") or pending is None:
+          continue
+        m = re.search(r"seg_(\d{5,8})\.ts", line)
+        if m:
+          out[int(m.group(1))] = max(0.1, pending)
+        pending = None
+  except Exception as e:
+    logging.warning("[hls] parse actual playlist durations failed: %s", e)
+  return out
+
 def _ensure_hls_dynamic_cache_dir(vid_id: str, src_path: str):
   out_dir = _hls_dir_for(vid_id)
   if os.path.isdir(out_dir) and not _hls_cache_matches(out_dir, src_path):
@@ -2345,25 +2402,35 @@ def _ensure_hls_dynamic_cache_dir(vid_id: str, src_path: str):
   os.makedirs(out_dir, exist_ok=True)
   if not _hls_cache_matches(out_dir, src_path):
     _write_hls_meta(out_dir, src_path, "dynamic")
+  return out_dir
 
 def _hls_dynamic_playlist(vid_id: str, src_path: str) -> str:
   """立即返回 VOD playlist；segment 在请求时按需生成并缓存。"""
-  _ensure_hls_dynamic_cache_dir(vid_id, src_path)
+  out_dir = _ensure_hls_dynamic_cache_dir(vid_id, src_path)
   dur = _hls_duration_for(src_path)
   seg = max(1, int(HLS_SEGMENT_SEC))
   count = max(1, int(math.ceil(dur / seg)))
   ver = _hls_source_version(src_path)
+  actual_durs = _hls_actual_playlist_durations(out_dir)
+  max_seg_dur = max([float(seg), *actual_durs.values()], default=float(seg))
   lines = [
     "#EXTM3U",
     "#EXT-X-VERSION:3",
-    f"#EXT-X-TARGETDURATION:{seg + 1}",
+    f"#EXT-X-TARGETDURATION:{max(1, int(math.ceil(max_seg_dur)))}",
     "#EXT-X-MEDIA-SEQUENCE:0",
     "#EXT-X-PLAYLIST-TYPE:VOD",
     "#EXT-X-INDEPENDENT-SEGMENTS",
   ]
+  acc = 0.0
   for i in range(count):
-    start = i * seg
-    seg_dur = max(0.1, min(seg, dur - start)) if i == count - 1 else seg
+    if i in actual_durs:
+      seg_dur = actual_durs[i]
+    else:
+      remaining = max(0.1, dur - acc)
+      seg_dur = max(0.1, min(seg, remaining)) if i == count - 1 else seg
+    if i == count - 1:
+      seg_dur = max(0.1, dur - acc)
+    acc += seg_dur
     lines.append(f"#EXTINF:{seg_dur:.3f},")
     lines.append(f"seg_{i:05d}.ts?v={ver}")
   lines.append("#EXT-X-ENDLIST")
@@ -2382,6 +2449,32 @@ def _hls_forget_job(key: str):
 
 def _hls_segment_path(out_dir: str, idx: int) -> str:
   return os.path.join(out_dir, f"seg_{idx:05d}.ts")
+
+def _hls_segment_oversized(seg_path: str) -> bool:
+  try:
+    return os.path.isfile(seg_path) and os.path.getsize(seg_path) > HLS_MAX_REASONABLE_SEGMENT_BYTES
+  except Exception:
+    return False
+
+def _hls_reset_bad_copy_cache(key: str, vid_id: str, src_path: str, job: dict | None, seg_path: str):
+  try:
+    size = os.path.getsize(seg_path) if os.path.isfile(seg_path) else 0
+  except Exception:
+    size = 0
+  reason = f"oversized HLS segment {os.path.basename(seg_path)} size={size}"
+  _hls_block_copy_for_source(src_path, reason)
+  if job:
+    _hls_kill_job(job)
+  _hls_forget_job(key)
+  out_dir = _hls_dir_for(vid_id)
+  try:
+    if os.path.isdir(out_dir):
+      shutil.rmtree(out_dir)
+  except Exception as e:
+    logging.warning("[hls] failed to remove bad copy cache for %s: %s", vid_id, e)
+  os.makedirs(out_dir, exist_ok=True)
+  _write_hls_meta(out_dir, src_path, "dynamic")
+  return reason
 
 def _hls_existing_segment_indexes(out_dir: str) -> list[int]:
   try:
@@ -2531,6 +2624,11 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
     deadline = time.time() + max(1.0, wait_s)
     while time.time() < deadline:
       if _hls_segment_file_ready(target):
+        if mode in {"copy", "copyfix"} and _hls_segment_oversized(target):
+          last_err = _hls_reset_bad_copy_cache(key, vid_id, src_path, job, target)
+          attempt_errors.append(f"{mode}: {last_err}")
+          logging.warning("[hls] copy mode=%s produced oversized segment for %s; retry transcoding", mode, vid_id)
+          break
         return job
       if proc.poll() is not None:
         # 监控线程会填 error，给它一个短窗口。
@@ -2769,6 +2867,8 @@ def hls_info(vid_id: str):
     "source_size": _hls_source_size(path),
     "estimated_bitrate_bps": int(_hls_estimated_bitrate_bps(path) or 0),
     "copy_risky": _hls_copy_risky_for_browser(path),
+    "copy_blocked": _hls_copy_blocked_for_source(path),
+    "copy_block_reason": _hls_copy_block_reason(path),
     "use_hls": True,
     "segment_sec": HLS_SEGMENT_SEC,
     "allow_copy": HLS_ALLOW_COPY,
@@ -2803,6 +2903,8 @@ def hls_debug(vid_id: str):
     "source_size": _hls_source_size(path),
     "estimated_bitrate_bps": int(_hls_estimated_bitrate_bps(path) or 0),
     "copy_risky": _hls_copy_risky_for_browser(path),
+    "copy_blocked": _hls_copy_blocked_for_source(path),
+    "copy_block_reason": _hls_copy_block_reason(path),
     "first_segment_size": (
       os.path.getsize(_hls_segment_path(out_dir, 0))
       if os.path.isfile(_hls_segment_path(out_dir, 0)) else 0

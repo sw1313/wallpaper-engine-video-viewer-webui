@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-78-hls-single-video-diagnose-2026-05-21");
+console.log("app.js version fs-86-fullscreen-gesture-2026-05-22");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -8,6 +8,10 @@ let state = { path:"/", page:1, per_page:45, sort_idx:0, mature_only:false, q:""
   isLoading:false, hasMore:true, queryKey:"" };
 
 let player = { ids:[], titles:{}, index:0, idleTimer:null, returnPath:"/", loop:false, returnScrollY:0 };
+
+const SHIFT_RANGE_GRACE_MS = 300;
+let shiftKeyDown = false;
+let lastShiftReleasedAt = 0;
 
 let media = { v: null, a: null };
 let playbackMode = "video";
@@ -49,29 +53,6 @@ function beginScrubGuard(){
 function endScrubGuardSoon(){
   if (scrubGuard.timer) clearTimeout(scrubGuard.timer);
   scrubGuard.timer = setTimeout(()=>{ scrubGuard.active = false; }, 400);
-}
-
-const startupControls = { token:0, timer:null };
-function holdVideoControlsDuringStartup(v){
-  if (!v || WALLPAPER_MODE) return 0;
-  const token = ++startupControls.token;
-  if (startupControls.timer) clearTimeout(startupControls.timer);
-  try{
-    v.controls = false;
-    v.removeAttribute("controls");
-  }catch(_){}
-  return token;
-}
-function releaseVideoControlsAfterStartup(v, token, delay=700){
-  if (!v || WALLPAPER_MODE || !token) return;
-  if (startupControls.timer) clearTimeout(startupControls.timer);
-  startupControls.timer = setTimeout(()=>{
-    if (startupControls.token !== token) return;
-    try{
-      v.controls = true;
-      v.setAttribute("controls", "");
-    }catch(_){}
-  }, delay);
 }
 
 /* === 全局忙碌遮罩（转圈 + 阻塞） === */
@@ -419,6 +400,595 @@ function getLogicalPosDur(){
   return { pos: 0, dur: 0 };
 }
 
+function fmtClock(sec){
+  sec = Math.max(0, Number(sec) || 0);
+  const s = Math.floor(sec % 60);
+  const m = Math.floor(sec / 60) % 60;
+  const h = Math.floor(sec / 3600);
+  return h > 0
+    ? `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`
+    : `${m}:${String(s).padStart(2,"0")}`;
+}
+
+function cpcIcon(name){
+  const attrs = 'class="cpc-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"';
+  const icons = {
+    play: `<svg ${attrs}><polygon points="6 4 20 12 6 20 6 4"></polygon></svg>`,
+    pause: `<svg ${attrs}><rect x="6" y="4" width="4" height="16" rx="1"></rect><rect x="14" y="4" width="4" height="16" rx="1"></rect></svg>`,
+    previous: `<svg ${attrs}><polygon points="19 20 9 12 19 4 19 20"></polygon><line x1="5" y1="19" x2="5" y2="5"></line></svg>`,
+    next: `<svg ${attrs}><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="19"></line></svg>`,
+    volume: `<svg ${attrs}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.5 8.5a5 5 0 0 1 0 7"></path><path d="M19 5a10 10 0 0 1 0 14"></path></svg>`,
+    mute: `<svg ${attrs}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="22" y1="9" x2="16" y2="15"></line><line x1="16" y1="9" x2="22" y2="15"></line></svg>`,
+    pip: `<svg ${attrs}><rect x="3" y="5" width="18" height="14" rx="2"></rect><rect x="13" y="12" width="6" height="4" rx="1"></rect></svg>`,
+    fullscreen: `<svg ${attrs}><path d="M8 3H5a2 2 0 0 0-2 2v3"></path><path d="M16 3h3a2 2 0 0 1 2 2v3"></path><path d="M8 21H5a2 2 0 0 1-2-2v-3"></path><path d="M16 21h3a2 2 0 0 0 2-2v-3"></path></svg>`,
+    fullscreenExit: `<svg ${attrs}><path d="M8 3v3a2 2 0 0 1-2 2H3"></path><path d="M16 3v3a2 2 0 0 0 2 2h3"></path><path d="M8 21v-3a2 2 0 0 0-2-2H3"></path><path d="M16 21v-3a2 2 0 0 1 2-2h3"></path></svg>`,
+    rotate: `<svg ${attrs}><rect x="7" y="3" width="10" height="18" rx="2"></rect><path d="M4 8a8 8 0 0 1 8-6"></path><path d="m9 2 3 0 0 3"></path><path d="M20 16a8 8 0 0 1-8 6"></path><path d="m15 22-3 0 0-3"></path></svg>`,
+    back: `<svg ${attrs}><path d="M19 12H5"></path><path d="M12 19l-7-7 7-7"></path></svg>`,
+    menu: `<svg ${attrs}><path d="M4 6h16"></path><path d="M4 12h16"></path><path d="M4 18h16"></path></svg>`,
+    chevronDown: `<svg ${attrs}><path d="m6 9 6 6 6-6"></path></svg>`,
+    home: `<svg ${attrs}><path d="m3 10 9-7 9 7"></path><path d="M5 10v10h14V10"></path><path d="M9 20v-6h6v6"></path></svg>`,
+  };
+  return icons[name] || "";
+}
+
+function setCpcIcon(btn, name){
+  if (!btn || btn.dataset.icon === name) return;
+  btn.dataset.icon = name;
+  btn.innerHTML = cpcIcon(name);
+}
+
+const customControls = {
+  els:null,
+  dragging:false,
+  previewTime:0,
+  seekBufferClampUntil:0,
+  timer:null,
+  lastUiAt:0,
+  lastVolume:0.8,
+  pipPending:false,
+  pipActive:false,
+  orientationLocked:false,
+};
+
+function fixedMediaDuration(){
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  const expected = Number(v?._expectedDuration || 0);
+  if (Number.isFinite(expected) && expected > 0) return expected;
+  const id = player?.ids?.[player.index];
+  if (id){
+    const cached = hlsInfoCache.get(String(id));
+    const d = Number(cached?.duration || 0);
+    if (Number.isFinite(d) && d > 0) return d;
+  }
+  const { dur } = getLogicalPosDur();
+  if (Number.isFinite(dur) && dur > 0) return dur;
+  const vd = Number(v?.duration || 0);
+  if (Number.isFinite(vd) && vd > 0) return vd;
+  const ad = Number(a?.duration || 0);
+  if (Number.isFinite(ad) && ad > 0) return ad;
+  return 0;
+}
+
+function bufferedEndForPosition(el, pos){
+  try{
+    const b = el?.buffered;
+    if (!b || !b.length) return 0;
+    const p = Math.max(0, Number(pos) || 0);
+    for (let i=0; i<b.length; i++){
+      const start = b.start(i), end = b.end(i);
+      if (end >= p && start <= p + 0.25) return Math.max(p, end);
+    }
+    return p;
+  }catch(_){ return Math.max(0, Number(pos) || 0); }
+}
+
+function setCustomControlPct(playedPct, bufferPct){
+  const els = customControls.els;
+  if (!els) return;
+  const p = Math.max(0, Math.min(100, playedPct || 0));
+  const b = Math.max(0, Math.min(100, bufferPct || 0));
+  els.played.style.width = `${p}%`;
+  els.buffered.style.width = `${b}%`;
+  els.thumb.style.left = `${p}%`;
+}
+
+function isFsActive(){
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+function hasUserActivation(){
+  try{
+    const ua = navigator.userActivation;
+    return !ua || !!ua.isActive;
+  }catch(_){
+    return true;
+  }
+}
+
+function requestPlayerFullscreen({ requireActivation=false, showError=false } = {}){
+  const wrap = $("playerFS");
+  if (!wrap || isFsActive()) return false;
+  if (requireActivation && !hasUserActivation()) return false;
+  try{
+    let p = null;
+    if (wrap.requestFullscreen) p = wrap.requestFullscreen({ navigationUI:"hide" });
+    else if (wrap.webkitRequestFullscreen) p = wrap.webkitRequestFullscreen();
+    if (p && typeof p.catch === "function"){
+      p.catch(()=>{
+        if (showError){
+          showNotice("全屏需要由点击触发，请再点一次全屏按钮");
+          setTimeout(clearNotice, 1800);
+        }
+      }).finally(()=> renderCustomControls(true));
+    } else {
+      setTimeout(()=> renderCustomControls(true), 0);
+    }
+    return true;
+  }catch(_){
+    if (showError){
+      showNotice("全屏需要由点击触发，请再点一次全屏按钮");
+      setTimeout(clearNotice, 1800);
+    }
+    renderCustomControls(true);
+    return false;
+  }
+}
+
+function isPipActiveOrPending(){
+  return !!(customControls.pipPending || customControls.pipActive || document.pictureInPictureElement);
+}
+
+async function handlePiPEntered(){
+  customControls.pipPending = false;
+  customControls.pipActive = true;
+  if (playbackMode === "audio" && isPlayerActive()){
+    await switchToVideo();
+  }
+  stopBgAdvanceGuard();
+  stopBgKeepAlive();
+  stopStallHeartbeat();
+  renderCustomControls(true);
+}
+
+async function handlePiPLeft(){
+  customControls.pipPending = false;
+  customControls.pipActive = false;
+  renderCustomControls(true);
+  if (!isPlayerActive()) return;
+  if (document.visibilityState === "hidden" && BACKGROUND_AUDIO_MODE && !WALLPAPER_MODE && !scrubGuard.active && !_repairInProgress){
+    await switchToAudio();
+  }
+}
+
+function setActiveVolume(value){
+  const active = getActiveEl();
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  const vol = Math.max(0, Math.min(1, Number(value) || 0));
+  if (vol > 0) customControls.lastVolume = vol;
+  try{
+    if (active){
+      active.volume = vol;
+      active.muted = vol <= 0;
+    }
+    if (playbackMode === "video" && v){
+      v.volume = vol;
+      v.muted = vol <= 0;
+    } else if (playbackMode === "audio" && a){
+      a.volume = vol;
+      a.muted = vol <= 0;
+    }
+  }catch(_){}
+  renderCustomControls(true);
+}
+
+function toggleActiveMute(){
+  const active = getActiveEl();
+  if (!active) return;
+  const currentlyMuted = !!active.muted || Number(active.volume || 0) <= 0;
+  if (currentlyMuted){
+    setActiveVolume(customControls.lastVolume || 0.8);
+  } else {
+    customControls.lastVolume = Math.max(0.05, Number(active.volume || 0.8));
+    setActiveVolume(0);
+  }
+}
+
+function setPlaybackRate(rate){
+  const r = Math.max(0.25, Math.min(4, Number(rate) || 1));
+  const v = media.v || $("fsVideo");
+  const a = media.a || $("bgAudio");
+  try{ if (v) v.playbackRate = r; }catch(_){}
+  try{ if (a) a.playbackRate = r; }catch(_){}
+  renderCustomControls(true);
+}
+
+function cyclePlaybackRate(){
+  const rates = [0.5, 0.75, 1, 1.25, 1.5, 2];
+  const active = getActiveEl();
+  const cur = Number(active?.playbackRate || 1);
+  const next = rates.find(r => r > cur + 0.01) || rates[0];
+  setPlaybackRate(next);
+}
+
+async function togglePictureInPicture(){
+  const v = media.v || $("fsVideo");
+  if (!v || !document.pictureInPictureEnabled || typeof v.requestPictureInPicture !== "function") return;
+  try{
+    if (document.pictureInPictureElement) await document.exitPictureInPicture();
+    else {
+      customControls.pipPending = true;
+      await v.requestPictureInPicture();
+      await handlePiPEntered();
+    }
+  }catch(_){
+    customControls.pipPending = false;
+  }
+  renderCustomControls(true);
+}
+
+async function toggleFullscreen(){
+  try{
+    if (isFsActive()){
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    } else {
+      requestPlayerFullscreen({ showError:true });
+    }
+  }catch(_){}
+  renderCustomControls(true);
+}
+
+async function toggleScreenOrientation(){
+  if (!IS_MOBILE_UA) return;
+  const orientation = screen.orientation;
+  if (!orientation || typeof orientation.lock !== "function"){
+    showNotice("当前浏览器不支持网页转屏锁定");
+    setTimeout(clearNotice, 1800);
+    return;
+  }
+  try{
+    if (!isFsActive()) requestPlayerFullscreen({ showError:true });
+    const type = String(orientation.type || "");
+    const isPortrait = type ? type.includes("portrait") : window.innerHeight >= window.innerWidth;
+    const target = isPortrait ? "landscape" : "portrait";
+    await orientation.lock(target);
+    customControls.orientationLocked = true;
+  }catch(_){
+    showNotice("转屏失败：浏览器可能要求先进入全屏或不支持该功能");
+    setTimeout(clearNotice, 2200);
+  }
+  renderCustomControls(true);
+  wakeOverlay();
+}
+
+async function toggleCustomPlayback(){
+  const active = getActiveEl();
+  if (!active) return;
+  try{
+    if (active.paused){
+      clearUserPaused();
+      await active.play();
+    } else {
+      markUserPaused();
+      active.pause();
+    }
+  }catch(_){
+    installUserGestureUnlock();
+  }
+  renderCustomControls(true);
+  wakeOverlay();
+}
+
+async function playPreviousInPlaylist(){
+  if (!player.ids || player.ids.length <= 1) return;
+  if (player.index > 0) await playIndex(player.index - 1, { resumeAt: 0 });
+  else if (player.loop) await playIndex(player.ids.length - 1, { resumeAt: 0 });
+  renderCustomControls(true);
+  wakeOverlay();
+}
+
+function renderCustomControls(force=false){
+  const els = customControls.els;
+  if (!els || !isPlayerActive()) return;
+  const now = performance.now();
+  if (!force && !customControls.dragging && now - customControls.lastUiAt < 250) return;
+  customControls.lastUiAt = now;
+
+  const duration = fixedMediaDuration();
+  const { pos } = getLogicalPosDur();
+  const shownPos = customControls.dragging ? customControls.previewTime : pos;
+  const pct = duration > 0 ? (shownPos / duration) * 100 : 0;
+
+  const v = media.v || $("fsVideo");
+  const active = getActiveEl() || v;
+  let bufferEnd = bufferedEndForPosition(active, pos);
+  if (performance.now() < customControls.seekBufferClampUntil && active?.seeking){
+    bufferEnd = pos;
+  }
+  const bufferPct = duration > 0 ? (bufferEnd / duration) * 100 : 0;
+
+  setCustomControlPct(pct, bufferPct);
+  els.cur.textContent = fmtClock(shownPos);
+  els.dur.textContent = duration > 0 ? fmtClock(duration) : "--:--";
+  const isPlaying = !!(active && !active.paused);
+  const hasPlaylistNav = (player.ids || []).length > 1;
+  if (els.prev && els.next){
+    els.prev.hidden = !hasPlaylistNav;
+    els.next.hidden = !hasPlaylistNav;
+    els.prev.disabled = hasPlaylistNav && !player.loop && player.index <= 0;
+    els.next.disabled = hasPlaylistNav && !player.loop && player.index >= player.ids.length - 1;
+  }
+  els.play.classList.toggle("playing", isPlaying);
+  setCpcIcon(els.play, isPlaying ? "pause" : "play");
+  els.play.setAttribute("aria-label", isPlaying ? "暂停" : "播放");
+  if (els.centerPlay){
+    els.centerPlay.classList.toggle("playing", isPlaying);
+    els.centerPlay.classList.toggle("paused", !isPlaying);
+    setCpcIcon(els.centerPlay, isPlaying ? "pause" : "play");
+    els.centerPlay.setAttribute("aria-label", isPlaying ? "暂停" : "播放");
+  }
+  if (els.mute && active){
+    const vol = Math.max(0, Math.min(1, Number(active.volume || 0)));
+    const muted = !!active.muted || vol <= 0;
+    els.mute.classList.toggle("muted", muted);
+    setCpcIcon(els.mute, muted ? "mute" : "volume");
+    els.mute.setAttribute("aria-label", muted ? "解除静音" : "静音");
+    els.volume.value = String(Math.round((muted ? 0 : vol) * 100));
+  }
+  if (els.rate && active){
+    const rate = Number(active.playbackRate || 1);
+    els.rate.textContent = `${Number.isInteger(rate) ? rate.toFixed(0) : rate.toFixed(2).replace(/0$/,"")}x`;
+  }
+  if (els.pip){
+    const pipSupported = !!(document.pictureInPictureEnabled && v && typeof v.requestPictureInPicture === "function");
+    els.pip.disabled = !pipSupported;
+    els.pip.classList.toggle("active", !!document.pictureInPictureElement);
+  }
+  if (els.fullscreen){
+    const fs = isFsActive();
+    els.fullscreen.classList.toggle("active", fs);
+    setCpcIcon(els.fullscreen, fs ? "fullscreenExit" : "fullscreen");
+    els.fullscreen.setAttribute("aria-label", fs ? "退出全屏" : "全屏");
+  }
+  if (els.rotate){
+    els.rotate.hidden = !IS_MOBILE_UA;
+  }
+  els.root.classList.toggle("dragging", customControls.dragging);
+}
+
+function seekFromCustomControls(clientX){
+  const els = customControls.els;
+  const duration = fixedMediaDuration();
+  if (!els || duration <= 0) return 0;
+  const rect = els.track.getBoundingClientRect();
+  const frac = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0;
+  const target = frac * duration;
+  customControls.previewTime = target;
+  const bufferEnd = bufferedEndForPosition(getActiveEl() || media.v || $("fsVideo"), target);
+  const bufferPct = duration > 0 ? (bufferEnd / duration) * 100 : 0;
+  setCustomControlPct(frac * 100, bufferPct);
+  els.cur.textContent = fmtClock(target);
+  return target;
+}
+
+function commitCustomSeek(target){
+  const duration = fixedMediaDuration();
+  if (!Number.isFinite(target) || duration <= 0) return;
+  const t = Math.max(0, Math.min(duration - 0.05, target));
+  beginScrubGuard();
+  customControls.seekBufferClampUntil = performance.now() + 1500;
+  try{
+    if (playbackMode === "audio"){
+      const a = media.a || $("bgAudio");
+      if (a) a.currentTime = Math.max(0, t + (audioBias || 0));
+      const v = media.v || $("fsVideo");
+      if (v) v.currentTime = t;
+    } else {
+      const v = media.v || $("fsVideo");
+      if (v) v.currentTime = t;
+      const a = media.a || $("bgAudio");
+      if (a && !a.paused) a.currentTime = Math.max(0, t + (audioBias || 0));
+    }
+  }catch(_){}
+  endScrubGuardSoon();
+  updatePositionState();
+  renderCustomControls(true);
+}
+
+function ensureCustomPlayerControls(){
+  if (customControls.els) return customControls.els;
+  const overlay = $("overlay");
+  if (!overlay) return null;
+  const root = document.createElement("div");
+  root.id = "customPlayerControls";
+  root.className = "custom-player-controls";
+  root.innerHTML = `
+    <button class="cpc-btn cpc-prev" type="button" aria-label="上一曲" hidden>${cpcIcon("previous")}</button>
+    <button class="cpc-play" type="button" aria-label="播放">${cpcIcon("play")}</button>
+    <button class="cpc-btn cpc-next" type="button" aria-label="下一曲" hidden>${cpcIcon("next")}</button>
+    <div class="cpc-time cpc-current">0:00</div>
+    <div class="cpc-seek" role="slider" aria-label="播放进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+      <div class="cpc-track">
+        <div class="cpc-buffered"></div>
+        <div class="cpc-played"></div>
+        <div class="cpc-thumb"></div>
+      </div>
+    </div>
+    <div class="cpc-time cpc-duration">--:--</div>
+    <button class="cpc-btn cpc-mute" type="button" aria-label="静音">${cpcIcon("volume")}</button>
+    <input class="cpc-volume" type="range" min="0" max="100" value="80" aria-label="音量">
+    <button class="cpc-btn cpc-rate" type="button" aria-label="倍速">1x</button>
+    <button class="cpc-btn cpc-pip" type="button" aria-label="画中画">${cpcIcon("pip")}</button>
+    <button class="cpc-btn cpc-rotate" type="button" aria-label="切换横竖屏" hidden>${cpcIcon("rotate")}</button>
+    <button class="cpc-btn cpc-fullscreen" type="button" aria-label="全屏">${cpcIcon("fullscreen")}</button>
+  `;
+  const centerPlay = document.createElement("button");
+  centerPlay.className = "cpc-center-play paused";
+  centerPlay.type = "button";
+  centerPlay.setAttribute("aria-label", "播放");
+  centerPlay.innerHTML = cpcIcon("play");
+  overlay.appendChild(centerPlay);
+  overlay.appendChild(root);
+  const els = customControls.els = {
+    root,
+    centerPlay,
+    prev: root.querySelector(".cpc-prev"),
+    play: root.querySelector(".cpc-play"),
+    next: root.querySelector(".cpc-next"),
+    cur: root.querySelector(".cpc-current"),
+    dur: root.querySelector(".cpc-duration"),
+    seek: root.querySelector(".cpc-seek"),
+    track: root.querySelector(".cpc-track"),
+    buffered: root.querySelector(".cpc-buffered"),
+    played: root.querySelector(".cpc-played"),
+    thumb: root.querySelector(".cpc-thumb"),
+    mute: root.querySelector(".cpc-mute"),
+    volume: root.querySelector(".cpc-volume"),
+    rate: root.querySelector(".cpc-rate"),
+    pip: root.querySelector(".cpc-pip"),
+    rotate: root.querySelector(".cpc-rotate"),
+    fullscreen: root.querySelector(".cpc-fullscreen"),
+  };
+
+  els.prev.onclick = async (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    await playPreviousInPlaylist();
+  };
+  els.play.onclick = async (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    await toggleCustomPlayback();
+  };
+  els.next.onclick = async (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    await nextInPlaylist();
+    renderCustomControls(true);
+    wakeOverlay();
+  };
+  els.centerPlay.onclick = async (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    await toggleCustomPlayback();
+  };
+  els.mute.onclick = (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    toggleActiveMute();
+    wakeOverlay();
+  };
+  els.volume.addEventListener("input", (ev)=>{
+    ev.stopPropagation();
+    setActiveVolume(Number(ev.currentTarget.value || 0) / 100);
+    wakeOverlay();
+  });
+  const stopVolumePointer = (ev)=>{ ev.stopPropagation(); wakeOverlay(); };
+  ["pointerdown","pointermove","pointerup","pointercancel","touchstart","touchmove","touchend","mousedown","mousemove","mouseup","click"].forEach((type)=>{
+    els.volume.addEventListener(type, stopVolumePointer, { passive:true });
+  });
+  els.rate.onclick = (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    cyclePlaybackRate();
+    wakeOverlay();
+  };
+  els.pip.onclick = (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    togglePictureInPicture();
+    wakeOverlay();
+  };
+  els.rotate.onclick = (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    toggleScreenOrientation();
+  };
+  els.fullscreen.onclick = (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    toggleFullscreen();
+    wakeOverlay();
+  };
+  if (!customControls.docEventsInstalled){
+    customControls.docEventsInstalled = true;
+    document.addEventListener("fullscreenchange", ()=> renderCustomControls(true));
+    document.addEventListener("webkitfullscreenchange", ()=> renderCustomControls(true));
+    document.addEventListener("enterpictureinpicture", ()=>{ handlePiPEntered(); }, true);
+    document.addEventListener("leavepictureinpicture", ()=>{ handlePiPLeft(); }, true);
+  }
+
+  const onDown = (ev)=>{
+    ev.preventDefault(); ev.stopPropagation();
+    wakeOverlay();
+    customControls.dragging = true;
+    beginScrubGuard();
+    const target = seekFromCustomControls(ev.clientX);
+    try{ els.seek.setPointerCapture(ev.pointerId); }catch(_){}
+    customControls.previewTime = target;
+    renderCustomControls(true);
+  };
+  const onMove = (ev)=>{
+    if (!customControls.dragging) return;
+    ev.preventDefault(); ev.stopPropagation();
+    customControls.previewTime = seekFromCustomControls(ev.clientX);
+  };
+  const onUp = (ev)=>{
+    if (!customControls.dragging) return;
+    ev.preventDefault(); ev.stopPropagation();
+    const target = seekFromCustomControls(ev.clientX);
+    customControls.dragging = false;
+    commitCustomSeek(target);
+    try{ els.seek.releasePointerCapture(ev.pointerId); }catch(_){}
+  };
+  els.seek.addEventListener("pointerdown", onDown);
+  els.seek.addEventListener("pointermove", onMove);
+  els.seek.addEventListener("pointerup", onUp);
+  els.seek.addEventListener("pointercancel", onUp);
+  els.seek.addEventListener("keydown", (ev)=>{
+    const duration = fixedMediaDuration();
+    if (duration <= 0) return;
+    const { pos } = getLogicalPosDur();
+    let target = null;
+    if (ev.key === "ArrowLeft") target = pos - 10;
+    else if (ev.key === "ArrowRight") target = pos + 10;
+    else if (ev.key === "Home") target = 0;
+    else if (ev.key === "End") target = duration - 0.05;
+    if (target !== null){
+      ev.preventDefault(); ev.stopPropagation();
+      commitCustomSeek(target);
+      wakeOverlay();
+    }
+  });
+  return els;
+}
+
+function startCustomControlsTicker(){
+  ensureCustomPlayerControls();
+  if (customControls.timer) clearInterval(customControls.timer);
+  customControls.timer = setInterval(()=>renderCustomControls(false), 250);
+  renderCustomControls(true);
+}
+
+function stopCustomControlsTicker(){
+  if (customControls.timer){ clearInterval(customControls.timer); customControls.timer = null; }
+  customControls.dragging = false;
+}
+
+function installCustomControlKeys(){
+  if (customControls.keysInstalled) return;
+  customControls.keysInstalled = true;
+  window.addEventListener("keydown", async (ev)=>{
+    if (!isPlayerActive()) return;
+    const tag = String(ev.target?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || ev.target?.isContentEditable) return;
+    if (ev.key === " " || ev.key === "k" || ev.key === "K"){
+      ev.preventDefault();
+      await toggleCustomPlayback();
+      return;
+    }
+    if (ev.key === "ArrowLeft" || ev.key === "ArrowRight"){
+      ev.preventDefault();
+      const { pos } = getLogicalPosDur();
+      commitCustomSeek(pos + (ev.key === "ArrowRight" ? 10 : -10));
+      wakeOverlay();
+    }
+  });
+}
+
 document.addEventListener("dragstart", e => e.preventDefault());
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 function chunk(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size)); return out; }
@@ -500,6 +1070,20 @@ function setNoticePct(pct){
 }
 function fmtSize(sz){ if (sz>=1<<30) return (sz/(1<<30)).toFixed(1)+" GB"; if (sz>=1<<20) return (sz/(1<<20)).toFixed(1)+" MB"; if (sz>=1<<10) return (sz/(1<<10)).toFixed(1)+" KB"; return sz+" B"; }
 function fmtDate(ts){ return new Date(ts*1000).toLocaleString(); }
+function tileMetaHtml(v){
+  return `<span class="meta-date">${_escHtml(fmtDate(v.mtime))}</span><span class="meta-sep">·</span><span class="meta-size">${_escHtml(fmtSize(v.size))}</span>`;
+}
+function ratingBadgeInfo(rating){
+  const raw = String(rating || "").trim();
+  const low = raw.toLowerCase();
+  if (low.includes("adult") || low.includes("mature") || low.includes("成人") || low === "18+" || low.includes("r18")) return { label:"成人", cls:"adult" };
+  if (low.includes("sensitive") || low.includes("questionable") || low.includes("partial") || low.includes("较敏感") || low.includes("敏感")) return { label:"较敏感", cls:"sensitive" };
+  return { label:"全年龄", cls:"safe" };
+}
+function ratingBadgeHtml(rating){
+  const info = ratingBadgeInfo(rating);
+  return `<span class="rating-badge ${info.cls}">${info.label}</span>`;
+}
 function isSelectableTile(t){ return !!t && (t.type === "video" || t.type === "folder"); }
 function isSel(t){ if (!isSelectableTile(t)) return false; return t.type==="video" ? state.selV.has(t.vid) : state.selF.has(t.path); }
 function setSel(t,on){
@@ -508,6 +1092,22 @@ function setSel(t,on){
   t.el.classList.toggle("selected",on);
 }
 function clearSel(){ state.tiles.forEach(t=>t.el.classList.remove("selected")); state.selV.clear(); state.selF.clear(); }
+function hasSelectionAnchor(){
+  return state.lastIdx != null || state.selV.size > 0 || state.selF.size > 0;
+}
+function shouldRangeSelect(ev){
+  if (ev?.shiftKey || shiftKeyDown) return true;
+  return hasSelectionAnchor() && (Date.now() - lastShiftReleasedAt) <= SHIFT_RANGE_GRACE_MS;
+}
+window.addEventListener("keydown", (ev)=>{
+  if (ev.key === "Shift") shiftKeyDown = true;
+}, { passive:true });
+window.addEventListener("keyup", (ev)=>{
+  if (ev.key === "Shift") {
+    shiftKeyDown = false;
+    lastShiftReleasedAt = Date.now();
+  }
+}, { passive:true });
 
 /* ====================== （★ 新增）文件夹操作辅助 ====================== */
 
@@ -771,7 +1371,7 @@ function onHashChange(){
 window.addEventListener("hashchange", onHashChange);
 
 function renderSkeleton(nextBreadcrumb) {
-  if (nextBreadcrumb) $("crumb").innerHTML = "当前位置：" + nextBreadcrumb;
+  if (nextBreadcrumb) renderCrumbFromHtml(nextBreadcrumb);
   const g = grid(); g.innerHTML = "";
   for (let i=0;i<16;i++){
     const el = document.createElement("div");
@@ -864,10 +1464,7 @@ async function loadNextPage(){
     let data;
     if (usePrefetch){ data=prefetchState.data; prefetchState.data=null; }
     else { const opts=snapshotOpts(); data = await apiScan(opts, state.page, undefined); if (keyAtStart!==makeQueryKey()){ state.isLoading=false; return; } }
-    const crumb = ["<a class='link' href='#/'>/</a>"].concat(
-      data.breadcrumb.map((seg,i)=>{const p="/"+data.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}'>${seg}</a>`;})
-    ).join(" / ");
-    $("crumb").innerHTML = "当前位置：" + crumb;
+    renderCrumb(data.breadcrumb || []);
 
     if (state.page===1){ grid().innerHTML=""; state.tiles=[]; }
     const newIds = appendTiles(data);
@@ -915,7 +1512,7 @@ function appendTiles(data){
     const el = document.createElement("div");
     el.className="tile folder"; el.dataset.type="folder"; el.dataset.path=path; el.dataset.idx=idx;
     el.innerHTML = `<div class="thumb"><div class="big">📁</div></div>
-                    <div class="title">${f.title}</div>
+                    <div class="title" data-full-title="${_escHtml(f.title)}">${f.title}</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"folder", path, idx, title:f.title}); idx++;
   });
@@ -935,10 +1532,11 @@ function appendTiles(data){
                         alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
                         onerror="this.onerror=null; this.src='${fallback}'"
                       />
+                      ${ratingBadgeHtml(v.rating)}
                     </div>
                     <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
-                    <div class="title">${v.title}</div>
-                    <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
+                    <div class="title" data-full-title="${_escHtml(v.title)}">${v.title}</div>
+                    <div class="meta">${tileMetaHtml(v)}</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"video", vid:v.id, idx, title:v.title}); idx++;
     batchVideoIds.push(String(v.id));
@@ -1012,7 +1610,7 @@ function createTileFromSpec(spec, idx){
     el.className = "tile folder";
     el.dataset.type = "folder"; el.dataset.path = spec.path; el.dataset.idx = idx;
     el.innerHTML = `<div class="thumb"><div class="big">📁</div></div>
-                    <div class="title">${spec.title}</div>
+                    <div class="title" data-full-title="${_escHtml(spec.title)}">${spec.title}</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     return { el, type:"folder", path:spec.path, idx, title:spec.title };
   }
@@ -1028,10 +1626,11 @@ function createTileFromSpec(spec, idx){
                       alt="preview" draggable="false" loading="lazy" decoding="async" fetchpriority="low"
                       onerror="this.onerror=null; this.src='${fallback}'"
                     />
+                    ${ratingBadgeHtml(v.rating)}
                   </div>
                   <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
-                  <div class="title">${v.title}</div>
-                  <div class="meta">${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}</div>
+                  <div class="title" data-full-title="${_escHtml(v.title)}">${v.title}</div>
+                  <div class="meta">${tileMetaHtml(v)}</div>
                   <button class="tile-menu" title="菜单">⋮</button>`;
   return { el, type:"video", vid:String(v.id), idx, title:v.title };
 }
@@ -1044,14 +1643,78 @@ function updateTileFromSpec(tile, spec, idx){
     tile.title = v.title;
     const titleEl = tile.el && tile.el.querySelector(".title");
     const metaEl = tile.el && tile.el.querySelector(".meta");
-    if (titleEl && titleEl.textContent !== v.title) titleEl.textContent = v.title;
-    if (metaEl) metaEl.textContent = `${fmtDate(v.mtime)} · ${fmtSize(v.size)} · ${v.rating||"-"}`;
+    const badgeEl = tile.el && tile.el.querySelector(".rating-badge");
+    if (titleEl) {
+      if (titleEl.textContent !== v.title) titleEl.textContent = v.title;
+      titleEl.dataset.fullTitle = v.title || "";
+    }
+    if (metaEl) metaEl.innerHTML = tileMetaHtml(v);
+    if (badgeEl) {
+      const info = ratingBadgeInfo(v.rating);
+      badgeEl.className = `rating-badge ${info.cls}`;
+      badgeEl.textContent = info.label;
+    }
     updateTileWatchedUI(v.id, isWatched(v.id));
   } else {
     tile.title = spec.title;
+    const titleEl = tile.el && tile.el.querySelector(".title");
+    if (titleEl) {
+      if (titleEl.textContent !== spec.title) titleEl.textContent = spec.title;
+      titleEl.dataset.fullTitle = spec.title || "";
+    }
   }
   if (tile.el) tile.el.classList.toggle("selected", isSel(tile));
   return tile;
+}
+
+const titleTip = { el:null, active:null };
+function ensureTitleTip(){
+  if (titleTip.el) return titleTip.el;
+  const el = document.createElement("div");
+  el.className = "title-tooltip";
+  document.body.appendChild(el);
+  titleTip.el = el;
+  return el;
+}
+function showTitleTip(target, ev){
+  const text = target?.dataset?.fullTitle || target?.textContent || "";
+  if (!text.trim()) return;
+  const el = ensureTitleTip();
+  titleTip.active = target;
+  el.textContent = text;
+  el.classList.add("show");
+  moveTitleTip(ev);
+}
+function moveTitleTip(ev){
+  const el = titleTip.el;
+  if (!el || !el.classList.contains("show")) return;
+  const pad = 12;
+  const x = Math.min(window.innerWidth - pad, (ev?.clientX || 0) + 14);
+  const y = Math.min(window.innerHeight - pad, (ev?.clientY || 0) + 16);
+  el.style.left = x + "px";
+  el.style.top = y + "px";
+}
+function hideTitleTip(){
+  if (titleTip.el) titleTip.el.classList.remove("show");
+  titleTip.active = null;
+}
+function installTitleTooltip(){
+  if (installTitleTooltip.installed) return;
+  installTitleTooltip.installed = true;
+  document.addEventListener("mouseover", (ev)=>{
+    const title = ev.target && ev.target.closest && ev.target.closest(".tile .title");
+    if (!title) return;
+    showTitleTip(title, ev);
+  });
+  document.addEventListener("mousemove", (ev)=>{
+    if (titleTip.active) moveTitleTip(ev);
+  });
+  document.addEventListener("mouseout", (ev)=>{
+    const title = ev.target && ev.target.closest && ev.target.closest(".tile .title");
+    if (!title) return;
+    if (ev.relatedTarget && title.contains(ev.relatedTarget)) return;
+    hideTitleTip();
+  });
 }
 async function softRefreshCurrentScanContext(){
   if (state.isLoading) return;
@@ -1074,10 +1737,7 @@ async function softRefreshCurrentScanContext(){
     const first = pages[0] && pages[0].data;
     const last = pages[pages.length - 1] && pages[pages.length - 1].data;
     if (!first || !last) return;
-    const crumb = ["<a class='link' href='#/'>/</a>"].concat(
-      first.breadcrumb.map((seg,i)=>{const p="/"+first.breadcrumb.slice(0,i+1).join("/"); return `<a class='link' href='#${p}'>${seg}</a>`;})
-    ).join(" / ");
-    $("crumb").innerHTML = "当前位置：" + crumb;
+    renderCrumb(first.breadcrumb || []);
 
     const specs = [];
     pages.forEach(x=> specs.push(...buildTileSpecs(x.data, x.page)));
@@ -1182,6 +1842,21 @@ function buildCrumbHtml(pathStr){
   const segs = pathStr.split("/").filter(Boolean);
   segs.forEach((seg,i)=>{ const p="/"+segs.slice(0,i+1).join("/"); html.push(`<a class='link' href='#${p}'>${seg}</a>`); });
   return html.join(" / ");
+}
+function renderCrumbFromHtml(_html){
+  const segs = (state.path || "/").split("/").filter(Boolean);
+  renderCrumb(segs);
+}
+function renderCrumb(segs=[]){
+  const el = $("crumb");
+  if (!el) return;
+  el.classList.add("path-pill");
+  const parts = [`<a class="path-chip root" href="#/" title="根目录">${cpcIcon("home")}<span>/</span></a>`];
+  (segs || []).forEach((seg, i)=>{
+    const p = "/" + segs.slice(0, i+1).join("/");
+    parts.push(`<span class="path-sep">/</span><a class="path-chip" href="#${encodeURI(p)}" title="${_escHtml(seg)}">${_escHtml(seg)}</a>`);
+  });
+  el.innerHTML = parts.join("");
 }
 
 /* =================== 播放控制（无 MSE） =================== */
@@ -1336,14 +2011,11 @@ installPopStateGuard();
   }
 })();
 
-/* --- 禁用 PIP --- */
+/* --- 允许自定义控件接管 PiP/远程播放 --- */
 function enforceNoPIP(v){
   if (!v) return;
-  try{ v.disablePictureInPicture = true; v.setAttribute("disablepictureinpicture",""); }catch(_){}
+  try{ v.disablePictureInPicture = false; v.removeAttribute("disablepictureinpicture"); }catch(_){}
   try{ v.disableRemotePlayback = true; }catch(_){}
-  v.addEventListener("enterpictureinpicture", async ()=>{
-    try{ if (document.pictureInPictureElement) await document.exitPictureInPicture(); }catch(_){}
-  });
 }
 
 /* --- play 封装 --- */
@@ -1502,6 +2174,40 @@ function _hlsPlaylistUrl(src){
 }
 
 const hlsInfoCache = new Map();
+function _hlsInfoForSrc(src){
+  const vid = _videoIdFromMp4Src(src);
+  return vid ? hlsInfoCache.get(String(vid)) : null;
+}
+function _serverDurationForSrc(src){
+  const d = Number((_hlsInfoForSrc(src) || {}).duration || 0);
+  return Number.isFinite(d) && d > 0 ? d : 0;
+}
+let hlsAttachSeq = 0;
+function pinHlsDuration(hls, v, expectedDuration){
+  const dur = Number(expectedDuration) || Number(v?._expectedDuration) || 0;
+  if (!hls || !v || !Number.isFinite(dur) || dur <= 0) return false;
+  const candidates = [];
+  try{ if (hls.mediaSource) candidates.push(hls.mediaSource); }catch(_){}
+  try{ if (hls.bufferController && hls.bufferController.mediaSource) candidates.push(hls.bufferController.mediaSource); }catch(_){}
+  try{
+    if (Array.isArray(hls.coreComponents)){
+      hls.coreComponents.forEach(c=>{ if (c && c.mediaSource) candidates.push(c.mediaSource); });
+    }
+  }catch(_){}
+  let ok = false;
+  candidates.forEach(ms=>{
+    try{
+      if (ms && ms.readyState !== "closed" && Number.isFinite(ms.duration) && Math.abs(ms.duration - dur) > 0.25){
+        ms.duration = dur;
+        ok = true;
+      }
+    }catch(_){}
+  });
+  try{
+    if (!ok && Number.isFinite(v.duration) && Math.abs(v.duration - dur) <= 0.25) ok = true;
+  }catch(_){}
+  return ok;
+}
 async function _shouldUseHLSForSrc(src){
   const vid = _videoIdFromMp4Src(src);
   if (!vid) return false;
@@ -1537,6 +2243,7 @@ function teardownMSE(v){
     v._hls = null;
   }
   v._hlsSrc = null;
+  v._hlsSeq = 0;
 }
 
 /* 原生 src 路径（兜底）：可以是原 MP4，也可以是 HLS playlist（Safari 原生支持） */
@@ -1562,18 +2269,23 @@ async function attachVideoSrc(src, resumeAt){
   const v = media.v || $("fsVideo");
   if (!v) return;
   enforceNoPIP(v);
+  const vidForInfo = _videoIdFromMp4Src(src);
+  if (vidForInfo) v._expectedDuration = _serverDurationForSrc(src);
 
   // 已经挂的是同一个视频 → 只调进度就行
   if (v._hls && _stripQuery(v._hlsSrc) === _stripQuery(src)){
     setCurrentTimeWhenReady(v, resumeAt||0);
+    pinHlsDuration(v._hls, v, v._expectedDuration);
     return;
   }
+  const seq = ++hlsAttachSeq;
   teardownMSE(v);
 
   const playlistUrl = _hlsPlaylistUrl(src);
 
   // 优先用 HLS.js（Chrome/Firefox/Edge/Android WebView）
   if (playlistUrl && _hlsSupported() && await _shouldUseHLSForSrc(src)){
+    v._expectedDuration = _serverDurationForSrc(src) || v._expectedDuration || 0;
     const hls = new window.Hls({
       // 激进缓冲：尽量把短/中等长度视频整条 append 进 MSE，让进度条灰色缓存段明显前推。
       maxBufferLength: HLS_TARGET_BUFFER_SEC,
@@ -1606,11 +2318,13 @@ async function attachVideoSrc(src, resumeAt){
     });
     v._hls = hls;
     v._hlsSrc = src;
+    v._hlsSeq = seq;
     v.dataset.playbackEngine = "hls";
     let fatalNetworkRetries = 0;
     let fatalMediaRetries = 0;
 
     const fallbackToNative = (reason)=>{
+      if (v._hlsSeq !== seq) return;
       console.warn("[hls] fallback to native mp4:", reason);
       showNotice("HLS 分段播放失败，已临时回退原生 MP4。请打开控制台查看 [hls] 错误。");
       try { hls.stopLoad(); } catch(_){}
@@ -1622,13 +2336,38 @@ async function attachVideoSrc(src, resumeAt){
     };
 
     hls.on(window.Hls.Events.MEDIA_ATTACHED, ()=>{
+      if (v._hlsSeq !== seq) return;
       // attach 完成后让 HLS.js 接管
+      pinHlsDuration(hls, v, v._expectedDuration);
     });
     hls.on(window.Hls.Events.MANIFEST_PARSED, ()=>{
+      if (v._hlsSeq !== seq) return;
       console.info("[hls] attached:", playlistUrl);
+      v._expectedDuration = _serverDurationForSrc(src) || v._expectedDuration || 0;
+      pinHlsDuration(hls, v, v._expectedDuration);
       setTimeout(fixPortraitVideoInFullscreen, 50);
     });
+    if (window.Hls.Events.LEVEL_LOADED){
+      hls.on(window.Hls.Events.LEVEL_LOADED, (_evt, data)=>{
+        if (v._hlsSeq !== seq) return;
+        try{
+          const d = Number(data?.details?.totalduration || data?.details?.totalDuration || 0);
+          const serverDuration = _serverDurationForSrc(src);
+          // Keep the UI on the probed media runtime, not HLS.js' mutable MSE timeline.
+          if (serverDuration > 0) v._expectedDuration = serverDuration;
+          else if (d > 0) v._expectedDuration = d;
+        }catch(_){}
+        pinHlsDuration(hls, v, v._expectedDuration);
+      });
+    }
+    if (window.Hls.Events.BUFFER_CREATED){
+      hls.on(window.Hls.Events.BUFFER_CREATED, ()=>{
+        if (v._hlsSeq !== seq) return;
+        pinHlsDuration(hls, v, v._expectedDuration);
+      });
+    }
     hls.on(window.Hls.Events.ERROR, (_evt, data)=>{
+      if (v._hlsSeq !== seq) return;
       if (!data) return;
       if (data.fatal){
         console.warn("[hls] fatal error:", data.type, data.details, data);
@@ -1772,7 +2511,8 @@ function updatePositionState(){
   if (!("mediaSession" in navigator)) return;
   const el = getActiveEl(); if (!el) return;
 
-  let dur = Number.isFinite(el.duration) && el.duration>0 ? el.duration : undefined;
+  let dur = fixedMediaDuration();
+  if (!Number.isFinite(dur) || dur <= 0) dur = Number.isFinite(el.duration) && el.duration>0 ? el.duration : undefined;
   let pos = Number.isFinite(el.currentTime) && el.currentTime>=0 ? el.currentTime : undefined;
 
   if (playbackMode === "audio"){
@@ -1849,6 +2589,8 @@ async function promoteToVideoNow(reason="unknown"){
 const switchToAudio = withSwitchLock(async function(){
   if (!isPlayerActive() || playbackMode==="audio") return;
   if (scrubGuard.active) return;
+  // PiP 窗口仍存在时保持 video 模式；暂停 PiP 也不算进入后台音频。
+  if (isPipActiveOrPending()) return;
 
   const v = media.v || $("fsVideo");
   const a = media.a || $("bgAudio");
@@ -2071,11 +2813,13 @@ document.addEventListener("visibilitychange", async ()=>{
   if (_repairInProgress) return;  // ★ 修复期间不自动切换到 audio
   if (document.visibilityState === "hidden"){
     if (!BACKGROUND_AUDIO_MODE) return;
+    if (isPipActiveOrPending()) return;
     await switchToAudio();
     // 延迟兜底：检查播放是否被浏览器静默中断（仅在用户没有主动暂停时）
     setTimeout(()=>{
       if (_userPaused) return;
       if (!BACKGROUND_AUDIO_MODE) return;
+      if (isPipActiveOrPending()) return;
       if (document.visibilityState !== "hidden" || !isPlayerActive() || playbackMode !== "audio") return;
       const a = media.a || $("bgAudio");
       if (a && a.paused){
@@ -2158,7 +2902,7 @@ function flushProgressOnLeave(){
 
 window.addEventListener("pagehide", (e)=> { 
   flushProgressOnLeave();
-  if (BACKGROUND_AUDIO_MODE && !WALLPAPER_MODE && isPlayerActive() && !scrubGuard.active && !_repairInProgress) switchToAudio();
+  if (BACKGROUND_AUDIO_MODE && !WALLPAPER_MODE && isPlayerActive() && !scrubGuard.active && !_repairInProgress && !isPipActiveOrPending()) switchToAudio();
   // 如果是进入 bfcache，保持保活机制
   if (e.persisted){
     // 不停止保活，让它在后台继续
@@ -2234,7 +2978,14 @@ function setMediaSessionMeta(id){
     navigator.mediaSession.setActionHandler("play", async ()=>{
       clearUserPaused();
       const {v,a} = both();
-      if (BACKGROUND_AUDIO_MODE && document.visibilityState==="hidden"){
+      if (isPipActiveOrPending()){
+        if (playbackMode === "audio") await promoteToVideoNow("media-session-pip-play");
+        else { try{ await (v?.play?.()); }catch(_){} }
+        try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
+        stopBgAdvanceGuard();
+        stopBgKeepAlive();
+        stopStallHeartbeat();
+      } else if (BACKGROUND_AUDIO_MODE && document.visibilityState==="hidden"){
         const id = player.ids[player.index];
         const aSrc = audioSrcOf(id);
         const resumeAt =
@@ -2559,6 +3310,9 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   playbackMode = "video";
 
   wrap.style.display = "flex";
+  if (!WALLPAPER_MODE) {
+    requestPlayerFullscreen({ requireActivation:true });
+  }
   if (WALLPAPER_MODE && typeof window.__setTouchLocked === "function"){
     window.__setTouchLocked(true);
   }
@@ -2571,9 +3325,9 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
     backBtn.className = "icon-btn back";
     backBtn.title = "返回";
     backBtn.setAttribute("aria-label", "返回");
-    backBtn.textContent = "←";
     wrap.appendChild(backBtn);
   }
+  setCpcIcon(backBtn, "back");
   backBtn.onclick = ()=>{
     exitPlayer();
     // 如果仍在同一路径，仅退出播放器并恢复滚动，不重新刷新列表
@@ -2607,23 +3361,26 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
     }catch(_){}
 
     const bindPos = (el, isVideo)=>{
-      el.addEventListener("timeupdate", updatePositionState);
-      el.addEventListener("loadedmetadata", updatePositionState);
-      el.addEventListener("durationchange", updatePositionState);
+      el.addEventListener("timeupdate", ()=>{ updatePositionState(); renderCustomControls(false); });
+      el.addEventListener("loadedmetadata", ()=>{ updatePositionState(); renderCustomControls(true); });
+      el.addEventListener("durationchange", ()=>{ updatePositionState(); renderCustomControls(true); });
+      el.addEventListener("progress", ()=> renderCustomControls(false));
+      el.addEventListener("volumechange", ()=> renderCustomControls(true));
+      el.addEventListener("ratechange", ()=> renderCustomControls(true));
       el.addEventListener("playing", ()=>{
         if (isVideo) clearUserPaused();
-        updatePositionState(); startPosTicker();
+        updatePositionState(); startPosTicker(); renderCustomControls(true);
         if (!isVideo && playbackMode==="audio" && !_userPaused) startBgKeepAlive();
       });
       el.addEventListener("pause",   ()=>{
         // 仅当该元素是主播放源时才标记用户暂停（音频在前台静音跟随时 pause 不算用户意图）
         if (!wallpaperApplyingVisibility && document.visibilityState==='visible' && (isVideo || playbackMode==='audio')) markUserPaused();
-        updatePositionState();
+        updatePositionState(); renderCustomControls(true);
         if (!isVideo) stopBgKeepAlive();                             
       });
       if (isVideo){
-        el.addEventListener("seeking", ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); stallRepair.lastSeekAt = Date.now(); stallRepair.lastSeekPos = Number.isFinite(el.currentTime)? el.currentTime : stallRepair.lastSeekPos; disarmFirstPlayWatch(); updatePositionState(); });
-        el.addEventListener("seeked",  ()=>{ endScrubGuardSoon(); updatePositionState(); });
+        el.addEventListener("seeking", ()=>{ beginScrubGuard(); stallRepair.startedAt = Date.now(); stallRepair.lastSeekAt = Date.now(); stallRepair.lastSeekPos = Number.isFinite(el.currentTime)? el.currentTime : stallRepair.lastSeekPos; disarmFirstPlayWatch(); updatePositionState(); renderCustomControls(true); });
+        el.addEventListener("seeked",  ()=>{ endScrubGuardSoon(); updatePositionState(); renderCustomControls(true); });
         el.addEventListener("timeupdate", ()=>{ if (Number.isFinite(el.currentTime)) stallRepair.lastVideoTime = el.currentTime; });
       }
     };
@@ -2637,17 +3394,15 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
     a.playsInline = true; a.setAttribute("playsinline",""); a.setAttribute("webkit-playsinline",""); 
     a.disableRemotePlayback = true;
     a.muted = true; a.volume = 0;
-    if (WALLPAPER_MODE){
-      v.controls = false;
-      v.removeAttribute("controls");
-    } else {
-      v.controls = true;
-      v.setAttribute("controls", "");
-    }
+    v.controls = false;
+    v.removeAttribute("controls");
   }catch(_){}
 
   const btnMenu = $("btnMenu");
-  if (btnMenu) btnMenu.onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
+  if (btnMenu) {
+    setCpcIcon(btnMenu, "menu");
+    btnMenu.onclick = ()=>{ if ($("playlistPanel").classList.contains("hidden")) showPlaylistPanel(); else hidePlaylistPanel(); };
+  }
 
   const waitReady = new Promise(res=>{
     let done=false;
@@ -2665,22 +3420,16 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   wrap.addEventListener("mousemove", wakeOverlay);
   wrap.addEventListener("touchstart", wakeOverlay);
   wakeOverlay();
+  startCustomControlsTicker();
+  installCustomControlKeys();
   suspendGridImageLoads();
 
-  // playIndex BEFORE requestFullscreen: play() needs the user gesture token,
-  // and requestFullscreen() would consume it.
-  await playIndex(player.index);
+  await playIndex(player.index, options.ignoreProgress ? { resumeAt: 0 } : {});
   if (WALLPAPER_MUTE_AWAY || WALLPAPER_PAUSE_AWAY) {
     await applyWallpaperVisibility(wallpaperDesktopVisible, "playlist-start");
   }
 
-  // fullscreen after playback started (fire-and-forget, user gesture may have expired
-  // but many browsers allow fullscreen shortly after user interaction)
   if (!WALLPAPER_MODE){
-    try{
-      if (wrap.requestFullscreen) wrap.requestFullscreen({ navigationUI: "hide" }).catch(()=>{});
-      else if (wrap.webkitRequestFullscreen) wrap.webkitRequestFullscreen();
-    }catch(_){}
     try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
   }
 
@@ -2711,8 +3460,14 @@ async function playIndex(i, opts = {}){
   //   3) 无论走哪条，都后台再去服务器核对一次：若服务器上有更新的值（来自其他设备），平滑 seek 过去
   let _progressBgCheck = null;
   const candId = player.ids[i];
+  const replayingWatched = candId && shouldPersistPlaybackState() && isWatched(candId);
+  if (replayingWatched){
+    // 重新播放已观看视频时立即取消已观看，避免勾选状态和当前播放意图冲突。
+    await setWatchedOptimistic(candId, false);
+    resumeAt = 0;
+  }
   rememberRandomPlayed(candId);
-  if (shouldPersistPlaybackState() && !hasExplicitResume && resumeAt <= 0 && candId){
+  if (shouldPersistPlaybackState() && !replayingWatched && !hasExplicitResume && resumeAt <= 0 && candId){
     const local = getLocalProgress(candId);
     const usable = (p) => p && p.duration > 0
       && p.position >= PROGRESS_MIN_POSITION_SEC
@@ -2782,7 +3537,6 @@ async function playIndex(i, opts = {}){
   } else {
     playbackMode = "video";
     try{ if (a){ a.pause(); a.muted = true; a.volume = 0; } }catch(_){}
-    const controlsToken = holdVideoControlsDuringStartup(v);
     await attachVideoSrc(vSrc, resumeAt||0);
     const ok = await safePlay(v);
     // Audio preload AFTER video play: v.play() must consume the user gesture first,
@@ -2791,13 +3545,13 @@ async function playIndex(i, opts = {}){
     if (!ok){ showNotice("播放被阻止：请点击屏幕以继续播放。"); installUserGestureUnlock(); }
     setMediaSessionMeta(id);
     updatePositionState(); startPosTicker();
-    releaseVideoControlsAfterStartup(v, controlsToken);
     stopBgAdvanceGuard();
     stopBgKeepAlive();
     armFirstPlayWatch(id, v);
   }
   startFgSync();
   renderPlaylistPanel();
+  renderCustomControls(true);
 
   wrap.classList.remove("switching");
 
@@ -2889,9 +3643,16 @@ async function exitPlayer(){
       }
     }
   }catch(_){}
+  try {
+    if (customControls.orientationLocked && screen.orientation && typeof screen.orientation.unlock === "function") {
+      screen.orientation.unlock();
+    }
+    customControls.orientationLocked = false;
+  } catch(_){}
   try { if (document.fullscreenElement) await document.exitFullscreen(); } catch(_){}
   const wrap = $("playerFS"); const v = $("fsVideo"); const a = $("bgAudio");
   const shouldFlushScanRefresh = !!scanWatch.pending;
+  stopCustomControlsTicker();
   try { v.pause(); } catch(_){}
   try { a.pause(); } catch(_){}
   // ★ 必须先 teardownMSE（设 destroyed=true）再动 v.src
@@ -2987,7 +3748,7 @@ async function handlePlayFromHereProgressive(vid, title){
   primeBusy("正在启动播放器…");
   cancelProgressive();
   const initial = [{ id: String(vid), title: title || `视频 ${vid}` }];
-  await startPlaylist(initial, 0, state.path);
+  await startPlaylist(initial, 0, state.path, { ignoreProgress: true });
   progressive.seen = new Set(player.ids);
   const all = await getFolderItems(state.path);
   await syncWatched(all.map(x=>x.id));
@@ -3476,7 +4237,7 @@ function bindDelegatedEvents(){
     }
 
     // SHIFT 连选
-    if (ev.shiftKey) {
+    if (shouldRangeSelect(ev)) {
       // 修复：刷新/移动后的第一次 Shift 可能 lastIdx 为空（或失效），但已有“锚点选中项”。
       // 规则：优先使用 lastIdx 指向且仍处于选中状态的 tile；否则使用当前已选中的某个 tile；再否则退化为自身。
       let start = t.idx;
@@ -4207,7 +4968,80 @@ function bindRubber(){
   try{ a.disableRemotePlayback = true; }catch(_){}
 })();
 
+function initCustomSortSelect(){
+  const native = $("sort");
+  if (!native || native._customSortReady) return;
+  native._customSortReady = true;
+  native.classList.add("native-hidden-select");
+
+  const wrap = document.createElement("div");
+  wrap.className = "glass-select";
+  wrap.innerHTML = `
+    <button type="button" class="glass-select-btn" aria-haspopup="listbox" aria-expanded="false">
+      <span class="glass-select-text"></span>
+      ${cpcIcon("chevronDown")}
+    </button>
+    <div class="glass-select-menu" role="listbox"></div>
+  `;
+  native.insertAdjacentElement("afterend", wrap);
+
+  const btn = wrap.querySelector(".glass-select-btn");
+  const text = wrap.querySelector(".glass-select-text");
+  const menu = wrap.querySelector(".glass-select-menu");
+
+  const syncLabel = ()=>{
+    const opt = native.options[native.selectedIndex];
+    text.textContent = opt ? opt.textContent : "";
+  };
+  const close = ()=>{
+    wrap.classList.remove("open");
+    btn.setAttribute("aria-expanded", "false");
+  };
+  const open = ()=>{
+    wrap.classList.add("open");
+    btn.setAttribute("aria-expanded", "true");
+  };
+  const rebuild = ()=>{
+    menu.innerHTML = "";
+    Array.from(native.options).forEach((opt)=>{
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "glass-select-item";
+      item.setAttribute("role", "option");
+      item.dataset.value = opt.value;
+      item.textContent = opt.textContent;
+      if (opt.selected) item.classList.add("selected");
+      item.onclick = (ev)=>{
+        ev.preventDefault();
+        ev.stopPropagation();
+        native.value = opt.value;
+        syncLabel();
+        rebuild();
+        close();
+        changeContext({sort_idx: parseInt(native.value,10)});
+      };
+      menu.appendChild(item);
+    });
+  };
+
+  btn.onclick = (ev)=>{
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (wrap.classList.contains("open")) close();
+    else { rebuild(); open(); }
+  };
+  document.addEventListener("pointerdown", (ev)=>{
+    if (!wrap.contains(ev.target)) close();
+  });
+  document.addEventListener("keydown", (ev)=>{
+    if (ev.key === "Escape") close();
+  });
+  syncLabel();
+  rebuild();
+}
+
 $("sort").onchange = ()=> changeContext({sort_idx: parseInt($("sort").value,10)});
+initCustomSortSelect();
 $("mature").onchange = ()=> changeContext({mature_only: $("mature").checked});
 $("refresh").onclick = ()=> refreshCurrentScanContext("manual");
 let qTimer=null;
@@ -4215,6 +5049,7 @@ $("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContex
 $("playUnwatched").onclick = handlePlayUnwatched;
 
 window.addEventListener("load", ()=>{
+  installTitleTooltip();
   const initPath = pathFromHash();
   renderSkeleton(buildCrumbHtml(initPath));
   changeContext({path: initPath});
