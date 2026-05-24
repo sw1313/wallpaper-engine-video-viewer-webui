@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-86-fullscreen-gesture-2026-05-22");
+console.log("app.js version fs-88-large-file-buffer-2026-05-22");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -334,6 +334,18 @@ function resetProgressSaveState(){
   progressSaveState.lastSavedPos = -1;
   progressSaveState.completedFor = null;
 }
+function maybeMarkPlaybackComplete(id, pos, dur){
+  if (!shouldPersistPlaybackState() || !id) return false;
+  if (!Number.isFinite(pos) || !Number.isFinite(dur) || dur < 1) return false;
+  if (pos / dur < PROGRESS_COMPLETE_RATIO) return false;
+  const sid = String(id);
+  if (progressSaveState.completedFor === sid) return true;
+  progressSaveState.completedFor = sid;
+  markWatched(id);
+  // 服务端在 >=90% 时会清 progress 并写入 watched；仅 clear 不会标记已观看。
+  apiSaveProgress(id, pos, dur);
+  return true;
+}
 function reportProgressTick(){
   if (!shouldPersistPlaybackState()) return;
   if (typeof isPlayerActive !== "function" || !isPlayerActive()) return;
@@ -342,14 +354,7 @@ function reportProgressTick(){
   const { pos, dur } = getLogicalPosDur();
   if (!Number.isFinite(pos) || !Number.isFinite(dur) || dur < 1) return;
 
-  // 完成 → 清除（watched 由 ended 处理，或服务器在 save 时自动标记）
-  if (pos / dur >= PROGRESS_COMPLETE_RATIO){
-    if (progressSaveState.completedFor !== String(id)){
-      progressSaveState.completedFor = String(id);
-      apiClearProgress(id);
-    }
-    return;
-  }
+  if (maybeMarkPlaybackComplete(id, pos, dur)) return;
 
   if (progressSaveState.id !== String(id)){
     progressSaveState.id = String(id);
@@ -386,14 +391,15 @@ function getLogicalPosDur(){
     if (playbackMode === "audio" && a){
       const rawPos = Number(a.currentTime) || 0;
       const pos = Math.max(0, rawPos - (audioBias || 0));
-      // 时长优先用 video（代表真实内容时长），退而求其次用 audio
-      let dur = Number(v?.duration);
+      let dur = fixedMediaDuration();
+      if (!Number.isFinite(dur) || dur <= 0) dur = Number(v?.duration) || 0;
       if (!Number.isFinite(dur) || dur <= 0) dur = Number(a.duration) || 0;
       return { pos, dur };
     }
     if (v){
       const pos = Number(v.currentTime) || 0;
-      const dur = Number(v.duration) || 0;
+      let dur = fixedMediaDuration();
+      if (!Number.isFinite(dur) || dur <= 0) dur = Number(v.duration) || 0;
       return { pos, dur };
     }
   }catch(_){}
@@ -2156,9 +2162,142 @@ function stopBgKeepAlive(){
  *    3. 都不支持 → 退回原生 MP4 src（旧行为）
  */
 
-// 所有视频统一走 HLS；只有浏览器不支持 HLS.js/原生 HLS 时才回退 MP4。
-const HLS_TARGET_BUFFER_SEC = 10 * 60;
-const HLS_MAX_BUFFER_BYTES = 768 * 1024 * 1024;
+// HLS 缓冲：MSE 预算只占 JS 堆的一小部分；bufferFullError 是正常满缓冲，勿 reload。
+const HLS_MSE_BUDGET_KEY = "mse_budget_learned_v2";
+const HLS_MSE_BUDGET_FLOOR_BYTES = 12 * 1024 * 1024;
+const HLS_MSE_HEAP_FRACTION = 0.15;
+const HLS_MSE_RAM_PER_GB_DESKTOP = 32 * 1024 * 1024;
+const HLS_MSE_RAM_PER_GB_MOBILE = 24 * 1024 * 1024;
+const HLS_MSE_BUDGET_CAP_DESKTOP = 192 * 1024 * 1024;
+const HLS_MSE_BUDGET_CAP_MOBILE = 64 * 1024 * 1024;
+const HLS_DEFAULT_BACK_BUFFER_SEC = 25;
+
+function _collectPlaybackEnvironment(v){
+  const mobile = _playbackIsMobile();
+  let deviceMemoryGb = 0;
+  try{ deviceMemoryGb = Number(navigator.deviceMemory) || 0; }catch(_){}
+  let jsHeapLimit = 0, jsHeapUsed = 0;
+  try{
+    const pm = performance.memory;
+    if (pm){
+      jsHeapLimit = Number(pm.jsHeapSizeLimit) || 0;
+      jsHeapUsed = Number(pm.usedJSHeapSize) || 0;
+    }
+  }catch(_){}
+  const vw = Number(v?.videoWidth || v?.clientWidth || window.innerWidth) || 1920;
+  const vh = Number(v?.videoHeight || v?.clientHeight || window.innerHeight) || 1080;
+  const screenPixels = Math.max(1, Math.floor(vw * vh));
+  return { is_mobile: mobile, device_memory_gb: deviceMemoryGb, js_heap_limit_bytes: jsHeapLimit,
+    js_heap_used_bytes: jsHeapUsed, screen_pixels: screenPixels };
+}
+
+function _readLearnedMseBudget(){
+  try{
+    const raw = sessionStorage.getItem(HLS_MSE_BUDGET_KEY);
+    if (!raw) return 0;
+    const j = JSON.parse(raw);
+    const b = Number(j?.bytes || 0);
+    return Number.isFinite(b) && b >= HLS_MSE_BUDGET_FLOOR_BYTES ? b : 0;
+  }catch(_){ return 0; }
+}
+
+function _writeLearnedMseBudget(bytes){
+  try{
+    sessionStorage.setItem(HLS_MSE_BUDGET_KEY, JSON.stringify({
+      bytes: Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, Math.floor(bytes)),
+      ts: Date.now(),
+    }));
+  }catch(_){}
+}
+
+function _computeMseBudget(env){
+  const learned = _readLearnedMseBudget();
+  const mobile = !!env?.is_mobile;
+  const devGb = Number(env?.device_memory_gb) || (mobile ? 4 : 8);
+  const heapLimit = Number(env?.js_heap_limit_bytes) || 0;
+  const heapUsed = Number(env?.js_heap_used_bytes) || 0;
+  const pixels = Number(env?.screen_pixels) || (1920 * 1080);
+
+  const decodeBytes = Math.floor(pixels * 1.5 * 12);
+  const perGb = mobile ? HLS_MSE_RAM_PER_GB_MOBILE : HLS_MSE_RAM_PER_GB_DESKTOP;
+  const ramBudget = Math.floor(devGb * perGb);
+
+  let raw = ramBudget;
+  if (heapLimit > 0){
+    const heapAvail = Math.max(0, heapLimit - heapUsed - Math.floor(heapLimit * 0.25));
+    // SourceBuffer 配额远小于 JS 堆总量，只取可用堆的一小部分
+    raw = Math.min(Math.floor(heapAvail * HLS_MSE_HEAP_FRACTION), ramBudget);
+  }
+  raw = Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, raw - decodeBytes);
+  const cap = mobile ? HLS_MSE_BUDGET_CAP_MOBILE : HLS_MSE_BUDGET_CAP_DESKTOP;
+  let budget = Math.min(raw, cap);
+  if (learned > 0) budget = Math.min(budget, learned);
+  return Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, budget);
+}
+
+function _hlsJsConfigFromBudget(mseBudgetBytes, bps, isMobile){
+  const budget = Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, Number(mseBudgetBytes) || HLS_MSE_BUDGET_FLOOR_BYTES);
+  const segHeadroom = Math.floor(32 * 1024 * 1024 * 0.35);
+  const maxBufferSize = Math.max(8 * 1024 * 1024, budget - segHeadroom);
+  let maxBufferLength = 600;
+  const rate = Number(bps) || 0;
+  if (rate > 0){
+    maxBufferLength = Math.min(600, Math.max(15, Math.floor((maxBufferSize * 8 * 0.92) / rate)));
+  }
+  let backBufferLength = Math.min(120, Math.max(8, Math.floor(maxBufferLength * 0.22)));
+  if (isMobile) backBufferLength = Math.min(backBufferLength, 20);
+  return {
+    maxBufferLength,
+    maxMaxBufferLength: maxBufferLength,
+    maxBufferSize,
+    backBufferLength,
+    startFragPrefetch: maxBufferSize >= 32 * 1024 * 1024,
+    maxBufferHole: 0.5,
+    highBufferWatchdogPeriod: 2,
+    nudgeMaxRetries: 5,
+    mseBudgetBytes: budget,
+  };
+}
+
+function _installHlsBufferGuard(hls, v, seq, hlsInfo){
+  if (!hls || v._hlsBufferGuard) return;
+  v._hlsBufferGuard = true;
+  let shrinkCount = 0;
+  let lastShrinkAt = 0;
+  const bps = Number(hlsInfo?.estimated_bitrate_bps || 0);
+
+  const applyBudget = (nextBudget, reason)=>{
+    const cfg = _hlsJsConfigFromBudget(nextBudget, bps, _playbackIsMobile());
+    hls.config.maxBufferSize = cfg.maxBufferSize;
+    hls.config.maxBufferLength = cfg.maxBufferLength;
+    hls.config.maxMaxBufferLength = cfg.maxMaxBufferLength;
+    hls.config.backBufferLength = cfg.backBufferLength;
+    hls.config.startFragPrefetch = cfg.startFragPrefetch;
+    _writeLearnedMseBudget(nextBudget);
+    console.warn("[hls] MSE budget adjust:", reason, cfg);
+  };
+
+  hls.on(window.Hls.Events.ERROR, (_evt, data)=>{
+    if (v._hlsSeq !== seq || !data) return;
+    const d = String(data.details || "");
+    // bufferFullError = 已达到 maxBufferSize，hls.js 会自行停拉，不是 OOM，绝不能 reload
+    if (d === "bufferFullError"){
+      hls.config.startFragPrefetch = false;
+      return;
+    }
+    // 只有 append 失败（QuotaExceeded）才收缩预算
+    if (d !== "bufferAppendError") return;
+    const now = Date.now();
+    if (shrinkCount >= 4 || (now - lastShrinkAt) < 3000) return;
+    shrinkCount += 1;
+    lastShrinkAt = now;
+    const cur = Number(hls.config?.maxBufferSize) || HLS_MSE_BUDGET_FLOOR_BYTES;
+    applyBudget(Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, Math.floor(cur * 0.75)), d);
+    if (!data.fatal && data.type === window.Hls.ErrorTypes.MEDIA_ERROR){
+      try{ hls.recoverMediaError(); }catch(_){}
+    }
+  });
+}
 
 function _videoIdFromMp4Src(src){
   // /media/video/123?v=xxx → 123
@@ -2208,22 +2347,101 @@ function pinHlsDuration(hls, v, expectedDuration){
   }catch(_){}
   return ok;
 }
-async function _shouldUseHLSForSrc(src){
+function _hlsInfoFromJson(j){
+  return {
+    use_hls: true,
+    duration: Number(j.duration || 0),
+    source_size: Number(j.source_size || 0),
+    estimated_bitrate_bps: Number(j.estimated_bitrate_bps || 0),
+    copy_risky: !!j.copy_risky,
+    copy_blocked: !!j.copy_blocked,
+    direct_play_ok: !!j.direct_play_ok,
+    ts: Date.now(),
+  };
+}
+function _cachePlaybackMeta(vid, meta){
+  if (!vid || !meta) return;
+  hlsInfoCache.set(String(vid), {
+    use_hls: true,
+    duration: Number(meta.duration || 0),
+    source_size: Number(meta.source_size || 0),
+    estimated_bitrate_bps: Number(meta.estimated_bitrate_bps || 0),
+    copy_risky: !!meta.copy_risky,
+    copy_blocked: !!meta.copy_blocked,
+    direct_play_ok: !!meta.direct_play_ok,
+    ts: Date.now(),
+  });
+}
+function _collectSupportedCodecs(v){
+  const el = v || document.createElement("video");
+  const can = (t)=>{ try{ return el.canPlayType(t) !== ""; }catch(_){ return false; } };
+  return {
+    h264: can('video/mp4; codecs="avc1.42E01E"'),
+    hevc: can('video/mp4; codecs="hvc1.1.6.L150.B0"'),
+    aac: can('audio/mp4; codecs="mp4a.40.2"'),
+  };
+}
+function _playbackIsMobile(){
+  return /Android|webOS|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+}
+async function _negotiatePlayback(vid, v, position){
+  if (!vid) return null;
+  const env = _collectPlaybackEnvironment(v);
+  const mseBudget = _computeMseBudget(env);
+  try{
+    const r = await fetch("/api/playback/negotiate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        video_id: String(vid),
+        is_mobile: env.is_mobile,
+        supports_mse: !!(window.MediaSource || window.WebKitMediaSource),
+        browser: (navigator.userAgent || "").slice(0, 120),
+        supported_codecs: _collectSupportedCodecs(v),
+        position: Number(position) || 0,
+        device_memory_gb: env.device_memory_gb,
+        js_heap_limit_bytes: env.js_heap_limit_bytes,
+        js_heap_used_bytes: env.js_heap_used_bytes,
+        screen_pixels: env.screen_pixels,
+        mse_budget_bytes: mseBudget,
+      }),
+      cache: "no-store",
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  }catch(_){
+    return null;
+  }
+}
+function _preferNativeMp4ForInfo(info){
+  // 仅作 HLS 致命失败后的兜底；正常路径一律优先 HLS。
+  return !!info?.direct_play_ok && !info?.copy_blocked;
+}
+function _hlsJsConfigForInfo(info){
+  const bps = Number(info?.estimated_bitrate_bps || 0);
+  const env = _collectPlaybackEnvironment(null);
+  const budget = _computeMseBudget(env);
+  return _hlsJsConfigFromBudget(budget, bps, env.is_mobile);
+}
+async function _ensureHlsInfoForSrc(src){
   const vid = _videoIdFromMp4Src(src);
-  if (!vid) return false;
+  if (!vid) return null;
   const key = String(vid);
   const cached = hlsInfoCache.get(key);
-  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return true;
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached;
   try{
     const r = await fetch(`/media/hls/${encodeURIComponent(vid)}/info`, { cache:"no-store" });
-    if (!r.ok) return true; // 探测失败时仍走 HLS，让后端错误显性暴露
-    const j = await r.json();
-    const info = { use_hls: true, duration: Number(j.duration || 0), ts: Date.now() };
+    if (!r.ok) return cached || null;
+    const info = _hlsInfoFromJson(await r.json());
     hlsInfoCache.set(key, info);
-    return true;
+    return info;
   }catch(_){
-    return true;
+    return cached || null;
   }
+}
+async function _shouldUseHLSForSrc(src){
+  const info = await _ensureHlsInfoForSrc(src);
+  return !!info || !!_videoIdFromMp4Src(src);
 }
 
 function _hlsSupported(){
@@ -2244,9 +2462,81 @@ function teardownMSE(v){
   }
   v._hlsSrc = null;
   v._hlsSeq = 0;
+  v._hlsBufferGuard = false;
 }
 
 /* 原生 src 路径（兜底）：可以是原 MP4，也可以是 HLS playlist（Safari 原生支持） */
+function _configureDirectPlayElement(v){
+  if (!v) return;
+  try{
+    v.preload = "auto";
+    v.playsInline = true;
+    v.setAttribute("playsinline", "");
+    v.setAttribute("webkit-playsinline", "true");
+    v.disableRemotePlayback = true;
+  }catch(_){}
+}
+async function prewarmMediaConnection(url){
+  const bare = _stripQuery(url || "");
+  if (!bare) return;
+  // 优先 HEAD 预热连接；若服务端未开 HEAD（405）则只用 Range GET
+  let headOk = false;
+  try{
+    const hr = await fetch(bare, { method: "HEAD", cache: "no-store", credentials: "same-origin" });
+    headOk = hr.ok;
+  }catch(_){}
+  if (headOk) return;
+  try{
+    await fetch(bare, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  }catch(_){}
+}
+function _installDirectPlayStallNudge(v){
+  if (!v || v._directPlayStallNudge) return;
+  v._directPlayStallNudge = true;
+  v.addEventListener("stalled", ()=>{
+    if (v.paused || (v.readyState || 0) >= 3) return;
+    try{
+      const t = Number(v.currentTime) || 0;
+      v.currentTime = t + 0.01;
+    }catch(_){}
+  });
+}
+async function _ensurePlaybackWakeLock(){
+  try{
+    if ("wakeLock" in navigator && !keepAlive.wakeLock){
+      keepAlive.wakeLock = await navigator.wakeLock.request("screen");
+      keepAlive.wakeLock.addEventListener("release", ()=>{ keepAlive.wakeLock = null; });
+    }
+  }catch(_){ keepAlive.wakeLock = null; }
+}
+async function _attachDirectPlayVideo(v, src, resumeAt){
+  _configureDirectPlayElement(v);
+  const curAttr = v.getAttribute("src") || "";
+  const needReload = curAttr !== src;
+  if (needReload){
+    try{ v.pause(); }catch(_){}
+    v.removeAttribute("src");
+    try{ v.load(); }catch(_){}
+  }
+  await prewarmMediaConnection(src);
+  if (needReload){
+    v.src = src;
+    try{ v.load(); }catch(_){}
+  }
+  _installDirectPlayStallNudge(v);
+  await _ensurePlaybackWakeLock();
+  setCurrentTimeWhenReady(v, resumeAt || 0);
+  if (v.readyState >= 1) {
+    setTimeout(fixPortraitVideoInFullscreen, 50);
+  } else {
+    v.addEventListener("loadedmetadata", ()=> setTimeout(fixPortraitVideoInFullscreen, 50), { once:true });
+  }
+}
 function _attachVideoSrcNative(v, src, resumeAt){
   const curAttr = v.getAttribute("src") || "";
   const needReload = curAttr !== src;
@@ -2281,17 +2571,45 @@ async function attachVideoSrc(src, resumeAt){
   const seq = ++hlsAttachSeq;
   teardownMSE(v);
 
-  const playlistUrl = _hlsPlaylistUrl(src);
+  const prewarmP = (()=>{
+    const pl = _hlsPlaylistUrl(src);
+    if (pl) return fetch(pl, { cache:"no-store", credentials:"same-origin" }).catch(()=>{});
+    return prewarmMediaConnection(src);
+  })();
+  const decision = vidForInfo ? await _negotiatePlayback(vidForInfo, v, resumeAt||0) : null;
+  await prewarmP.catch(()=>{});
+
+  if (decision?.meta){
+    _cachePlaybackMeta(vidForInfo, decision.meta);
+    if (decision.meta.duration > 0) v._expectedDuration = decision.meta.duration;
+  }
+
+  const playlistUrl = decision?.url || _hlsPlaylistUrl(src);
+  let hlsInfo = _hlsInfoForSrc(src);
+  if (!hlsInfo){
+    hlsInfo = await _ensureHlsInfoForSrc(src);
+    if (hlsInfo?.duration > 0) v._expectedDuration = hlsInfo.duration;
+  }
+
+  const useDirectPlay = decision?.method === "direct_play";
+
+  if (useDirectPlay){
+    console.info("[playback] direct play:", src, decision?.method || "fallback");
+    v.dataset.playbackEngine = "native";
+    await _attachDirectPlayVideo(v, src, resumeAt);
+    return;
+  }
 
   // 优先用 HLS.js（Chrome/Firefox/Edge/Android WebView）
-  if (playlistUrl && _hlsSupported() && await _shouldUseHLSForSrc(src)){
+  const useHlsJs = decision?.method === "hls_js"
+    || (!decision && playlistUrl && _hlsSupported() && (hlsInfo || vidForInfo));
+  if (useHlsJs){
     v._expectedDuration = _serverDurationForSrc(src) || v._expectedDuration || 0;
+    const bufCfg = decision?.config ? { ...decision.config } : _hlsJsConfigForInfo(hlsInfo);
+    console.info("[hls] MSE budget:", bufCfg.mseBudgetBytes, "maxBufferSize:", bufCfg.maxBufferSize, "maxBufferLength:", bufCfg.maxBufferLength);
     const hls = new window.Hls({
-      // 激进缓冲：尽量把短/中等长度视频整条 append 进 MSE，让进度条灰色缓存段明显前推。
-      maxBufferLength: HLS_TARGET_BUFFER_SEC,
-      maxMaxBufferLength: HLS_TARGET_BUFFER_SEC,
-      maxBufferSize: HLS_MAX_BUFFER_BYTES,
-      backBufferLength: HLS_TARGET_BUFFER_SEC,
+      // 短视频尽量多缓冲；超大/高码率文件按 /info 动态收紧，避免 MSE 撑爆内存。
+      ...bufCfg,
       autoStartLoad: true,
       // 段加载并发 + 重试
       fragLoadPolicy: {
@@ -2320,6 +2638,7 @@ async function attachVideoSrc(src, resumeAt){
     v._hlsSrc = src;
     v._hlsSeq = seq;
     v.dataset.playbackEngine = "hls";
+    _installHlsBufferGuard(hls, v, seq, hlsInfo);
     let fatalNetworkRetries = 0;
     let fatalMediaRetries = 0;
 
@@ -2403,7 +2722,9 @@ async function attachVideoSrc(src, resumeAt){
   }
 
   // 原生 HLS（Safari / iOS）
-  if (playlistUrl && _nativeHlsSupported(v)){
+  const useNativeHls = decision?.method === "native_hls"
+    || (!decision && playlistUrl && _nativeHlsSupported(v));
+  if (useNativeHls){
     v._hlsSrc = src;
     v.dataset.playbackEngine = "native-hls";
     _attachVideoSrcNative(v, playlistUrl, resumeAt);
@@ -2878,11 +3199,7 @@ function flushProgressOnLeave(){
     const { pos, dur } = getLogicalPosDur();
     if (!Number.isFinite(pos) || !Number.isFinite(dur) || dur < 1) return;
 
-    // 完成 → 清
-    if (pos / dur >= PROGRESS_COMPLETE_RATIO){
-      _beaconJson("/api/progress/clear", { ids: [String(curId)] });
-      return;
-    }
+    if (maybeMarkPlaybackComplete(curId, pos, dur)) return;
     // 正常进度 → 保存
     if (pos >= PROGRESS_MIN_POSITION_SEC && pos / dur >= PROGRESS_START_RATIO){
       _beaconJson("/api/progress", { id: String(curId), position: pos, duration: dur });
@@ -2941,8 +3258,11 @@ function advanceToNextOnce(){
   if (lastAdvanceId === curId) return;
   lastAdvanceId = curId;
   if (shouldPersistPlaybackState()){
-    markWatched(curId);
-    apiClearProgress(curId);
+    const { pos, dur } = getLogicalPosDur();
+    if (!maybeMarkPlaybackComplete(curId, pos, dur)){
+      markWatched(curId);
+      apiClearProgress(curId);
+    }
   }
   nextInPlaylist();
 }
@@ -3154,20 +3474,15 @@ function setCurrentTimeWhenReady(el, t){
 
 /* —— 预加载提升 —— */
 function injectVideoPreload(src){
-  // 走 HLS 时不要预加载原 MP4：那只会重复拉一份大文件浪费带宽
-  // 只有走原生 MP4 兜底的浏览器才需要 preload
+  // HLS 优先：预热 playlist，避免大 MP4 HEAD 抢带宽
   try {
-    if (_hlsPlaylistUrl(src)) {
-      const v = (typeof media !== "undefined" && media.v) || (typeof $ === "function" && $("fsVideo"));
-      if (_hlsSupported() || _nativeHlsSupported(v)) return;
+    const pl = _hlsPlaylistUrl(src);
+    if (pl) {
+      fetch(pl, { cache: "no-store", credentials: "same-origin" }).catch(()=>{});
+      return;
     }
   } catch(_){}
-  try{
-    const l = document.createElement("link");
-    l.rel = "preload"; l.as = "video"; l.href = src; l.fetchPriority = "high";
-    document.head.appendChild(l);
-    setTimeout(()=>{ try{ l.remove(); }catch(_){ } }, 8000);
-  }catch(_){}
+  prewarmMediaConnection(src).catch(()=>{});
 }
 
 /* ===== 播放入口 ===== */
@@ -3361,7 +3676,17 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
     }catch(_){}
 
     const bindPos = (el, isVideo)=>{
-      el.addEventListener("timeupdate", ()=>{ updatePositionState(); renderCustomControls(false); });
+      el.addEventListener("timeupdate", ()=>{
+        updatePositionState();
+        renderCustomControls(false);
+        if (shouldPersistPlaybackState()){
+          const curId = player?.ids?.[player.index];
+          if (curId){
+            const { pos, dur } = getLogicalPosDur();
+            maybeMarkPlaybackComplete(curId, pos, dur);
+          }
+        }
+      });
       el.addEventListener("loadedmetadata", ()=>{ updatePositionState(); renderCustomControls(true); });
       el.addEventListener("durationchange", ()=>{ updatePositionState(); renderCustomControls(true); });
       el.addEventListener("progress", ()=> renderCustomControls(false));
@@ -3370,6 +3695,7 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
       el.addEventListener("playing", ()=>{
         if (isVideo) clearUserPaused();
         updatePositionState(); startPosTicker(); renderCustomControls(true);
+        if (isVideo && playbackMode==="video" && !_userPaused) _ensurePlaybackWakeLock();
         if (!isVideo && playbackMode==="audio" && !_userPaused) startBgKeepAlive();
       });
       el.addEventListener("pause",   ()=>{
@@ -3626,8 +3952,8 @@ async function exitPlayer(){
     const curId = player?.ids?.[player.index];
     const { pos, dur } = getLogicalPosDur();
     if (curId && Number.isFinite(pos) && Number.isFinite(dur) && dur >= 1){
-      if (pos / dur >= PROGRESS_COMPLETE_RATIO){
-        apiClearProgress(curId);
+      if (maybeMarkPlaybackComplete(curId, pos, dur)){
+        /* done */
       } else if (pos >= PROGRESS_MIN_POSITION_SEC && pos / dur >= PROGRESS_START_RATIO){
         apiSaveProgress(curId, pos, dur);
       } else {

@@ -1,6 +1,6 @@
 # app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart + keepalive)
 import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil, json
-import time, logging  # ★ 新增：用于 /api/keepalive 时间与日志过滤
+import time, logging, asyncio  # ★ 新增：用于 /api/keepalive 时间与日志过滤
 import secrets  # ★ 新增
 from urllib.parse import quote
 from pathlib import Path
@@ -23,17 +23,27 @@ from pydantic import BaseModel
 
 
 class FastFileResponse(FileResponse):
-  """与 FileResponse 一致，但 chunk 调大到 8MB，提升大文件 + HTTPS 吞吐。
-
-  Starlette 默认 chunk_size 是 64KB。对 2GB 级别的视频，每次 chunk 都要走
-  一遍 asyncio + SSL 加密 + ASGI send 的热路径，HTTPS 下单连接吞吐很容易
-  被打到几 MB/s。改成 8MB 后同样的数据量循环次数 / 加密调用次数减 128 倍，
-  对 2.5G LAN 这种高带宽场景效果非常明显。
-
-  现代 uvicorn 对非 Range 响应会自动走 `http.response.pathsend`（sendfile
-  零拷贝），跟这里 chunk_size 无关；这里主要优化的是 Range（206）路径。
-  """
+  """大文件/HLS 段：较大 chunk，减少 HTTPS 下循环与加密开销。"""
   chunk_size = 8 * 1024 * 1024
+
+
+class DirectPlayFileResponse(FileResponse):
+  """Direct Play 原生 MP4：小 chunk 配合浏览器 Range 流控，避免一次塞满触发 Chrome 限速。
+
+  浏览器直放几乎总是走 206 Range；128KB 量级的高频小块比 4–8MB 大块更容易
+  维持 TCP 接收窗口稳定，缓冲条会刷得更顺。可通过 DIRECT_PLAY_CHUNK_BYTES 调整。
+  """
+  chunk_size = int(os.getenv("DIRECT_PLAY_CHUNK_BYTES", str(128 * 1024)))
+
+  async def __call__(self, scope, receive, send):
+    if scope["type"] != "http":
+      await super().__call__(scope, receive, send)
+      return
+    async def paced_send(message):
+      await send(message)
+      if message.get("type") == "http.response.body" and message.get("more_body", False):
+        await asyncio.sleep(0)
+    await super().__call__(scope, receive, paced_send)
 
 from .we_scan import (
     load_we_config, extract_folders_list, build_folder_tree, scan_workshop_items,
@@ -88,7 +98,9 @@ HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"
 HLS_ALLOW_COPY = os.getenv("HLS_ALLOW_COPY", "1").lower() in {"1", "true", "yes", "on"}
 HLS_COPY_MAX_SOURCE_BYTES = int(os.getenv("HLS_COPY_MAX_SOURCE_BYTES", str(2 * 1024 * 1024 * 1024)))
 HLS_COPY_MAX_BITRATE_BPS = int(os.getenv("HLS_COPY_MAX_BITRATE_BPS", str(30 * 1000 * 1000)))
+HLS_HUGE_FILE_BYTES = int(os.getenv("HLS_HUGE_FILE_BYTES", str(8 * 1024 * 1024 * 1024)))
 HLS_MAX_REASONABLE_SEGMENT_BYTES = int(os.getenv("HLS_MAX_REASONABLE_SEGMENT_BYTES", str(128 * 1024 * 1024)))
+HLS_ENCODE_AHEAD_SEC = int(os.getenv("HLS_ENCODE_AHEAD_SEC", "60"))
 
 # === 音频缓存定时清理（避免 audio_cache 无限膨胀） ===
 # - AUDIO_CACHE_MAX_AGE_DAYS：超过多少天的缓存直接删除
@@ -184,6 +196,19 @@ class CreateFolderRequest(BaseModel):  # ★ 新增
 class MoveRequest(BaseModel):  # ★ 新增
     ids: List[str] = []
     dest_path: str = "/"
+
+class PlaybackNegotiateRequest(BaseModel):
+    video_id: str
+    is_mobile: bool = False
+    supports_mse: bool = True
+    browser: str = ""
+    supported_codecs: dict = {}
+    position: float = 0
+    device_memory_gb: float = 0
+    js_heap_limit_bytes: int = 0
+    js_heap_used_bytes: int = 0
+    screen_pixels: int = 0
+    mse_budget_bytes: int = 0
 
 # ========= 预览图缓存 =========
 PREVIEW_CACHE_DIR = os.getenv("PREVIEW_CACHE_DIR", os.path.join(DATA_DIR, "preview_cache"))
@@ -780,6 +805,14 @@ def api_set_progress(payload: ProgressSet):
     return {"ok": False, "error": "missing-id"}
   pos = max(0.0, float(payload.position or 0))
   dur = max(0.0, float(payload.duration or 0))
+  try:
+    _hls_set_playhead(vid, pos)
+    src_path = _hls_source_for_vid(vid)
+    out_dir = _hls_dir_for(vid)
+    key = _hls_job_key(vid, src_path)
+    _hls_maybe_throttle_job(vid, out_dir, _hls_job_for(key))
+  except Exception:
+    pass
 
   # 完成 → 清进度 + 标记 watched
   if dur > 0 and pos / dur >= PROGRESS_COMPLETE_RATIO:
@@ -829,6 +862,18 @@ def api_clear_progress(payload: ProgressClear):
     conn.commit()
     conn.close()
   return {"ok": True, "count": len(ids)}
+
+@app.post("/api/playback/negotiate")
+def api_playback_negotiate(payload: PlaybackNegotiateRequest):
+  """根据浏览器能力与源文件元数据，选择 direct_play / native_hls / hls_js。"""
+  vid = str(payload.video_id or "").strip()
+  if not vid:
+    raise HTTPException(400, "missing video_id")
+  path = _hls_source_for_vid(vid)
+  pos = max(0.0, float(payload.position or 0))
+  if pos > 0:
+    _hls_set_playhead(vid, pos)
+  return _negotiate_playback(path, vid, payload)
 
 # ========== 扫描 / 列表 ==========
 @app.get("/api/scan")
@@ -1513,13 +1558,15 @@ def _send_media_file(path: str, media_type: str, etag: str, last_mod: str):
     - 与 uvicorn 配合的 zero-copy `http.response.pathsend`（即 sendfile）
 
   我们额外：
-    - chunk 调大到 1MB（FastFileResponse）
+    - Direct Play 用 128KB 小 chunk（DirectPlayFileResponse），迎合浏览器 Range 流控
+    - HLS 段仍用 FastFileResponse 大 chunk
     - 触发 OS page cache 预热，消除浏览器 Range 拉取空窗期的磁盘 seek 延迟
   """
   if not os.path.isfile(path):
     raise HTTPException(404)
   _prewarm_into_page_cache(path)
-  return FastFileResponse(path, media_type=media_type, headers={
+  response_cls = DirectPlayFileResponse if media_type.startswith("video/") else FastFileResponse
+  return response_cls(path, media_type=media_type, headers={
     "Accept-Ranges": "bytes",
     "ETag": etag,
     "Last-Modified": last_mod,
@@ -1898,6 +1945,8 @@ _hls_disabled_modes_guard = threading.Lock()
 _hls_encoder_probe_cache: dict[str, bool] = {}
 _hls_copy_blocked_sources: dict[str, str] = {}
 _hls_copy_blocked_guard = threading.Lock()
+_hls_playheads: dict[str, tuple[float, float]] = {}
+_hls_playheads_guard = threading.Lock()
 
 def _hls_lock(vid_id: str) -> threading.Lock:
   with _hls_locks_guard:
@@ -2293,6 +2342,9 @@ def _hls_attempt_chain_for_source(src_path: str) -> list[str]:
     attempts = ["copyfix"] + [x for x in attempts if x != "copy"]
   if copy_blocked:
     attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
+  if _hls_copy_risky_for_browser(src_path):
+    # 超大/高码率 + 长 GOP：copy 首段可能 GB 级，hls.js 解析即 OOM → 直接走带关键帧的转码
+    attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
   if ("copy" in attempts or "copyfix" in attempts) and not _hls_can_copy_for_browser(src_path):
     # fallback=none 明确表示只想 copy，就尊重配置；其他模式直接跳过注定会被浏览器解析失败的 copy。
     if HLS_TRANSCODE_FALLBACK != "none":
@@ -2530,6 +2582,145 @@ def _hls_delete_last_transcoding_file(out_dir: str):
   except Exception:
     pass
 
+def _hls_set_playhead(vid_id: str, position: float):
+  with _hls_playheads_guard:
+    _hls_playheads[str(vid_id)] = (max(0.0, float(position)), time.time())
+
+def _hls_get_playhead(vid_id: str) -> float:
+  with _hls_playheads_guard:
+    return float((_hls_playheads.get(str(vid_id)) or (0.0, 0.0))[0])
+
+def _hls_encoded_position_sec(out_dir: str, job: dict | None) -> float:
+  seg_len = max(1, int(HLS_SEGMENT_SEC))
+  indexes = _hls_existing_segment_indexes(out_dir)
+  if indexes:
+    return (max(indexes) + 1) * seg_len
+  if job:
+    return max(0, int(job.get("start_index") or 0)) * seg_len
+  return 0.0
+
+def _hls_maybe_throttle_job(vid_id: str, out_dir: str, job: dict | None):
+  """编码进度超前播放头过多时终止 ffmpeg，避免临时目录被撑爆。"""
+  if not job or job.get("done") or job.get("killed"):
+    return
+  proc = job.get("proc")
+  try:
+    running = proc is not None and proc.poll() is None
+  except Exception:
+    running = False
+  if not running:
+    return
+  playhead = _hls_get_playhead(vid_id)
+  encoded = _hls_encoded_position_sec(out_dir, job)
+  ahead = encoded - playhead
+  if ahead <= HLS_ENCODE_AHEAD_SEC:
+    return
+  logging.info(
+    "[hls] throttle encode-ahead vid=%s playhead=%.1fs encoded=%.1fs ahead=%.1fs limit=%ss",
+    vid_id, playhead, encoded, ahead, HLS_ENCODE_AHEAD_SEC,
+  )
+  _hls_kill_job(job)
+
+def _media_container_for(src_path: str) -> str:
+  ext = os.path.splitext(src_path)[1].lower().lstrip(".")
+  return ext or "unknown"
+
+def _browser_supports_source_codecs(info: dict, supported: dict | None) -> bool:
+  sc = supported or {}
+  video = (info.get("video") or "").lower()
+  audio = (info.get("audio") or "").lower()
+  if video == "h264" and not sc.get("h264"):
+    return False
+  if audio in {"aac", "mp4a"} and not sc.get("aac"):
+    return False
+  return True
+
+def _hls_js_config_for_client(src_path: str, payload: PlaybackNegotiateRequest) -> dict:
+  """按客户端上报的 MSE 内存预算 + 码率，尽量填满 Chrome 缓冲而不 OOM。"""
+  bps = int(_hls_estimated_bitrate_bps(src_path) or 0)
+  is_mobile = bool(payload.is_mobile)
+  budget = int(payload.mse_budget_bytes or 0)
+  if budget <= 0:
+    dev_gb = float(payload.device_memory_gb or 0) or (4.0 if is_mobile else 8.0)
+    heap_lim = int(payload.js_heap_limit_bytes or 0)
+    pixels = int(payload.screen_pixels or 0) or (1280 * 720)
+    decode_bytes = int(pixels * 1.5 * 12)
+    per_gb = 24 * 1024 * 1024 if is_mobile else 32 * 1024 * 1024
+    ram_budget = int(dev_gb * per_gb)
+    if heap_lim > 0:
+      heap_used = max(0, int(payload.js_heap_used_bytes or 0))
+      heap_avail = max(0, heap_lim - heap_used - int(heap_lim * 0.25))
+      budget = min(int(heap_avail * 0.15), ram_budget)
+    else:
+      budget = ram_budget
+    budget = max(12 * 1024 * 1024, budget - decode_bytes)
+    cap = 64 * 1024 * 1024 if is_mobile else 192 * 1024 * 1024
+    budget = min(budget, cap)
+
+  seg_headroom = int(32 * 1024 * 1024 * 0.35)
+  max_buffer_size = max(8 * 1024 * 1024, budget - seg_headroom)
+
+  max_buffer_length = 600
+  if bps > 0:
+    max_buffer_length = min(600, max(15, int((max_buffer_size * 8 * 0.92) / bps)))
+
+  back_buffer_length = min(120, max(8, int(max_buffer_length * 0.22)))
+  if is_mobile:
+    back_buffer_length = min(back_buffer_length, 20)
+
+  return {
+    "maxBufferLength": max_buffer_length,
+    "maxMaxBufferLength": max_buffer_length,
+    "maxBufferSize": max_buffer_size,
+    "backBufferLength": back_buffer_length,
+    "maxBufferHole": 0.5,
+    "highBufferWatchdogPeriod": 2,
+    "nudgeMaxRetries": 5,
+    "startFragPrefetch": max_buffer_size >= 32 * 1024 * 1024,
+    "mseBudgetBytes": budget,
+  }
+
+def _negotiate_playback(src_path: str, vid_id: str, payload: PlaybackNegotiateRequest) -> dict:
+  duration = _hls_duration_for(src_path)
+  source_size = _hls_source_size(src_path)
+  bitrate = int(_hls_estimated_bitrate_bps(src_path) or 0)
+  direct_ok = _hls_can_copy_for_browser(src_path)
+  copy_risky = _hls_copy_risky_for_browser(src_path)
+  copy_blocked = _hls_copy_blocked_for_source(src_path)
+  info = _probe_hls_codecs(src_path)
+  container = _media_container_for(src_path)
+  playlist_url = f"/media/hls/{quote(vid_id, safe='')}/playlist.m3u8"
+  direct_url = f"/media/video/{quote(vid_id, safe='')}"
+  meta = {
+    "id": str(vid_id),
+    "duration": duration,
+    "source_size": source_size,
+    "estimated_bitrate_bps": bitrate,
+    "direct_play_ok": direct_ok,
+    "copy_risky": copy_risky,
+    "copy_blocked": copy_blocked,
+    "container": container,
+    "video_codec": info.get("video") or "",
+    "audio_codec": info.get("audio") or "",
+  }
+
+  # iOS/Safari：无 MSE，走原生 HLS（系统自己控内存）
+  if not payload.supports_mse:
+    return {
+      "method": "native_hls",
+      "url": playlist_url,
+      "meta": meta,
+    }
+
+  # 有 MSE 的浏览器：一律优先 HLS.js；大文件靠紧缓冲 + 跳过长 GOP copy 防 OOM
+  return {
+    "method": "hls_js",
+    "url": playlist_url,
+    "direct_url": direct_url,
+    "meta": meta,
+    "config": _hls_js_config_for_client(src_path, payload),
+  }
+
 def _hls_kill_job(job: dict | None):
   if not job:
     return
@@ -2695,6 +2886,7 @@ def _ensure_hls_job_for_segment(vid_id: str, src_path: str, idx: int, start_time
       # 这时不能因为 current_idx=None 就杀掉 job，否则首段永远等不到。
       anchor_idx = current_idx if current_idx is not None else start_idx
       if idx >= anchor_idx and (idx - anchor_idx) <= gap_limit:
+        _hls_maybe_throttle_job(vid_id, out_dir, job)
         return job
 
     if running:
@@ -2764,6 +2956,7 @@ def _wait_for_hls_segment(vid_id: str, src_path: str, idx: int, timeout_s: float
     if _hls_cache_matches(out_dir, src_path) and _hls_segment_ready_to_serve(out_dir, idx, job):
       return seg_path
     job = _hls_job_for(key)
+    _hls_maybe_throttle_job(vid_id, out_dir, job)
     if job and job.get("done") and job.get("error"):
       _hls_forget_job(key)
       job = _ensure_hls_job_for_segment(vid_id, src_path, idx) or _hls_job_for(key)
@@ -2866,6 +3059,7 @@ def hls_info(vid_id: str):
     "duration": duration,
     "source_size": _hls_source_size(path),
     "estimated_bitrate_bps": int(_hls_estimated_bitrate_bps(path) or 0),
+    "direct_play_ok": _hls_can_copy_for_browser(path),
     "copy_risky": _hls_copy_risky_for_browser(path),
     "copy_blocked": _hls_copy_blocked_for_source(path),
     "copy_block_reason": _hls_copy_block_reason(path),
@@ -2902,6 +3096,7 @@ def hls_debug(vid_id: str):
     "segment_count": len(indexes),
     "source_size": _hls_source_size(path),
     "estimated_bitrate_bps": int(_hls_estimated_bitrate_bps(path) or 0),
+    "direct_play_ok": _hls_can_copy_for_browser(path),
     "copy_risky": _hls_copy_risky_for_browser(path),
     "copy_blocked": _hls_copy_blocked_for_source(path),
     "copy_block_reason": _hls_copy_block_reason(path),
@@ -2942,7 +3137,7 @@ def hls_segment(vid_id: str, segment: str):
     "Cache-Control": "public, max-age=31536000, immutable",
   })
 
-@app.get("/media/video/{vid_id}")
+@app.api_route("/media/video/{vid_id}", methods=["GET", "HEAD"])
 def media_video(request: Request, vid_id: str):
   _, id_map, _ = _scan_state()
   v = id_map.get(vid_id)
