@@ -1,0 +1,33 @@
+# 通用 Compose — 配置请写挂载目录里的 runtime.env，不要在群晖 GUI 堆环境变量
+#
+#   cp runtime.env.example runtime.env
+#   docker compose build && docker compose up -d
+#
+# GPU 叠加：
+#   无 GPU：     docker compose up -d
+#   双 GPU：     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+
+x-wallpaper-volumes: &wallpaper-volumes
+  - /volume1/docker/wallpaper-webui:/app/app
+  - /volume1/steam/SteamLibrary/steamapps/common/wallpaper_engine:/data/wallpaper_engine
+  - /volume1/steam/SteamLibrary/steamapps/workshop/content/431960:/data/workshop/content/431960
+
+services:
+  wallpaper-webui:
+    image: wallpaper-webui:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WITH_INTEL_QSV: "1"
+    container_name: wallpaper-webui
+    restart: unless-stopped
+    ports:
+      - "8066:8066"
+    volumes: *wallpaper-volumes
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8066/api/diag', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s

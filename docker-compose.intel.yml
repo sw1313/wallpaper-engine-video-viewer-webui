@@ -1,0 +1,6 @@
+# 叠加：Intel QSV（docker compose -f docker-compose.yml -f docker-compose.intel.yml up -d）
+# GPU 相关环境变量请写在 runtime.env
+services:
+  wallpaper-webui:
+    devices:
+      - /dev/dri:/dev/dri

@@ -1,0 +1,5 @@
+# 叠加：NVIDIA NVENC（docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d）
+# GPU 相关环境变量请写在 runtime.env
+services:
+  wallpaper-webui:
+    gpus: all

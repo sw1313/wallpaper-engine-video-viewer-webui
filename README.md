@@ -16,7 +16,10 @@
 - **自定义播放器控件**：隐藏浏览器原生 controls，使用服务端探测时长绘制进度条，支持播放/暂停、上一曲/下一曲、音量、静音、画中画、全屏、倍速和移动端横竖屏切换。
 - **触屏友好 UI**：深色毛玻璃主题、路径按钮、自定义排序下拉、标题悬浮提示、半透明分级角标和移动端居中播放按钮。
 - **媒体修复**：支持 faststart 无损重封装、按需 repair/reencode 缓存，不直接覆盖 Steam Workshop 原始文件的转码缓存。
-- **资源管理**：支持标记已看/未看、移动项目到文件夹、新建/删除文件夹、删除本地项目/Workshop 项目。
+- **资源管理**：支持标记已看/未看、移动视频/文件夹、新建/删除文件夹、删除本地项目/Workshop 项目。
+- **拖拽到文件夹**：从缩略图或 Alt+浮动窗标题栏拖到文件夹 tile；文件夹按路径整体移入（写入 WE `config.json` 的 `folders` 树，不 flatten 视频）；拖到 `…` 表示移到上一层；**双击 Esc** 撤销上一次移动（10 分钟内有效）。
+- **浮动预览窗**：Alt+点击视频 tile 打开内嵌小窗；标题栏 `⋯` 等同右键菜单。
+- **搜索筛选**：空格分词且全部包含；`a:词` 仅上传者、`t:词` 仅标题、`=词` 全字/整词匹配（可组合，如 `a:=foo t:bar`）。
 - **移动端手势**：双指右滑返回；双指双击锁定/解锁触摸操作，适合壁纸 WebView 防误触。
 
 ## 移动端动态壁纸
@@ -32,6 +35,31 @@
 
 ```text
 http://你的NAS:8066/?wallpaper=1
+```
+
+## 示例配置与部署脚本
+
+仓库根目录提供可直接复制的示例文件（**不要**把含密钥的 `runtime.env` / `steam_config.json` 提交进 Git）：
+
+| 文件 | 说明 |
+| --- | --- |
+| [`runtime.env.example`](runtime.env.example) | **群晖/NAS 推荐**：复制为挂载目录下的 `runtime.env`，改完 `docker restart wallpaper-webui` 即可 |
+| [`docker.env.example`](docker.env.example) | `docker compose` 的 `env_file` 参考 |
+| [`steam_config.example.json`](steam_config.example.json) | Steam Web API Key 模板（复制为 `steam_config.json`） |
+| [`deploy-nas.sh`](deploy-nas.sh) | 群晖上一键构建镜像、rsync 代码、按 GPU 模式启动容器 |
+
+`runtime.env` 读取路径：容器内 `/app/app/runtime.env`（即宿主机挂载目录，例如 `/volume1/docker/wallpaper-webui/runtime.env`）。
+
+```bash
+# 群晖 SSH 或任务计划（在仓库目录执行）
+cp runtime.env.example runtime.env   # 首次
+GPU_MODE=both ./deploy-nas.sh        # cpu | nvidia | intel | both
+```
+
+Compose 叠加 GPU（可选）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 ```
 
 ## Docker 部署
@@ -185,11 +213,13 @@ HLS 致命失败时回退 `/media/video/{id}`：
 
 ## 主要接口
 
-- `GET /api/scan`：目录扫描、排序、搜索、分页。
+- `GET /api/scan`：目录扫描、排序、搜索、分页。搜索参数 `q` 支持 `a:`/`t:`/`=` 字段与全字匹配（见功能概览）。
 - `GET /api/folder_videos`：获取当前文件夹递归视频列表，用于文件夹播放/随机播放。
 - `GET /api/watched` / `POST /api/watched`：批量读取和写入已看状态。
 - `GET /api/progress` / `POST /api/progress` / `POST /api/progress/clear`：播放进度读写。
 - `POST /api/playback/negotiate`：播放能力协商，返回 HLS/Direct Play 策略与缓冲配置。
+- `POST /api/move`：移动视频 `ids` 和/或文件夹 `folder_paths` 到 `dest_path`（`/`=主页）；**只改 WE `config.json` 的 folders 结构，不移动磁盘文件**。
+- `POST /api/folder/create` / `POST /api/folder/delete`：新建/删除文件夹节点。
 - `POST /api/faststart/{id}`：就地无损 faststart 重封装。
 - `POST /api/repair/{id}?mode=auto|copy|reencode`：媒体修复或写入视频缓存。
 - `GET /media/hls/{id}/info`：HLS 源信息（时长、码率、copy risky 等）。
@@ -254,6 +284,7 @@ copy 可行时不会用 GPU。只有 fallback 到 `nvenc` 或 `qsv` 才会看到
 
 ## 注意事项
 
-- 删除、移动、文件夹修改会写 Wallpaper Engine 配置或删除本地文件，请确认卷挂载和权限。
+- **移动文件夹/视频**会写 Wallpaper Engine 的 `config.json`（`folders` 树）；不会移动 Workshop 磁盘上的视频文件。误拖后可双击 Esc 撤销（10 分钟内）。
+- 删除、faststart 修复等会触及本地或 Workshop 文件，请确认卷挂载和权限。
 - `faststart` 是就地覆盖原视频；`repair?mode=reencode` 会写入 `VIDEO_CACHE_DIR`，不会覆盖 Workshop 原文件。
 - 不建议同时让 Steam 正在下载/校验同一批 Workshop 文件时执行删除或修复操作。

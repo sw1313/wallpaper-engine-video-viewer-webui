@@ -24,6 +24,13 @@ config.json
 # Local environment and logs
 .env
 .env.*
+runtime.env
+docker.env
+steam_config.json
+!*.example
+!runtime.env.example
+!docker.env.example
+!steam_config.example.json
 *.log
 *.tmp
 *.bak

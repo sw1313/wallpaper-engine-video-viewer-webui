@@ -1,0 +1,12 @@
+# 叠加：NVIDIA + Intel 双 GPU
+# docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# 注意：NVIDIA_* 必须在「创建容器时」注入（compose/run -e），runtime.env 对 nvidia 挂载无效。
+services:
+  wallpaper-webui:
+    gpus: all
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
