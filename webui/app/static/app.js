@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-114-float-drop-live-rect-2026-06-11");
+console.log("app.js version fs-117-float-gpu-warm-2026-06-11");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -229,7 +229,7 @@ function _cancelFloatHlsSlotAcquire(){
 
 // 冷启动并发闸：同时只让少数浮窗触发后端 ffmpeg 冷启（NAS 磁盘 seek + GPU init 很重），
 // 其余按优先级（打开/聚焦顺序）排队；某窗解出首帧或失败即释放，下一个补位。
-const FLOAT_WARMUP_MAX = 2;
+const FLOAT_WARMUP_MAX = 4;
 let _floatWarmupActive = 0;
 const _floatWarmupWaiters = [];
 
@@ -266,6 +266,7 @@ function _releaseFloatWarmupSlot(video){
 }
 // 浮动预览不读写 /api/progress，避免多窗/全屏播放互相覆盖断点；HLS preview playhead 仍上报给后端。
 const FLOAT_PERSIST_PROGRESS = false;
+const FLOAT_SEEK_GRACE_MS = 22000;
 
 function _floatPanelActive(panel, video){
   return !!panel?._floatAlive && !!video && !video._floatClosed && document.body.contains(video);
@@ -310,18 +311,66 @@ function _floatPlaybackBudgetBytes(){
   return Math.max(FLOAT_MSE_BUDGET_FLOOR_BYTES, Math.floor(FLOAT_PLAYER_MSE_BYTES / Math.sqrt(n)));
 }
 
+function _floatInSeekGrace(v){
+  if (!v) return false;
+  if (v._floatSeekDragging) return true;
+  if (v._floatUserSeekPending) return true;
+  try { if (v.seeking) return true; } catch(_){}
+  return Number(v?._floatUserSeekUntil || 0) > Date.now();
+}
+
+function _floatClearUserSeekIfPlaying(v, prevT, ct){
+  if (!v?._floatUserSeekPending || v.seeking) return;
+  const target = Number(v._floatUserSeekTarget);
+  if (!Number.isFinite(target)) return;
+  const prev = Number(prevT) || 0;
+  if (Math.abs(prev - target) <= 0.6 && ct > target + 0.04 && ct > prev + 0.04){
+    v._floatUserSeekPending = false;
+    v._floatUserSeekTarget = NaN;
+  }
+}
+
+function _floatSeekResumeAt(v){
+  if (!v) return 0;
+  if ((v._floatUserSeekPending || _floatInSeekGrace(v)) && Number.isFinite(v._floatUserSeekTarget)){
+    return Math.max(0, Number(v._floatUserSeekTarget) || 0);
+  }
+  return Math.max(0, Number(v.currentTime) || 0);
+}
+
+function _floatMarkUserSeek(v, targetTime, extendMs){
+  if (!v) return;
+  v._floatUserSeekTarget = Math.max(0, Number(targetTime) || 0);
+  v._floatUserSeekPending = true;
+  v._floatUserSeekUntil = Date.now() + (Number(extendMs) || FLOAT_SEEK_GRACE_MS);
+  v._floatPlaybackStuck = false;
+  v._floatLastMoveAt = Date.now();
+}
+
+function _floatHlsStartLoadAt(v, t){
+  const hls = v?._hls;
+  if (!hls) return;
+  try { hls.startLoad(Math.max(0, Number(t) || 0)); } catch(_){}
+}
+
+function _floatReassertSeekIfSpurious(v){
+  if (!_floatInSeekGrace(v)) return false;
+  const target = Number(v._floatUserSeekTarget);
+  if (!Number.isFinite(target) || target < 2) return false;
+  const ct = Number(v.currentTime) || 0;
+  if (ct >= 1 || Math.abs(ct - target) <= 1.5) return false;
+  console.info("[float-watch] reassert seek:", ct.toFixed(2), "->", target.toFixed(2));
+  try { v.currentTime = target; } catch(_){}
+  _floatHlsStartLoadAt(v, target);
+  return true;
+}
+
 function _floatNudgePlayback(v, reason){
   if (!v || v._floatClosed || !document.body.contains(v)) return false;
   const ct = Math.max(0, Number(v.currentTime) || 0);
   const hls = v._hls;
-  try { v.pause(); } catch(_){}
-  const nudge = ct + 0.05;
-  try { v.currentTime = nudge; } catch(_){
-    try { v.currentTime = ct + 0.01; } catch(__){}
-  }
   if (hls){
-    try { hls.recoverMediaError(); } catch(_){}
-    try { hls.startLoad(Number(v.currentTime) || ct); } catch(_){}
+    try { hls.startLoad(ct); } catch(_){}
   }
   v._floatPlaybackStuck = false;
   v._floatLastMoveAt = Date.now();
@@ -389,6 +438,7 @@ function _floatHasDecoded(v){
 
 function _floatHardRetryAttach(panel, video, id, reason){
   if (!panel || !video || video._floatDirectPlay || video._floatClosed) return;
+  if (_floatInSeekGrace(video)) return;
   const now = Date.now();
   if (video._floatHardRetryAt && now - video._floatHardRetryAt < 10000) return;
   video._floatHardRetryAt = now;
@@ -396,7 +446,8 @@ function _floatHardRetryAttach(panel, video, id, reason){
   bumpFloatPanelPriority(panel, id);
   apiHlsResume(id, "preview");
   if (video._hls){
-    try { video._hls.startLoad(0); } catch(_){}
+    const resumeAt = _floatSeekResumeAt(video);
+    try { video._hls.startLoad(resumeAt); } catch(_){}
     try { video._hls.recoverMediaError(); } catch(_){}
   }
   if (!video._floatUserPaused) video.play().catch(()=>{});
@@ -664,30 +715,47 @@ function installFloatPlayerControls(panel, video, vid){
     seek.addEventListener("input", (ev)=>{
       ev.stopPropagation();
       dragging = true;
+      video._floatSeekDragging = true;
+      focusWatchFloatPanel(panel);
       const dur = duration();
       if (dur <= 0) return;
       const frac = Math.max(0, Math.min(1, Number(ev.currentTarget.value) / 1000));
       const t = frac * dur;
+      _floatMarkUserSeek(video, t);
       if (curEl) curEl.textContent = fmtClock(t);
     });
     seek.addEventListener("change", (ev)=>{
       ev.stopPropagation();
       dragging = false;
+      video._floatSeekDragging = false;
+      focusWatchFloatPanel(panel);
       const dur = duration();
       if (dur <= 0) return;
       const frac = Math.max(0, Math.min(1, Number(ev.currentTarget.value) / 1000));
       const t = Math.max(0, Math.min(dur - 0.05, frac * dur));
+      _floatMarkUserSeek(video, t);
       try{ video.currentTime = t; }catch(_){}
       if (video._hls){
-        try{ video._hls.startLoad(t); }catch(_){}
+        try { video._hls.stopLoad(); } catch(_){}
+        _floatHlsStartLoadAt(video, t);
       }
       apiReportHlsPlayhead(vid, t, "preview");
+      if (!video._floatUserPaused) video.play().catch(()=>{});
       syncUi();
     });
     ["pointerdown","mousedown","touchstart"].forEach(t=>{
-      seek.addEventListener(t, ev=> ev.stopPropagation());
+      seek.addEventListener(t, ev=>{
+        ev.stopPropagation();
+        video._floatSeekDragging = true;
+        focusWatchFloatPanel(panel);
+      });
     });
   }
+  video.addEventListener("seeking", ()=>{
+    if (Number.isFinite(video._floatUserSeekTarget)){
+      video._floatUserSeekUntil = Date.now() + FLOAT_SEEK_GRACE_MS;
+    }
+  });
   ["play","pause","timeupdate","durationchange","volumechange","loadedmetadata"].forEach(evt=>{
     video.addEventListener(evt, syncUi);
   });
@@ -1248,7 +1316,9 @@ function installFloatStallWatch(vEl, vid, panel){
   vEl._floatPlaybackStuck = false;
   vEl.addEventListener("timeupdate", ()=>{
     const ct = Number(vEl.currentTime) || 0;
+    const prevT = lastT;
     if (Math.abs(ct - lastT) >= 0.08){
+      _floatClearUserSeekIfPlaying(vEl, prevT, ct);
       vEl._floatLastMoveAt = Date.now();
       vEl._floatPlaybackStuck = false;
       stuck = 0;
@@ -1261,15 +1331,23 @@ function installFloatStallWatch(vEl, vid, panel){
   vEl.addEventListener("waiting", ()=>{
     apiReportHlsPlayhead(id, vEl.currentTime || 0, "preview");
     if (vEl._floatUserPaused) return;
-    if (vEl._hls){ try { vEl._hls.startLoad(); } catch(_){} }
+    if (_floatInSeekGrace(vEl)) return;
+    _floatHlsStartLoadAt(vEl, _floatSeekResumeAt(vEl));
   });
   vEl.addEventListener("stalled", ()=>{
     if (vEl._floatUserPaused) return;
-    if (vEl._hls){ try { vEl._hls.startLoad(); } catch(_){} }
+    if (_floatInSeekGrace(vEl)) return;
+    _floatHlsStartLoadAt(vEl, _floatSeekResumeAt(vEl));
   });
   const watchdog = setInterval(()=>{
     if (!document.contains(vEl) || vEl._floatClosed || !panel._floatAlive) return;
     if (vEl._floatUserPaused || vEl.ended) return;
+    if (vEl._floatSeekDragging || _floatInSeekGrace(vEl)){
+      _floatReassertSeekIfSpurious(vEl);
+      stuck = 0;
+      vEl._floatPlaybackStuck = false;
+      return;
+    }
     if (vEl.paused){
       if (String(watchFloatState.audioFocus) !== String(id)) vEl.muted = true;
       if (!vEl._floatClosed) vEl.play().catch(()=>{});
@@ -1280,7 +1358,7 @@ function installFloatStallWatch(vEl, vid, panel){
     const bufEnd = bufferedEndForPosition(vEl, ct);
     const hasBufferedAhead = bufEnd > ct + 0.35;
     const idleMs = now - (vEl._floatLastMoveAt || now);
-    if (ct < 0.05 && !hasBufferedAhead && idleMs > 22000 && vEl._hls){
+    if (ct < 0.05 && !hasBufferedAhead && idleMs > 22000 && vEl._hls && !_floatInSeekGrace(vEl)){
       // 预热超时：先放掉冷启动槽位（别卡住排队中的其它浮窗），再重试
       _releaseFloatWarmupSlot(vEl);
       vEl._floatWarmupRetries = (vEl._floatWarmupRetries || 0) + 1;
@@ -1294,21 +1372,20 @@ function installFloatStallWatch(vEl, vid, panel){
       return;
     }
     if (idleMs > 1800 && Math.abs(ct - lastT) < 0.12){
+      if (_floatInSeekGrace(vEl)){
+        stuck = 0;
+        vEl._floatPlaybackStuck = false;
+        return;
+      }
       stuck += 1;
       vEl._floatPlaybackStuck = true;
       apiReportHlsPlayhead(id, ct, "preview");
-      if (hasBufferedAhead && stuck >= 1){
-        _floatNudgePlayback(vEl, stuck >= 2 ? "watchdog-stuck-buffered" : "watchdog-stuck");
-        stuck = 0;
-        lastT = Number(vEl.currentTime) || ct;
-        lastWall = now;
-        return;
-      }
+      // 浮窗 preview：不自动 nudge（pause/recoverMediaError 易把 seek 打回开头）
       if (vEl._hls){
-        try { vEl._hls.startLoad(); } catch(_){}
-        if (stuck >= 2){ try { vEl._hls.recoverMediaError(); } catch(_){} }
+        if (stuck >= 1) _floatHlsStartLoadAt(vEl, _floatSeekResumeAt(vEl));
+        if (stuck >= 5){ try { vEl._hls.recoverMediaError(); } catch(_){} }
       }
-      if (stuck >= 2) vEl.play().catch(()=>{});
+      if (stuck >= 2 && hasBufferedAhead) vEl.play().catch(()=>{});
     } else if (Math.abs(ct - lastT) >= 0.12) {
       stuck = 0;
       vEl._floatPlaybackStuck = false;
@@ -1525,7 +1602,7 @@ async function refreshFloatHlsCapacity(){
     const j = await r.json();
     const n = Number(j.concurrent_max);
     if (Number.isFinite(n) && n > 0){
-      _floatConcurrentHlsMax = Math.floor(n);
+      _floatConcurrentHlsMax = Math.min(Math.floor(n), 10);
       reconcileFloatLoadPriority();
     }
   }catch(_){}
@@ -4268,7 +4345,7 @@ function _installHlsBufferGuard(hls, v, seq, hlsInfo){
     const cur = Number(hls.config?.maxBufferSize) || HLS_MSE_BUDGET_FLOOR_BYTES;
     applyBudget(Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, Math.floor(cur * 0.75)), d);
     if (!data.fatal && data.type === window.Hls.ErrorTypes.MEDIA_ERROR){
-      try{ hls.recoverMediaError(); }catch(_){}
+      if (!isFloat) try{ hls.recoverMediaError(); }catch(_){}
     }
   });
 }
@@ -4576,12 +4653,17 @@ async function attachVideoSrc(src, resumeAt, opts = {}){
     if (vidForInfo) apiHlsResume(vidForInfo, "preview");
   }
 
-  const prewarmP = (()=>{
-    const pl = decision?.url || _hlsPlaylistUrl(src, playbackTier);
-    if (pl) return fetch(pl, { cache:"no-store", credentials:"same-origin" }).catch(()=>{});
-    return prewarmMediaConnection(src);
-  })();
-  await prewarmP.catch(()=>{});
+  const pl = decision?.url || _hlsPlaylistUrl(src, playbackTier);
+  if (pl){
+    if (opts.isFloat){
+      // 浮窗：异步触发 playlist/转码，不阻塞 HLS.js attach（避免串行等 prime 拖慢起播）
+      fetch(pl, { cache:"no-store", credentials:"same-origin" }).catch(()=>{});
+    } else {
+      await fetch(pl, { cache:"no-store", credentials:"same-origin" }).catch(()=>{});
+    }
+  } else {
+    await prewarmMediaConnection(src).catch(()=>{});
+  }
   if (!floatStillValid()){ _releaseFloatWarmupSlot(v); abortFloatAttach(); return; }
 
   if (decision?.meta){
@@ -4741,7 +4823,8 @@ async function attachVideoSrc(src, resumeAt, opts = {}){
         switch (data.type) {
           case window.Hls.ErrorTypes.NETWORK_ERROR:
             if (++fatalNetworkRetries <= 2) {
-              hls.startLoad();
+              const resumeAt = v._floatSyncUi ? _floatSeekResumeAt(v) : (Number(v.currentTime) || 0);
+              hls.startLoad(Math.max(0, resumeAt));
             } else {
               fallbackToNative(data.details || data.type);
             }
