@@ -1,5 +1,5 @@
 /* app/static/app.js (fs-42d-stall-hb-wallclock-projection+end-guard+gate-FULL+hotfix-2025-11-01b) */
-console.log("app.js version fs-88-large-file-buffer-2026-05-22");
+console.log("app.js version fs-114-float-drop-live-rect-2026-06-11");
 
 /* ===================== 公共状态与工具 ===================== */
 
@@ -24,8 +24,12 @@ window.addEventListener("error", (ev)=>{
   }
 }, true);
 const URL_PARAMS = new URLSearchParams(window.location.search || "");
+const POPOUT_PATH_MATCH = (typeof window !== "undefined" && window.location.pathname || "").match(/^\/watch\/([^/?#]+)/);
+const POPOUT_VID = POPOUT_PATH_MATCH ? decodeURIComponent(POPOUT_PATH_MATCH[1]) : "";
+const POPOUT_MODE = !!POPOUT_VID;
+const POPOUT_EMBED = POPOUT_MODE && URL_PARAMS.get("embed") === "1";
 const WALLPAPER_MODE_VALUE = URL_PARAMS.get("wallpaper") || "";
-const WALLPAPER_MODE = ["1", "2"].includes(WALLPAPER_MODE_VALUE);
+const WALLPAPER_MODE = !POPOUT_MODE && ["1", "2"].includes(WALLPAPER_MODE_VALUE);
 const WALLPAPER_MUTE_AWAY = WALLPAPER_MODE_VALUE === "1";
 const WALLPAPER_PAUSE_AWAY = WALLPAPER_MODE_VALUE === "2";
 let wallpaperDesktopVisible = !(WALLPAPER_MUTE_AWAY || WALLPAPER_PAUSE_AWAY) || document.visibilityState === "visible";
@@ -185,7 +189,1149 @@ const BACKGROUND_AUDIO_MODE = IS_MOBILE_UA;
 try { document.documentElement.classList.toggle("is-desktop", !IS_MOBILE_UA); } catch(_){}
 try {
   document.documentElement.classList.toggle("wallpaper-mode", WALLPAPER_MODE);
+  document.documentElement.classList.toggle("popout-mode", POPOUT_MODE);
 } catch(_){}
+
+const watchFloatState = { panels: new Map(), zCounter: 4000, audioFocus: null, pendingRestoreTimers: [], prioritySeq: 0 };
+const FLOAT_PLAYER_MSE_BYTES = 56 * 1024 * 1024;
+const FLOAT_MSE_BUDGET_FLOOR_BYTES = 10 * 1024 * 1024;
+const FLOAT_MAX_RESTORE_PLAY = 6;
+// 与双 GPU 转码槽位对齐；启动后从 /api/hls/capacity 动态刷新
+const FLOAT_MAX_CONCURRENT_HLS = 8;
+let _floatConcurrentHlsMax = FLOAT_MAX_CONCURRENT_HLS;
+let _floatActiveHlsCount = 0;
+const _floatHlsSlotWaiters = [];
+
+async function _acquireFloatHlsSlot(){
+  const maxN = Math.max(1, _floatConcurrentHlsMax || FLOAT_MAX_CONCURRENT_HLS);
+  while (_floatActiveHlsCount >= maxN){
+    await new Promise(resolve => _floatHlsSlotWaiters.push(resolve));
+  }
+  _floatActiveHlsCount += 1;
+}
+
+function _releaseFloatHlsSlot(v){
+  if (v?._floatHlsSlotHeld){
+    v._floatHlsSlotHeld = false;
+  } else {
+    return;
+  }
+  _floatActiveHlsCount = Math.max(0, _floatActiveHlsCount - 1);
+  const w = _floatHlsSlotWaiters.shift();
+  if (w) w();
+}
+
+function _cancelFloatHlsSlotAcquire(){
+  _floatActiveHlsCount = Math.max(0, _floatActiveHlsCount - 1);
+  const w = _floatHlsSlotWaiters.shift();
+  if (w) w();
+}
+
+// 冷启动并发闸：同时只让少数浮窗触发后端 ffmpeg 冷启（NAS 磁盘 seek + GPU init 很重），
+// 其余按优先级（打开/聚焦顺序）排队；某窗解出首帧或失败即释放，下一个补位。
+const FLOAT_WARMUP_MAX = 2;
+let _floatWarmupActive = 0;
+const _floatWarmupWaiters = [];
+
+function _pumpFloatWarmup(){
+  while (_floatWarmupActive < Math.max(1, FLOAT_WARMUP_MAX) && _floatWarmupWaiters.length){
+    _floatWarmupWaiters.sort((a, b)=> (Number(b.panel?._floatPriority) || 0) - (Number(a.panel?._floatPriority) || 0));
+    const w = _floatWarmupWaiters.shift();
+    _floatWarmupActive += 1;
+    try { w.resolve(); } catch(_){}
+  }
+}
+
+function _acquireFloatWarmupSlot(panel, video){
+  if (video) video._floatWarmupHeld = true;
+  return new Promise(resolve=>{
+    _floatWarmupWaiters.push({ panel, video, resolve });
+    _pumpFloatWarmup();
+  });
+}
+
+function _releaseFloatWarmupSlot(video){
+  if (!video) return;
+  // 还在排队没拿到槽位 → 从等待队列剔除
+  const qi = _floatWarmupWaiters.findIndex(w=> w.video === video);
+  if (qi >= 0){
+    _floatWarmupWaiters.splice(qi, 1);
+    video._floatWarmupHeld = false;
+    return;
+  }
+  if (!video._floatWarmupHeld) return;
+  video._floatWarmupHeld = false;
+  _floatWarmupActive = Math.max(0, _floatWarmupActive - 1);
+  _pumpFloatWarmup();
+}
+// 浮动预览不读写 /api/progress，避免多窗/全屏播放互相覆盖断点；HLS preview playhead 仍上报给后端。
+const FLOAT_PERSIST_PROGRESS = false;
+
+function _floatPanelActive(panel, video){
+  return !!panel?._floatAlive && !!video && !video._floatClosed && document.body.contains(video);
+}
+
+function _invalidateFloatVideoLoad(video){
+  if (!video) return;
+  video._floatLoadToken = (video._floatLoadToken || 0) + 1;
+}
+
+function _destroyFloatVideo(video){
+  if (!video || video._floatDestroyed) return;
+  video._floatDestroyed = true;
+  video._floatClosed = true;
+  video._floatUserPaused = true;
+  _releaseFloatHlsSlot(video);
+  _releaseFloatWarmupSlot(video);
+  _invalidateFloatVideoLoad(video);
+  try { video.pause(); } catch(_){}
+  try { video.muted = true; video.volume = 0; } catch(_){}
+  try { video.srcObject = null; } catch(_){}
+  try { video.removeAttribute("src"); } catch(_){}
+  teardownMSE(video);
+  try { video.load(); } catch(_){}
+}
+
+function _cancelAllFloatRestoreTimers(){
+  (watchFloatState.pendingRestoreTimers || []).forEach(tid=> clearTimeout(tid));
+  watchFloatState.pendingRestoreTimers = [];
+}
+
+function _floatVideoMayPlay(v, panel){
+  return _floatPanelActive(panel, v) && !v._floatUserPaused;
+}
+
+function _floatPlayerCount(){
+  try { return watchFloatState.panels.size; } catch(_){ return 0; }
+}
+
+function _floatPlaybackBudgetBytes(){
+  const n = Math.max(1, _floatPlayerCount());
+  return Math.max(FLOAT_MSE_BUDGET_FLOOR_BYTES, Math.floor(FLOAT_PLAYER_MSE_BYTES / Math.sqrt(n)));
+}
+
+function _floatNudgePlayback(v, reason){
+  if (!v || v._floatClosed || !document.body.contains(v)) return false;
+  const ct = Math.max(0, Number(v.currentTime) || 0);
+  const hls = v._hls;
+  try { v.pause(); } catch(_){}
+  const nudge = ct + 0.05;
+  try { v.currentTime = nudge; } catch(_){
+    try { v.currentTime = ct + 0.01; } catch(__){}
+  }
+  if (hls){
+    try { hls.recoverMediaError(); } catch(_){}
+    try { hls.startLoad(Number(v.currentTime) || ct); } catch(_){}
+  }
+  v._floatPlaybackStuck = false;
+  v._floatLastMoveAt = Date.now();
+  if (!v._floatUserPaused && !v._floatClosed){
+    try { v.play().catch(()=>{}); } catch(_){}
+  }
+  if (reason) console.info("[float-watch] nudge playback:", reason, ct.toFixed(2));
+  return true;
+}
+
+function _applyFloatHlsBudget(v){
+  const hls = v?._hls;
+  if (!hls) return;
+  const budget = _floatPlaybackBudgetBytes();
+  const cfg = _hlsJsConfigFromBudget(budget, Number(v._hlsBitrateBps || 0), _playbackIsMobile());
+  cfg.maxBufferLength = Math.max(18, Math.min(cfg.maxBufferLength || 50, 55));
+  cfg.maxMaxBufferLength = cfg.maxBufferLength;
+  cfg.mseBudgetBytes = budget;
+  hls.config.maxBufferSize = cfg.maxBufferSize;
+  hls.config.maxBufferLength = cfg.maxBufferLength;
+  hls.config.maxMaxBufferLength = cfg.maxMaxBufferLength;
+  hls.config.backBufferLength = cfg.backBufferLength;
+  hls.config.startFragPrefetch = cfg.startFragPrefetch;
+}
+
+function reconcileFloatHlsBudgets(){
+  reconcileFloatLoadPriority();
+}
+
+function _floatPanelsByPriority(){
+  const out = [];
+  watchFloatState.panels.forEach((panel, vid)=>{
+    out.push({ panel, vid: String(vid), pri: Number(panel._floatPriority) || 0 });
+  });
+  out.sort((a, b)=> b.pri - a.pri);
+  return out;
+}
+
+function bumpFloatPanelPriority(panel, vid){
+  if (!panel) return;
+  watchFloatState.prioritySeq = (watchFloatState.prioritySeq || 0) + 1;
+  panel._floatPriority = watchFloatState.prioritySeq;
+  apiHlsPriority(vid, panel._floatPriority);
+  reconcileFloatLoadPriority();
+}
+
+function focusWatchFloatPanel(panel){
+  if (!panel) return;
+  bumpWatchFloatPanel(panel);
+  const vid = panel.dataset?.vid;
+  if (vid) bumpFloatPanelPriority(panel, vid);
+}
+
+function _floatHasDecoded(v){
+  if (!v) return false;
+  const ct = Number(v.currentTime) || 0;
+  if (ct > 0.02) return true;
+  if (v.readyState >= 2) return true;
+  try{
+    const buf = bufferedEndForPosition(v, ct);
+    if (buf > ct + 0.2) return true;
+  }catch(_){}
+  return false;
+}
+
+function _floatHardRetryAttach(panel, video, id, reason){
+  if (!panel || !video || video._floatDirectPlay || video._floatClosed) return;
+  const now = Date.now();
+  if (video._floatHardRetryAt && now - video._floatHardRetryAt < 10000) return;
+  video._floatHardRetryAt = now;
+  console.warn("[float-watch] hard retry:", reason, id);
+  bumpFloatPanelPriority(panel, id);
+  apiHlsResume(id, "preview");
+  if (video._hls){
+    try { video._hls.startLoad(0); } catch(_){}
+    try { video._hls.recoverMediaError(); } catch(_){}
+  }
+  if (!video._floatUserPaused) video.play().catch(()=>{});
+}
+
+async function _floatPrewarmPreviewHls(id){
+  const vid = String(id || "").trim();
+  if (!vid) return;
+  apiHlsResume(vid, "preview");
+  const pl = _hlsPlaylistUrl(mediaVideoSrcOf(vid), "preview");
+  try{
+    await fetch(pl, { cache: "no-store", credentials: "same-origin" });
+  }catch(_){}
+}
+
+async function _floatRetryHlsWarmup(panel, video, id){
+  if (!panel || !video || video._floatClosed || video._floatDirectPlay) return false;
+  console.warn("[float-watch] hls warmup retry:", id);
+  bumpFloatPanelPriority(panel, id);
+  await _floatPrewarmPreviewHls(id);
+  _floatHardRetryAttach(panel, video, id, "warmup-hls-retry");
+  return true;
+}
+
+function _floatResumeHlsLoad(v, vid, reason){
+  if (!v?._hls || v._floatDirectPlay || v._floatClosed) return false;
+  apiHlsResume(vid, "preview");
+  try { v._hls.startLoad(Number(v.currentTime) || 0); } catch(_){}
+  if (!v._floatUserPaused) v.play().catch(()=>{});
+  if (reason) console.info("[float-watch] resume hls:", reason, vid);
+  return true;
+}
+
+function reconcileFloatLoadPriority(){
+  const ranked = _floatPanelsByPriority();
+  const maxN = Math.max(1, _floatConcurrentHlsMax || FLOAT_MAX_CONCURRENT_HLS);
+  const hlsAttached = ranked.filter(({ panel })=>{
+    const v = panel.querySelector("video.watch-float-video");
+    return v && v._hls && !v._floatDirectPlay;
+  });
+  const activeHls = new Set(hlsAttached.slice(0, maxN).map(x=> x.vid));
+
+  ranked.forEach(({ panel, vid })=>{
+    const v = panel.querySelector("video.watch-float-video");
+    if (!v) return;
+    if (panel._floatAttachPending && typeof panel._floatRunAttach === "function"){
+      panel._floatRunAttach();
+    }
+    if (v._floatDirectPlay || !v._hls) return;
+    if (!activeHls.has(vid)){
+      if (!_floatHasDecoded(v)) return;
+      try { v._hls.stopLoad(); } catch(_){}
+      v._floatLoadDeferred = true;
+      return;
+    }
+    if (v._floatLoadDeferred || !_floatHasDecoded(v)){
+      v._floatLoadDeferred = false;
+      _floatResumeHlsLoad(v, vid, v._floatLoadDeferred ? "promoted" : null);
+    }
+  });
+
+  forEachFloatVideo((v)=> _applyFloatHlsBudget(v));
+}
+
+function forEachFloatVideo(fn){
+  watchFloatState.panels.forEach((panel, vid)=>{
+    const v = panel.querySelector("video.watch-float-video");
+    if (v) fn(v, String(vid), panel);
+  });
+}
+
+function snapshotFloatPlayback(){
+  const snap = new Map();
+  forEachFloatVideo((v, vid)=>{
+    snap.set(vid, {
+      playing: !v.paused && !v.ended,
+      muted: !!v.muted,
+      userMuted: !!v._floatUserMuted,
+    });
+  });
+  return snap;
+}
+
+async function restoreFloatPlayback(snap, exceptVid){
+  if (!snap || !snap.size) return;
+  const jobs = [];
+  let restored = 0;
+  snap.forEach((st, vid)=>{
+    if (restored >= FLOAT_MAX_RESTORE_PLAY) return;
+    if (String(vid) === String(exceptVid) || !st.playing) return;
+    const panel = watchFloatState.panels.get(vid);
+    const v = panel?.querySelector("video.watch-float-video");
+    if (!_floatVideoMayPlay(v, panel)) return;
+    // Chrome 同时只允许一个有声 video；其余静音后可并行播放
+    v.muted = true;
+    v._floatUserMuted = st.userMuted;
+    restored += 1;
+    jobs.push(v.play().catch(()=>{}));
+  });
+  if (jobs.length) await Promise.all(jobs);
+}
+
+function scheduleFloatPlaybackRestore(snap, exceptVid){
+  if (!snap || !snap.size) return;
+  [80, 250, 700, 1500].forEach(ms=>{
+    const tid = setTimeout(()=> restoreFloatPlayback(snap, exceptVid), ms);
+    watchFloatState.pendingRestoreTimers.push(tid);
+  });
+}
+
+function syncFloatAudioFocus(activeVid){
+  watchFloatState.audioFocus = activeVid != null ? String(activeVid) : null;
+  forEachFloatVideo((v, vid)=>{
+    if (String(vid) === String(activeVid)){
+      v.muted = !!v._floatUserMuted;
+    } else {
+      v.muted = true;
+    }
+  });
+}
+
+function _playbackInstanceCount(){
+  let n = _floatPlayerCount();
+  if (typeof isPlayerActive === "function" && isPlayerActive()) n += 1;
+  return Math.max(1, n);
+}
+
+function fitWatchFloatPanel(panel, vw, vh){
+  if (!panel || !vw || !vh) return;
+  const barH = 36;
+  const ctrlH = 44;
+  const chromeH = barH + ctrlH;
+  const maxBodyW = Math.min(window.innerWidth * 0.38, 520);
+  const maxBodyH = Math.min(window.innerHeight * 0.36, 380);
+  let bodyW = maxBodyW;
+  let bodyH = Math.round(bodyW * vh / vw);
+  if (bodyH > maxBodyH){
+    bodyH = maxBodyH;
+    bodyW = Math.round(bodyH * vw / vh);
+  }
+  panel.style.width = `${bodyW}px`;
+  panel.style.height = `${bodyH + chromeH}px`;
+  const left = parseInt(panel.style.left, 10) || 0;
+  const top = parseInt(panel.style.top, 10) || 0;
+  if (left + bodyW > window.innerWidth - 8){
+    panel.style.left = `${Math.max(8, window.innerWidth - bodyW - 8)}px`;
+  }
+  if (top + bodyH + chromeH > window.innerHeight - 8){
+    panel.style.top = `${Math.max(8, window.innerHeight - bodyH - chromeH - 8)}px`;
+  }
+}
+
+function ensureWatchFloatLayer(){
+  let layer = document.getElementById("watchFloatLayer");
+  if (!layer){
+    layer = document.createElement("div");
+    layer.id = "watchFloatLayer";
+    layer.className = "watch-float-layer";
+    document.body.appendChild(layer);
+  }
+  return layer;
+}
+
+function bumpWatchFloatPanel(panel){
+  if (!panel) return;
+  watchFloatState.zCounter += 1;
+  panel.style.zIndex = String(watchFloatState.zCounter);
+}
+
+function stopFloatWatchServices(panel){
+  if (!panel) return;
+  const cleanups = panel._floatCleanups || [];
+  cleanups.forEach(fn=>{ try{ fn(); }catch(_){} });
+  panel._floatCleanups = [];
+}
+
+function floatFixedDuration(video, vid){
+  const expected = Number(video?._expectedDuration || 0);
+  if (Number.isFinite(expected) && expected > 0) return expected;
+  const cached = hlsInfoCache.get(String(vid));
+  const fromCache = Number(cached?.duration || 0);
+  if (Number.isFinite(fromCache) && fromCache > 0) return fromCache;
+  const fromServer = _serverDurationForSrc(mediaVideoSrcOf(vid));
+  if (fromServer > 0) return fromServer;
+  const vd = Number(video?.duration || 0);
+  if (Number.isFinite(vd) && vd > 0 && vd < 86400) return vd;
+  return 0;
+}
+
+function installFloatPlayerControls(panel, video, vid){
+  const root = panel.querySelector(".watch-float-controls");
+  if (!root || !video) return;
+  const btnPlay = root.querySelector(".wfc-play");
+  const btnMute = root.querySelector(".wfc-mute");
+  const seek = root.querySelector(".wfc-seek");
+  const curEl = root.querySelector(".wfc-cur");
+  const durEl = root.querySelector(".wfc-dur");
+  const bufEl = root.querySelector(".wfc-buffered");
+  const playedEl = root.querySelector(".wfc-played");
+  let dragging = false;
+
+  const duration = ()=> floatFixedDuration(video, vid);
+
+  const syncUi = ()=>{
+    const dur = duration();
+    const pos = Math.max(0, Number(video.currentTime) || 0);
+    if (curEl) curEl.textContent = fmtClock(pos);
+    if (durEl) durEl.textContent = dur > 0 ? fmtClock(dur) : "--:--";
+    if (seek && !dragging){
+      seek.value = dur > 0 ? String(Math.round((pos / dur) * 1000)) : "0";
+    }
+    if (bufEl && dur > 0){
+      const bufEnd = bufferedEndForPosition(video, pos);
+      const bufPct = Math.max(0, Math.min(100, (bufEnd / dur) * 100));
+      const playPct = Math.max(0, Math.min(100, (pos / dur) * 100));
+      bufEl.style.width = `${bufPct}%`;
+      if (playedEl) playedEl.style.width = `${playPct}%`;
+    }
+    if (btnPlay){
+      const playing = !video.paused && !video.ended && !video._floatPlaybackStuck;
+      btnPlay.textContent = playing ? "⏸" : "▶";
+      btnPlay.setAttribute("aria-label", playing ? "暂停" : "播放");
+    }
+    if (btnMute){
+      const muted = !!video.muted || (video.volume || 0) <= 0;
+      btnMute.textContent = muted ? "🔇" : "🔊";
+    }
+  };
+
+  btnPlay && (btnPlay.onclick = (ev)=>{
+    ev.stopPropagation();
+    const stuck = !!video._floatPlaybackStuck && !video._floatUserPaused;
+    if (stuck){
+      _floatNudgePlayback(video, "user-toggle-stuck");
+      syncUi();
+      return;
+    }
+    if (video.paused || video.ended){
+      video._floatUserPaused = false;
+      syncFloatAudioFocus(vid);
+      if (video._hls){
+        try { video._hls.startLoad(Number(video.currentTime) || 0); } catch(_){}
+      }
+      video.play().catch(()=>{});
+    } else {
+      video._floatUserPaused = true;
+      try { video.pause(); } catch(_){}
+      if (video._hls){
+        try { video._hls.stopLoad(); } catch(_){}
+      }
+    }
+    syncUi();
+  });
+  btnMute && (btnMute.onclick = (ev)=>{
+    ev.stopPropagation();
+    video._floatUserMuted = !video._floatUserMuted;
+    if (String(watchFloatState.audioFocus) === String(vid)){
+      video.muted = video._floatUserMuted;
+    } else {
+      video.muted = true;
+    }
+    syncUi();
+  });
+  if (seek){
+    seek.addEventListener("input", (ev)=>{
+      ev.stopPropagation();
+      dragging = true;
+      const dur = duration();
+      if (dur <= 0) return;
+      const frac = Math.max(0, Math.min(1, Number(ev.currentTarget.value) / 1000));
+      const t = frac * dur;
+      if (curEl) curEl.textContent = fmtClock(t);
+    });
+    seek.addEventListener("change", (ev)=>{
+      ev.stopPropagation();
+      dragging = false;
+      const dur = duration();
+      if (dur <= 0) return;
+      const frac = Math.max(0, Math.min(1, Number(ev.currentTarget.value) / 1000));
+      const t = Math.max(0, Math.min(dur - 0.05, frac * dur));
+      try{ video.currentTime = t; }catch(_){}
+      if (video._hls){
+        try{ video._hls.startLoad(t); }catch(_){}
+      }
+      apiReportHlsPlayhead(vid, t, "preview");
+      syncUi();
+    });
+    ["pointerdown","mousedown","touchstart"].forEach(t=>{
+      seek.addEventListener(t, ev=> ev.stopPropagation());
+    });
+  }
+  ["play","pause","timeupdate","durationchange","volumechange","loadedmetadata"].forEach(evt=>{
+    video.addEventListener(evt, syncUi);
+  });
+  video.addEventListener("play", ()=>{
+    if (!video._floatUserPaused && video._hls){
+      try { video._hls.startLoad(Number(video.currentTime) || 0); } catch(_){}
+    }
+  });
+  video.addEventListener("pause", ()=>{
+    if (video._floatUserPaused && video._hls){
+      try { video._hls.stopLoad(); } catch(_){}
+    }
+  });
+  syncUi();
+  const uiTimer = setInterval(()=>{
+    if (!document.contains(panel)){ clearInterval(uiTimer); return; }
+    syncUi();
+  }, 500);
+  (panel._floatCleanups = panel._floatCleanups || []).push(()=> clearInterval(uiTimer));
+  video._floatSyncUi = syncUi;
+}
+
+async function startFloatWatchPanel(panel, vid, title, priorSnap){
+  const id = String(vid || "").trim();
+  const video = panel.querySelector("video.watch-float-video");
+  if (!video || !panel._floatAlive) return;
+  video._floatClosed = false;
+  video._floatDestroyed = false;
+  video._floatLoadToken = (video._floatLoadToken || 0) + 1;
+  const loadToken = video._floatLoadToken;
+  video._floatUserPaused = false;
+  video._floatUserMuted = false;
+  syncFloatAudioFocus(id);
+  let resumeAt = 0;
+  if (FLOAT_PERSIST_PROGRESS){
+    try{
+      const p = await Promise.race([
+        apiGetProgress(id),
+        new Promise(res => setTimeout(()=>res(null), 800)),
+      ]);
+      if (!_floatPanelActive(panel, video) || video._floatLoadToken !== loadToken) return;
+      if (p && p.duration > 0
+        && p.position >= PROGRESS_MIN_POSITION_SEC
+        && p.position / p.duration < PROGRESS_COMPLETE_RATIO){
+        resumeAt = p.position;
+      }
+    }catch(_){}
+  }
+  if (!_floatPanelActive(panel, video) || video._floatLoadToken !== loadToken) return;
+  apiHlsResume(id, "preview");   // 仅清除 abandoned；冷启动由 attach 内的 warmup 闸错峰触发
+  installFloatPlayheadReporter(video, id, panel);
+  installFloatStallWatch(video, id, panel);
+  installFloatPlayerControls(panel, video, id);
+  video.volume = 0.85;
+
+  panel._floatAttachPending = true;
+  panel._floatAttachStarted = false;
+  panel._floatRunAttach = async ()=>{
+    if (!panel._floatAttachPending || panel._floatAttachStarted) return;
+    if (!_floatPanelActive(panel, video) || video._floatLoadToken !== loadToken) return;
+    panel._floatAttachStarted = true;
+    try{
+      await attachVideoSrc(mediaVideoSrcOf(id), resumeAt, { target: video, isFloat: true, floatPanel: panel, floatLoadToken: loadToken });
+      if (!_floatPanelActive(panel, video) || video._floatLoadToken !== loadToken){
+        _destroyFloatVideo(video);
+        return;
+      }
+      const ok = await safePlay(video);
+      if (!_floatPanelActive(panel, video) || video._floatLoadToken !== loadToken){
+        _destroyFloatVideo(video);
+        return;
+      }
+      if (!ok) video.play().catch(()=>{});
+      if (priorSnap) await restoreFloatPlayback(priorSnap, id);
+      if (_floatPanelActive(panel, video) && video._floatLoadToken === loadToken){
+        scheduleFloatPlaybackRestore(priorSnap, id);
+      }
+    }catch(e){
+      _releaseFloatWarmupSlot(video);
+      if (_floatPanelActive(panel, video)) console.error("[float-watch] start failed", id, e);
+      else _destroyFloatVideo(video);
+    }finally{
+      panel._floatAttachPending = false;
+      panel._floatAttachStarted = false;
+      reconcileFloatLoadPriority();
+    }
+    if (!_floatPanelActive(panel, video)) return;
+    const fit = ()=>{
+      if (video.videoWidth > 0 && video.videoHeight > 0){
+        fitWatchFloatPanel(panel, video.videoWidth, video.videoHeight);
+      }
+    };
+    if (video.videoWidth > 0) fit();
+    else video.addEventListener("loadedmetadata", fit, { once:true });
+    if (video._hls && video._expectedDuration){
+      pinHlsDuration(video._hls, video, video._expectedDuration);
+    }
+    video._floatSyncUi?.();
+  };
+
+  bumpFloatPanelPriority(panel, id);
+  refreshFloatHlsCapacity();
+}
+
+function openPopoutWatch(vid, title){
+  refreshFloatHlsCapacity();
+  const id = String(vid || "").trim();
+  if (!id) return;
+  if (POPOUT_MODE) return;
+  if (isPlayerActive() && String(player.ids[player.index]) === id){
+    showNotice("该视频正在全屏播放，请先返回再开浮动窗");
+    setTimeout(clearNotice, 2400);
+    return;
+  }
+  const t = String(title || "").trim() || `视频 ${id}`;
+  if (watchFloatState.panels.has(id)){
+    syncFloatAudioFocus(id);
+    focusWatchFloatPanel(watchFloatState.panels.get(id));
+    const panel = watchFloatState.panels.get(id);
+    const v = panel?.querySelector("video.watch-float-video");
+    if (v && !v._floatUserPaused && v.paused) v.play().catch(()=>{});
+    return;
+  }
+  const priorSnap = snapshotFloatPlayback();
+  const layer = ensureWatchFloatLayer();
+  const idx = watchFloatState.panels.size;
+  const panel = document.createElement("div");
+  panel.className = "watch-float";
+  panel.dataset.vid = id;
+  panel._floatCleanups = [];
+  panel._floatAlive = true;
+  panel.style.left = `${24 + (idx % 4) * 40}px`;
+  panel.style.top = `${48 + Math.floor(idx / 4) * 40}px`;
+  panel.innerHTML = `
+    <div class="watch-float-bar">
+      <span class="watch-float-title"></span>
+      <button type="button" class="watch-float-menu" title="菜单" aria-label="菜单">⋯</button>
+      <button type="button" class="watch-float-close" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <div class="watch-float-body">
+      <video class="watch-float-video" playsinline webkit-playsinline preload="auto" crossorigin="anonymous"></video>
+      <div class="watch-float-controls">
+        <button type="button" class="wfc-play" aria-label="播放">▶</button>
+        <span class="wfc-cur">0:00</span>
+        <div class="wfc-seek-wrap">
+          <div class="wfc-seek-track">
+            <div class="wfc-buffered"></div>
+            <div class="wfc-played"></div>
+          </div>
+          <input type="range" class="wfc-seek" min="0" max="1000" value="0" aria-label="进度"/>
+        </div>
+        <span class="wfc-dur">--:--</span>
+        <button type="button" class="wfc-mute" aria-label="静音">🔊</button>
+      </div>
+    </div>
+  `;
+  panel.querySelector(".watch-float-title").textContent = t;
+  panel.querySelector(".watch-float-close").onclick = (ev)=>{
+    ev.stopPropagation();
+    closeWatchFloatPanel(id);
+  };
+  const floatMenuBtn = panel.querySelector(".watch-float-menu");
+  if (floatMenuBtn){
+    floatMenuBtn.onclick = (ev)=>{
+      ev.preventDefault();
+      ev.stopPropagation();
+      openFloatContextMenu(id, floatMenuBtn);
+    };
+  }
+  installWatchFloatDrag(panel);
+  panel.addEventListener("pointerdown", ()=>{
+    focusWatchFloatPanel(panel);
+    syncFloatAudioFocus(id);
+  });
+  layer.appendChild(panel);
+  watchFloatState.panels.set(id, panel);
+  bumpWatchFloatPanel(panel);
+  fitWatchFloatPanel(panel, 16, 9);
+  if (watchFloatState.panels.size > 10){
+    showNotice(`已打开 ${watchFloatState.panels.size} 个浮动窗，过多并发可能导致个别画面卡住`);
+    setTimeout(clearNotice, 3200);
+  }
+  startFloatWatchPanel(panel, id, t, priorSnap);
+  reconcileFloatHlsBudgets();
+}
+
+function closeWatchFloatPanel(vid){
+  const id = String(vid || "").trim();
+  const panel = watchFloatState.panels.get(id);
+  if (!panel) return;
+  panel._floatAlive = false;
+  const video = panel.querySelector("video.watch-float-video");
+  if (video && !video._floatDirectPlay) apiHlsStop(id, "preview");
+  else if (!video) apiHlsStop(id, "preview");
+  stopFloatWatchServices(panel);
+  if (video){
+    try{
+      if (FLOAT_PERSIST_PROGRESS && shouldPersistPlaybackState()){
+        const pos = Number(video.currentTime) || 0;
+        const dur = floatFixedDuration(video, id) || Number(video.duration) || 0;
+        if (dur >= 1 && pos >= PROGRESS_MIN_POSITION_SEC && pos / dur >= PROGRESS_START_RATIO){
+          apiSaveProgress(id, pos, dur);
+        }
+      }
+    }catch(_){}
+    _destroyFloatVideo(video);
+  }
+  panel.remove();
+  watchFloatState.panels.delete(id);
+  if (String(watchFloatState.audioFocus) === id){
+    const rest = [...watchFloatState.panels.keys()];
+    syncFloatAudioFocus(rest.length ? rest[rest.length - 1] : null);
+  }
+  if (watchFloatState.panels.size === 0){
+    _cancelAllFloatRestoreTimers();
+    document.querySelectorAll("video.watch-float-video").forEach(v=>{
+      try { _destroyFloatVideo(v); } catch(_){}
+    });
+    apiHlsStopAll("preview");
+  }
+  reconcileFloatHlsBudgets();
+}
+
+/* ===================== 浮窗拖入文件夹（虚拟热区层，视频窗始终可见） ===================== */
+const FLOAT_FOLDER_ARM_MS = 700;
+const FLOAT_STILL_PX = 4;
+const FLOAT_MOVE_DISARM_MS = 90;
+
+const floatFolderDropVL = { layer: null, box: null };
+
+function floatDropEnsureLayer(){
+  if (!floatFolderDropVL.layer){
+    const el = document.createElement("div");
+    el.id = "floatFolderDropLayer";
+    el.className = "float-folder-drop-layer";
+    el.setAttribute("aria-hidden", "true");
+    document.body.appendChild(el);
+    floatFolderDropVL.layer = el;
+  }
+  return floatFolderDropVL.layer;
+}
+
+function floatDropBuildZones(){
+  const zones = [];
+  for (const t of state.tiles || []){
+    if (t.type !== "folder" && t.type !== "parent") continue;
+    const path = t.path || "/";
+    if (state.selF.has(path)) continue;
+    const el = t.el;
+    if (!el?.isConnected) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) continue;
+    zones.push({
+      path,
+      title: String(t.title || path),
+      el,
+    });
+  }
+  return zones;
+}
+
+function floatDropLiveRect(zone){
+  const el = zone?.el;
+  if (!el?.isConnected) return null;
+  const r = el.getBoundingClientRect();
+  if (r.width < 8 || r.height < 8) return null;
+  return { left: r.left, top: r.top, width: r.width, height: r.height };
+}
+
+function floatDropApplyBox(box, zone){
+  const r = floatDropLiveRect(zone);
+  if (!r || !box) return false;
+  box.style.left = `${r.left}px`;
+  box.style.top = `${r.top}px`;
+  box.style.width = `${r.width}px`;
+  box.style.height = `${r.height}px`;
+  return true;
+}
+
+function floatDropHitZone(zones, x, y){
+  for (let i = zones.length - 1; i >= 0; i--){
+    const r = floatDropLiveRect(zones[i]);
+    if (!r) continue;
+    if (x >= r.left && x <= r.left + r.width && y >= r.top && y <= r.top + r.height)
+      return { ...zones[i], ...r };
+  }
+  return null;
+}
+
+function floatDropLayerClear(){
+  floatFolderDropVL.layer?.classList.remove("active");
+}
+
+function floatDropLayerShowArmed(zone){
+  const layer = floatDropEnsureLayer();
+  if (!floatFolderDropVL.box){
+    const box = document.createElement("div");
+    box.className = "float-drop-vzone armed";
+    box.innerHTML = `<div class="float-drop-vface"><span class="float-drop-vicon">📁</span><span class="float-drop-vtitle"></span></div>`;
+    layer.appendChild(box);
+    floatFolderDropVL.box = box;
+  }
+  const box = floatFolderDropVL.box;
+  const titleEl = box.querySelector(".float-drop-vtitle");
+  if (titleEl) titleEl.textContent = zone.title;
+  if (!floatDropApplyBox(box, zone)) return;
+  layer.classList.add("active");
+}
+
+function floatDropLayerSyncArmed(){
+  if (!floatFolderDropVL.box || !floatFolderDropVL.layer?.classList.contains("active")) return;
+  const z = floatFolderDropVL._zone;
+  if (!z) return;
+  if (!floatDropApplyBox(floatFolderDropVL.box, z)){
+    floatDropLayerClear();
+  }
+}
+
+function installWatchFloatDrag(panel){
+  const bar = panel.querySelector(".watch-float-bar");
+  if (!bar || bar._dragBound) return;
+  bar._dragBound = true;
+  const vid = String(panel.dataset.vid || "");
+
+  bar.addEventListener("pointerdown", (ev)=>{
+    if (ev.target.closest(".watch-float-close, .watch-float-menu")) return;
+    if (WALLPAPER_MODE) return;
+
+    const pointerId = ev.pointerId;
+    let startX = ev.clientX, startY = ev.clientY;
+    let lastX = ev.clientX, lastY = ev.clientY;
+    let stillX = ev.clientX, stillY = ev.clientY;
+    let armAtX = 0, armAtY = 0;
+    let origLeft = panel.offsetLeft, origTop = panel.offsetTop;
+    let dragging = false;
+    let dropArmed = false;
+    let movedSinceArm = false;
+    let zones = [];
+    let activeZone = null;
+    let armTimer = null;
+    let moveDisarmTimer = null;
+
+    const syncPanelPos = ()=>{
+      panel.style.left = `${Math.max(0, origLeft + lastX - startX)}px`;
+      panel.style.top = `${Math.max(0, origTop + lastY - startY)}px`;
+    };
+
+    const rebuildZones = ()=>{ zones = floatDropBuildZones(); };
+
+    const clearArmTimer = ()=>{
+      if (armTimer){ clearTimeout(armTimer); armTimer = null; }
+    };
+
+    const clearMoveDisarmTimer = ()=>{
+      if (moveDisarmTimer){ clearTimeout(moveDisarmTimer); moveDisarmTimer = null; }
+    };
+
+    const clearDropUI = ()=>{
+      activeZone = null;
+      floatFolderDropVL._zone = null;
+      floatDropLayerClear();
+    };
+
+    const disarmDrop = (keepZone=false)=>{
+      if (!dropArmed) return;
+      dropArmed = false;
+      movedSinceArm = false;
+      clearMoveDisarmTimer();
+      floatDropLayerClear();
+      if (!keepZone){
+        activeZone = null;
+        floatFolderDropVL._zone = null;
+      }
+    };
+
+    const armDrop = ()=>{
+      if (dropArmed || !activeZone) return;
+      dropArmed = true;
+      movedSinceArm = false;
+      armAtX = lastX;
+      armAtY = lastY;
+      floatFolderDropVL._zone = activeZone;
+      floatDropLayerShowArmed(activeZone);
+    };
+
+    const startArmTimer = ()=>{
+      clearArmTimer();
+      stillX = lastX;
+      stillY = lastY;
+      armTimer = setTimeout(()=>{
+        armTimer = null;
+        if (!activeZone || dropArmed) return;
+        if (floatDropHitZone(zones, lastX, lastY)?.path !== activeZone.path) return;
+        if (Math.hypot(lastX - stillX, lastY - stillY) > FLOAT_STILL_PX) return;
+        armDrop();
+      }, FLOAT_FOLDER_ARM_MS);
+    };
+
+    const enterZone = (zone)=>{
+      if (activeZone?.path !== zone.path){
+        clearArmTimer();
+        disarmDrop(false);
+        activeZone = zone;
+      }
+      startArmTimer();
+    };
+
+    const scheduleDisarmOnMove = ()=>{
+      if (!dropArmed || moveDisarmTimer) return;
+      moveDisarmTimer = setTimeout(()=>{
+        moveDisarmTimer = null;
+        if (!dropArmed) return;
+        const keep = !!(activeZone && floatDropHitZone(zones, lastX, lastY)?.path === activeZone.path);
+        disarmDrop(keep);
+        if (keep) startArmTimer();
+      }, FLOAT_MOVE_DISARM_MS);
+    };
+
+    const onScrollOrResize = ()=>{
+      if (!dragging) return;
+      const path = activeZone?.path;
+      rebuildZones();
+      if (!path) return;
+      const next = zones.find(z => z.path === path);
+      if (!next){ clearArmTimer(); disarmDrop(false); clearDropUI(); return; }
+      activeZone = next;
+      if (dropArmed){
+        floatFolderDropVL._zone = next;
+        floatDropLayerSyncArmed();
+      }
+    };
+
+    const cleanup = ()=>{
+      clearArmTimer();
+      clearMoveDisarmTimer();
+      disarmDrop(false);
+      clearDropUI();
+      if (panel.isConnected) panel.style.pointerEvents = "";
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      document.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+
+    const onMove = (e)=>{
+      if (e.pointerId !== pointerId) return;
+      lastX = e.clientX;
+      lastY = e.clientY;
+
+      if (!dragging){
+        if (Math.hypot(lastX - startX, lastY - startY) < FOLDER_DROP_THRESHOLD) return;
+        dragging = true;
+        panel.style.pointerEvents = "none";
+        bumpWatchFloatPanel(panel);
+        rebuildZones();
+        window.addEventListener("scroll", onScrollOrResize, { passive:true, capture:true });
+        document.addEventListener("scroll", onScrollOrResize, { passive:true, capture:true });
+        window.addEventListener("resize", onScrollOrResize, { passive:true });
+      }
+
+      if (dropArmed){
+        if (Math.hypot(lastX - armAtX, lastY - armAtY) > FLOAT_STILL_PX){
+          movedSinceArm = true;
+          scheduleDisarmOnMove();
+        }
+        floatDropLayerSyncArmed();
+      }
+
+      syncPanelPos();
+
+      if (dropArmed) return;
+
+      const hit = floatDropHitZone(zones, lastX, lastY);
+      if (hit){
+        enterZone(hit);
+        if (Math.hypot(lastX - stillX, lastY - stillY) > FLOAT_STILL_PX) startArmTimer();
+        return;
+      }
+
+      clearArmTimer();
+      disarmDrop(false);
+      clearDropUI();
+    };
+
+    const onUp = async (e)=>{
+      if (e.pointerId !== pointerId) return;
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+
+      const hit = floatDropHitZone(zones, e.clientX, e.clientY);
+      if (dropArmed && !movedSinceArm && activeZone && hit?.path === activeZone.path){
+        const path = activeZone.path;
+        cleanup();
+        folderDrop.suppressClickUntil = Date.now() + 400;
+        await moveIdsAndRefresh([vid], path);
+        return;
+      }
+      cleanup();
+    };
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+  });
+}
+
+// 浮窗"三个点"按钮：复用与右键完全一致的上下文菜单。
+// 选中该浮窗对应的视频（若网格内仍存在对应 tile 则同步高亮），再在按钮下方弹出菜单。
+function openFloatContextMenu(vid, anchorEl){
+  const id = String(vid || "").trim();
+  if (!id || !anchorEl) return;
+  try { clearSel(); } catch(_){}
+  const tile = (state.tiles || []).find(t => t && t.type === "video" && String(t.vid) === id);
+  if (tile){
+    setSel(tile, true);
+    state.lastIdx = tile.idx;
+  } else {
+    state.selV.add(id);
+  }
+  const b = anchorEl.getBoundingClientRect();
+  openContextMenu(b.left + b.width / 2, b.top + b.height);
+}
+
+if (!POPOUT_MODE){
+  window.addEventListener("message", (ev)=>{
+    if (ev.origin !== window.location.origin) return;
+    const d = ev.data;
+    if (d && d.type === "watch-close" && d.vid) closeWatchFloatPanel(d.vid);
+  });
+}
+
+function installFloatPlayheadReporter(vEl, vid, panel){
+  const id = String(vid || "");
+  if (!vEl || !id || !panel) return;
+  let lastPos = -1;
+  const tick = ()=>{
+    if (!document.contains(vEl)) return;
+    const pos = Number(vEl.currentTime);
+    if (!Number.isFinite(pos)) return;
+    if (Math.abs(pos - lastPos) < 0.25) return;
+    lastPos = pos;
+    apiReportHlsPlayhead(id, pos, "preview");
+  };
+  vEl.addEventListener("timeupdate", tick);
+  const interval = setInterval(()=>{
+    if (!document.contains(vEl)) return;
+    if (vEl.paused || vEl.ended) return;
+    tick();
+  }, 1200);
+  (panel._floatCleanups = panel._floatCleanups || []).push(()=> clearInterval(interval));
+}
+
+function installFloatStallWatch(vEl, vid, panel){
+  const id = String(vid || "");
+  if (!vEl || !id || !panel) return;
+  let lastT = 0, lastWall = 0, stuck = 0;
+  vEl._floatLastMoveAt = Date.now();
+  vEl._floatPlaybackStuck = false;
+  vEl.addEventListener("timeupdate", ()=>{
+    const ct = Number(vEl.currentTime) || 0;
+    if (Math.abs(ct - lastT) >= 0.08){
+      vEl._floatLastMoveAt = Date.now();
+      vEl._floatPlaybackStuck = false;
+      stuck = 0;
+      lastT = ct;
+      // 解出首帧 → 释放冷启动槽位，让排队的下一个浮窗开始预热
+      if (ct > 0.02) _releaseFloatWarmupSlot(vEl);
+    }
+  });
+  vEl.addEventListener("loadeddata", ()=>{ if ((Number(vEl.currentTime)||0) >= 0) _releaseFloatWarmupSlot(vEl); }, { once:true });
+  vEl.addEventListener("waiting", ()=>{
+    apiReportHlsPlayhead(id, vEl.currentTime || 0, "preview");
+    if (vEl._floatUserPaused) return;
+    if (vEl._hls){ try { vEl._hls.startLoad(); } catch(_){} }
+  });
+  vEl.addEventListener("stalled", ()=>{
+    if (vEl._floatUserPaused) return;
+    if (vEl._hls){ try { vEl._hls.startLoad(); } catch(_){} }
+  });
+  const watchdog = setInterval(()=>{
+    if (!document.contains(vEl) || vEl._floatClosed || !panel._floatAlive) return;
+    if (vEl._floatUserPaused || vEl.ended) return;
+    if (vEl.paused){
+      if (String(watchFloatState.audioFocus) !== String(id)) vEl.muted = true;
+      if (!vEl._floatClosed) vEl.play().catch(()=>{});
+      return;
+    }
+    const ct = Number(vEl.currentTime) || 0;
+    const now = Date.now();
+    const bufEnd = bufferedEndForPosition(vEl, ct);
+    const hasBufferedAhead = bufEnd > ct + 0.35;
+    const idleMs = now - (vEl._floatLastMoveAt || now);
+    if (ct < 0.05 && !hasBufferedAhead && idleMs > 22000 && vEl._hls){
+      // 预热超时：先放掉冷启动槽位（别卡住排队中的其它浮窗），再重试
+      _releaseFloatWarmupSlot(vEl);
+      vEl._floatWarmupRetries = (vEl._floatWarmupRetries || 0) + 1;
+      _floatHardRetryAttach(panel, vEl, id, "warmup-timeout");
+      vEl._floatLastMoveAt = now;
+      stuck = 0;
+      if (vEl._floatWarmupRetries >= 3){
+        _floatRetryHlsWarmup(panel, vEl, id).catch(()=>{});
+        vEl._floatWarmupRetries = 0;
+      }
+      return;
+    }
+    if (idleMs > 1800 && Math.abs(ct - lastT) < 0.12){
+      stuck += 1;
+      vEl._floatPlaybackStuck = true;
+      apiReportHlsPlayhead(id, ct, "preview");
+      if (hasBufferedAhead && stuck >= 1){
+        _floatNudgePlayback(vEl, stuck >= 2 ? "watchdog-stuck-buffered" : "watchdog-stuck");
+        stuck = 0;
+        lastT = Number(vEl.currentTime) || ct;
+        lastWall = now;
+        return;
+      }
+      if (vEl._hls){
+        try { vEl._hls.startLoad(); } catch(_){}
+        if (stuck >= 2){ try { vEl._hls.recoverMediaError(); } catch(_){} }
+      }
+      if (stuck >= 2) vEl.play().catch(()=>{});
+    } else if (Math.abs(ct - lastT) >= 0.12) {
+      stuck = 0;
+      vEl._floatPlaybackStuck = false;
+      vEl._floatLastMoveAt = now;
+    }
+    lastT = ct;
+    lastWall = now;
+  }, 1500);
+  (panel._floatCleanups = panel._floatCleanups || []).push(()=> clearInterval(watchdog));
+}
+
+async function exitPlayerOrClosePopout(){
+  await exitPlayer();
+  if (POPOUT_MODE){
+    if (POPOUT_EMBED && window.parent !== window){
+      try{
+        window.parent.postMessage({ type:"watch-close", vid: POPOUT_VID }, window.location.origin);
+      }catch(_){}
+      return;
+    }
+    try { window.close(); } catch(_){}
+  }
+}
 
 const watchedCache = new Map();
 function isWatched(id){ return watchedCache.get(String(id)) === true; }
@@ -316,6 +1462,111 @@ function apiClearProgress(id){
       body: JSON.stringify(body),
     }).catch(()=>{});
   }catch(_){}
+}
+
+function apiHlsStop(id, tier = "preview"){
+  const body = { id: String(id), tier: tier === "preview" ? "preview" : "full" };
+  if (_beaconJson("/api/hls/stop", body)) return;
+  try{
+    fetch("/api/hls/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify(body),
+    }).catch(()=>{});
+  }catch(_){}
+}
+
+function apiHlsStopAll(tier = "preview"){
+  const body = { tier: tier === "preview" ? "preview" : "full" };
+  if (_beaconJson("/api/hls/stop-all", body)) return;
+  try{
+    fetch("/api/hls/stop-all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify(body),
+    }).catch(()=>{});
+  }catch(_){}
+}
+
+function apiHlsResume(id, tier = "preview"){
+  const body = { id: String(id), tier: tier === "preview" ? "preview" : "full" };
+  try{
+    fetch("/api/hls/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify(body),
+    }).catch(()=>{});
+  }catch(_){}
+}
+
+function apiHlsPriority(id, priority, tier = "preview"){
+  const body = {
+    id: String(id),
+    priority: Number(priority) || 0,
+    tier: tier === "preview" ? "preview" : "full",
+  };
+  try{
+    fetch("/api/hls/priority", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify(body),
+    }).catch(()=>{});
+  }catch(_){}
+}
+
+async function refreshFloatHlsCapacity(){
+  try{
+    const r = await fetch("/api/hls/capacity?tier=preview", { cache: "no-store", credentials: "same-origin" });
+    if (!r.ok) return;
+    const j = await r.json();
+    const n = Number(j.concurrent_max);
+    if (Number.isFinite(n) && n > 0){
+      _floatConcurrentHlsMax = Math.floor(n);
+      reconcileFloatLoadPriority();
+    }
+  }catch(_){}
+}
+
+function apiReportHlsPlayhead(id, position, tier = "full"){
+  const body = {
+    id: String(id),
+    position: Math.max(0, Number(position) || 0),
+    tier: tier === "preview" ? "preview" : "full",
+  };
+  if (_beaconJson("/api/hls/playhead", body)) return;
+  try{
+    fetch("/api/hls/playhead", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify(body),
+    }).catch(()=>{});
+  }catch(_){}
+}
+
+let _popoutPlayheadVideo = null;
+function installPopoutPlayheadReporter(vEl){
+  if (!POPOUT_MODE || !vEl) return;
+  if (_popoutPlayheadVideo === vEl) return;
+  _popoutPlayheadVideo = vEl;
+  let lastAt = 0, lastPos = -1;
+  vEl.addEventListener("timeupdate", ()=>{
+    if (!isPlayerActive()) return;
+    const curId = player?.ids?.[player.index];
+    if (!curId) return;
+    const now = Date.now();
+    if (now - lastAt < 2500) return;
+    const pos = Number(vEl.currentTime);
+    if (!Number.isFinite(pos)) return;
+    if (Math.abs(pos - lastPos) < 0.5) return;
+    lastAt = now;
+    lastPos = pos;
+    apiReportHlsPlayhead(curId, pos);
+  });
 }
 function getLocalProgress(id){
   const p = progressLocalCache.get(String(id));
@@ -526,9 +1777,15 @@ function requestPlayerFullscreen({ requireActivation=false, showError=false } = 
           showNotice("全屏需要由点击触发，请再点一次全屏按钮");
           setTimeout(clearNotice, 1800);
         }
-      }).finally(()=> renderCustomControls(true));
+      }).finally(()=>{
+        adjustFSViewport();
+        renderCustomControls(true);
+      });
     } else {
-      setTimeout(()=> renderCustomControls(true), 0);
+      setTimeout(()=>{
+        adjustFSViewport();
+        renderCustomControls(true);
+      }, 0);
     }
     return true;
   }catch(_){
@@ -814,15 +2071,17 @@ function ensureCustomPlayerControls(){
     <button class="cpc-btn cpc-prev" type="button" aria-label="上一曲" hidden>${cpcIcon("previous")}</button>
     <button class="cpc-play" type="button" aria-label="播放">${cpcIcon("play")}</button>
     <button class="cpc-btn cpc-next" type="button" aria-label="下一曲" hidden>${cpcIcon("next")}</button>
-    <div class="cpc-time cpc-current">0:00</div>
-    <div class="cpc-seek" role="slider" aria-label="播放进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
-      <div class="cpc-track">
-        <div class="cpc-buffered"></div>
-        <div class="cpc-played"></div>
-        <div class="cpc-thumb"></div>
+    <div class="cpc-row-time">
+      <div class="cpc-time cpc-current">0:00</div>
+      <div class="cpc-seek" role="slider" aria-label="播放进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+        <div class="cpc-track">
+          <div class="cpc-buffered"></div>
+          <div class="cpc-played"></div>
+          <div class="cpc-thumb"></div>
+        </div>
       </div>
+      <div class="cpc-time cpc-duration">--:--</div>
     </div>
-    <div class="cpc-time cpc-duration">--:--</div>
     <button class="cpc-btn cpc-mute" type="button" aria-label="静音">${cpcIcon("volume")}</button>
     <input class="cpc-volume" type="range" min="0" max="100" value="80" aria-label="音量">
     <button class="cpc-btn cpc-rate" type="button" aria-label="倍速">1x</button>
@@ -1079,6 +2338,97 @@ function fmtDate(ts){ return new Date(ts*1000).toLocaleString(); }
 function tileMetaHtml(v){
   return `<span class="meta-date">${_escHtml(fmtDate(v.mtime))}</span><span class="meta-sep">·</span><span class="meta-size">${_escHtml(fmtSize(v.size))}</span>`;
 }
+function tileAuthorHtml(v){
+  return _escHtml(String(v?.author || "").trim());
+}
+function tileSelectionInside(tileEl){
+  if (!tileEl) return false;
+  const sel = window.getSelection && window.getSelection();
+  if (!sel || sel.isCollapsed) return false;
+  const anchor = sel.anchorNode;
+  const focus = sel.focusNode;
+  return (anchor && tileEl.contains(anchor)) || (focus && tileEl.contains(focus));
+}
+function tileTextFieldFromNode(node){
+  if (!node) return null;
+  const el = node.nodeType === 3 ? node.parentElement : node;
+  return el && el.closest ? el.closest(".tile .title, .tile .author") : null;
+}
+function tileTextSelectionActive(){
+  const sel = window.getSelection && window.getSelection();
+  if (!sel || sel.isCollapsed) return false;
+  return !!(tileTextFieldFromNode(sel.anchorNode) || tileTextFieldFromNode(sel.focusNode));
+}
+const _tileTextPick = { tileEl: null, suppressClick: false, dragging: false, picking: false, startX: 0, startY: 0 };
+function shouldIgnoreTileClick(t){
+  if (!t?.el) return false;
+  if (_tileTextPick.suppressClick && _tileTextPick.tileEl === t.el) return true;
+  if (!tileTextSelectionActive()) return false;
+  const sel = window.getSelection && window.getSelection();
+  if (!sel) return false;
+  const anchorTile = tileTextFieldFromNode(sel.anchorNode)?.closest(".tile");
+  const focusTile = tileTextFieldFromNode(sel.focusNode)?.closest(".tile");
+  return anchorTile === t.el || focusTile === t.el;
+}
+function clearTileTextSelection(){
+  try {
+    const sel = window.getSelection && window.getSelection();
+    if (sel) sel.removeAllRanges();
+  } catch(_){}
+  clearTileTextPickSuppress();
+  _tileTextPick.picking = false;
+  _tileTextPick.dragging = false;
+}
+function clearTileTextPickSuppress(){
+  _tileTextPick.suppressClick = false;
+  _tileTextPick.tileEl = null;
+}
+function installTileTextPickGuard(gridEl){
+  if (!gridEl || gridEl._textPickBound) return;
+  gridEl._textPickBound = true;
+
+  const clearSelectionIfOutsideText = (ev)=>{
+    if (ev.button !== 0) return;
+    if (ev.target.closest(".tile .title, .tile .author")) return;
+    if (tileTextSelectionActive()) clearTileTextSelection();
+  };
+
+  if (!document._tileTextPickDocBound) {
+    document._tileTextPickDocBound = true;
+    document.addEventListener("mousedown", clearSelectionIfOutsideText, true);
+  }
+
+  gridEl.addEventListener("mousedown", (ev)=>{
+    if (ev.button !== 0) return;
+    const textEl = ev.target.closest(".tile .title, .tile .author");
+    if (!textEl) return;
+    const tileEl = textEl.closest(".tile");
+    if (!tileEl) return;
+    _tileTextPick.picking = true;
+    _tileTextPick.dragging = false;
+    _tileTextPick.suppressClick = false;
+    _tileTextPick.tileEl = tileEl;
+    _tileTextPick.startX = ev.clientX;
+    _tileTextPick.startY = ev.clientY;
+  }, true);
+  gridEl.addEventListener("mousemove", (ev)=>{
+    if (!_tileTextPick.picking) return;
+    if (Math.abs(ev.clientX - _tileTextPick.startX) > 2 || Math.abs(ev.clientY - _tileTextPick.startY) > 2) {
+      _tileTextPick.dragging = true;
+    }
+  }, true);
+  gridEl.addEventListener("mouseup", ()=>{
+    if (!_tileTextPick.picking) return;
+    const tileEl = _tileTextPick.tileEl;
+    const dragged = _tileTextPick.dragging;
+    _tileTextPick.picking = false;
+    _tileTextPick.dragging = false;
+    if (dragged || tileSelectionInside(tileEl)) {
+      _tileTextPick.suppressClick = true;
+      _tileTextPick.tileEl = tileEl;
+    }
+  }, true);
+}
 function ratingBadgeInfo(rating){
   const raw = String(rating || "").trim();
   const low = raw.toLowerCase();
@@ -1144,13 +2494,29 @@ async function apiCreateFolder(parent, title){
   }).catch(()=>null);
   return !!(r && r.ok);
 }
-async function apiMove(ids, dest_path){
+async function apiMoveDetailed(payload, dest_path){
+  const p = normalizeMovePayload(payload);
   const r = await fetch("/api/move", {
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ ids: ids.map(String), dest_path })
+    body: JSON.stringify({ ids: p.ids, folder_paths: p.folderPaths, dest_path: dest_path || "/" })
   }).catch(()=>null);
-  return !!(r && r.ok);
+  if (!r || !r.ok) return { ok: false, moved: 0, moved_folders: 0 };
+  const j = await r.json().catch(()=>({}));
+  return {
+    ok: true,
+    moved: Number(j.moved) || 0,
+    moved_folders: Number(j.moved_folders) || 0,
+  };
+}
+function moveResultOk(payload, result){
+  const idsOk = !payload.ids.length || result.moved > 0;
+  const foldersOk = !payload.folderPaths.length || result.moved_folders > 0;
+  return idsOk && foldersOk;
+}
+async function apiMove(payload, dest_path){
+  const r = await apiMoveDetailed(payload, dest_path);
+  return r.ok && moveResultOk(normalizeMovePayload(payload), r);
 }
 
 /* ====================== 视频修复（针对“固定秒数卡住”） ====================== */
@@ -1317,7 +2683,171 @@ async function showFolderPicker(anchorX, anchorY, onPick){
   fp.style.top  = Math.min(Math.max(8, anchorY), vh - h - 8) + "px";
   setTimeout(()=> document.addEventListener("click", _fpClickAway, {capture:true}), 0);
 }
-// ★ 新增：根据所选收集视频 ID（可含文件夹→展开）
+// ★ 新增：根据所选收集移动载荷（视频 id + 文件夹路径，文件夹不展开）
+function collectMovePayload(){
+  return {
+    ids: Array.from(state.selV).map(String).filter(Boolean),
+    folderPaths: Array.from(state.selF).map(String).filter(Boolean),
+  };
+}
+function normalizeMovePayload(arg){
+  if (Array.isArray(arg)) return { ids: arg.map(String).filter(Boolean), folderPaths: [] };
+  return {
+    ids: (arg?.ids || []).map(String).filter(Boolean),
+    folderPaths: (arg?.folderPaths || arg?.folder_paths || []).map(String).filter(Boolean),
+  };
+}
+function movePayloadEmpty(payload){
+  return !(payload.ids.length || payload.folderPaths.length);
+}
+function folderDropDestValid(destPath, payload){
+  const dest = String(destPath || "/").replace(/\/+$/, "") || "/";
+  for (const raw of payload.folderPaths || []){
+    const fp = String(raw).replace(/\/+$/, "") || "/";
+    if (fp === dest) return false;
+    if (dest.startsWith(fp + "/")) return false;
+  }
+  return true;
+}
+
+/* ===================== 移动撤销（双击 Esc） ===================== */
+const MOVE_UNDO_ESC_MS = 450;
+const MOVE_UNDO_TTL_MS = 10 * 60 * 1000;
+let moveUndoState = null;
+let moveUndoBusy = false;
+
+function folderPathAfterMove(srcPath, destPath){
+  const name = String(srcPath || "").split("/").filter(Boolean).pop();
+  if (!name) return String(srcPath || "/");
+  const dest = String(destPath || "/").replace(/\/+$/, "") || "/";
+  if (dest === "/") return "/" + name;
+  return dest + "/" + name;
+}
+function folderParentPath(path){
+  const parts = String(path || "/").split("/").filter(Boolean);
+  if (parts.length <= 1) return "/";
+  return "/" + parts.slice(0, -1).join("/");
+}
+function captureMoveUndoRecord(payload, destPath, fromPath){
+  return {
+    ids: [...payload.ids],
+    folderSources: [...payload.folderPaths],
+    destPath: destPath || "/",
+    fromPath: fromPath || state.path || "/",
+    ts: Date.now(),
+  };
+}
+async function undoLastMove(){
+  if (moveUndoBusy) return;
+  const record = moveUndoState;
+  if (!record){
+    showNotice("没有可撤销的移动");
+    setTimeout(clearNotice, 1600);
+    return;
+  }
+  if (Date.now() - record.ts > MOVE_UNDO_TTL_MS){
+    moveUndoState = null;
+    showNotice("撤销已过期");
+    setTimeout(clearNotice, 1800);
+    return;
+  }
+
+  moveUndoBusy = true;
+  moveUndoState = null;
+  primeBusy("正在撤销移动…");
+  let ok = true;
+  try{
+    if (record.ids.length){
+      const r = await apiMoveDetailed({ ids: record.ids, folderPaths: [] }, record.fromPath);
+      ok = r.ok && r.moved > 0;
+    }
+    for (const src of record.folderSources){
+      const current = folderPathAfterMove(src, record.destPath);
+      const backTo = folderParentPath(src);
+      const r = await apiMoveDetailed({ ids: [], folderPaths: [current] }, backTo);
+      if (!r.ok || r.moved_folders < 1) ok = false;
+    }
+  }catch(_){
+    ok = false;
+  }
+  hideBusy();
+  moveUndoBusy = false;
+
+  if (!ok){
+    moveUndoState = record;
+    showNotice("撤销失败，请重试");
+    setTimeout(clearNotice, 2200);
+    return;
+  }
+
+  showNotice("已撤销上一次移动");
+  setTimeout(clearNotice, 2000);
+  await changeContext({});
+}
+function installMoveUndoHotkey(){
+  if (installMoveUndoHotkey._bound) return;
+  installMoveUndoHotkey._bound = true;
+  let lastEsc = 0;
+  window.addEventListener("keydown", (ev)=>{
+    if (ev.key !== "Escape") return;
+    if (WALLPAPER_MODE) return;
+    if (typeof isPlayerActive === "function" && isPlayerActive()) return;
+    const tag = String(ev.target?.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (ev.target?.isContentEditable) return;
+    const now = Date.now();
+    if (now - lastEsc <= MOVE_UNDO_ESC_MS){
+      lastEsc = 0;
+      ev.preventDefault();
+      ev.stopPropagation();
+      void undoLastMove();
+    } else {
+      lastEsc = now;
+    }
+  }, { capture: true });
+}
+
+async function buildMoveSubmenuEntries(payload){
+  const p = normalizeMovePayload(payload);
+  if (movePayloadEmpty(p)){
+    return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
+  }
+  const entries = [];
+  if (folderDropDestValid("/", p)){
+    entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(p, "/"); } });
+  }
+  const cur = String(state.path || "/").replace(/\/+$/, "") || "/";
+  if (cur !== "/"){
+    const parts = cur.split("/").filter(Boolean);
+    const parentPath = parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/";
+    if (parentPath !== "/" && folderDropDestValid(parentPath, p)){
+      entries.push({
+        text: `上一层 (${parentPath})`,
+        fn: async ()=>{ await moveIdsAndRefresh(p, parentPath); },
+      });
+    }
+  }
+  const tree = flattenFolderTree(await getFoldersMenuTree());
+  const MAX = 240;
+  for (let i=0;i<tree.length && i<MAX;i++){
+    const n = tree[i];
+    if (!folderDropDestValid(n.path, p)) continue;
+    const indent = "　".repeat(Math.min(10, n.depth||0));
+    const label = `${indent}${n.title} (${n.path})`;
+    entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(p, n.path); } });
+  }
+  if (!entries.length){
+    return [{ text:"（没有可用的目标位置）", fn: ()=>{} }];
+  }
+  return entries;
+}
+function moveSubmenuLoader(getPayload){
+  return async ()=>{
+    const payload = typeof getPayload === "function" ? getPayload() : getPayload;
+    return buildMoveSubmenuEntries(payload);
+  };
+}
+// ★ 新增：根据所选收集视频 ID（可含文件夹→展开，供删除/取消订阅等）
 async function collectSelectedIds(){
   const ids = new Set();
   for (const id of state.selV) ids.add(String(id));
@@ -1329,20 +2859,442 @@ async function collectSelectedIds(){
 }
 // ★ 新增：移动并刷新
 
-async function moveIdsAndRefresh(ids, destPath){
-  if (!ids.length) { alert("没有可移动的条目"); return; }
-  const samePath = (destPath === state.path);
+async function moveIdsAndRefresh(payloadOrIds, destPath, opts={}){
+  const payload = normalizeMovePayload(payloadOrIds);
+  if (movePayloadEmpty(payload)){ alert("没有可移动的条目"); return false; }
+  if (!folderDropDestValid(destPath, payload)){
+    showNotice("无法移动到该位置");
+    setTimeout(clearNotice, 1800);
+    return false;
+  }
+  if (moveUndoBusy) return false;
+  const undoSnap = opts.skipUndoRecord ? null : captureMoveUndoRecord(payload, destPath, state.path);
   primeBusy("正在移动…");
-  const ok = await apiMove(ids, destPath);
+  const result = await apiMoveDetailed(payload, destPath);
   hideBusy();
-  if (!ok){ alert("移动失败，请重试"); return; }
-  showNotice(`已移动到：${destPath}`);
-  setTimeout(clearNotice, 1200);
-  if (!samePath){
-    removeTilesByVideoIds(ids);
+  if (!result.ok || !moveResultOk(payload, result)){
+    alert("移动失败，请重试");
+    return false;
+  }
+  if (!opts.skipUndoRecord) moveUndoState = undoSnap;
+  showNotice(`已移动到：${destPath}（双击 Esc 撤销）`);
+  setTimeout(clearNotice, 2800);
+  payload.ids.forEach(id=>{ try{ closeWatchFloatPanel(String(id)); }catch(_){} });
+  if (payload.folderPaths.length){
+    await changeContext({});
+  } else if (destPath !== state.path){
+    removeTilesByVideoIds(payload.ids);
   }
   clearSel();
+  return true;
 }
+
+/* ===================== 拖拽到文件夹（等同右键「移动到」） ===================== */
+const FOLDER_DROP_ARM_MS = 680;
+const FOLDER_DROP_THRESHOLD = 12;
+const folderDrop = {
+  pending: false,
+  active: false,
+  pointerId: null,
+  startX: 0,
+  startY: 0,
+  ids: null,
+  payload: null,
+  idsPreset: null,
+  dragSourceTile: null,
+  panel: null,
+  ghost: null,
+  sourcePayload: null,
+  armRequired: false,
+  targetEl: null,
+  targetPath: null,
+  armTimer: null,
+  armed: false,
+  suppressClickUntil: 0,
+  _move: null,
+  _up: null,
+  _cancel: null,
+};
+
+function folderDropTileAt(x, y){
+  let el = null;
+  try{ el = document.elementFromPoint(x, y); }catch(_){}
+  if (!el) return null;
+  const tileEl = el.closest(".tile.folder, .tile.parent-folder");
+  if (!tileEl) return null;
+  const t = getTile(tileEl);
+  if (!t || (t.type !== "folder" && t.type !== "parent")) return null;
+  return t;
+}
+
+function folderDropFolderValid(t){
+  return !!(t && !state.selF.has(t.path || "/"));
+}
+
+function folderDropRemoveMeter(el){
+  if (!el) return;
+  el.querySelector(".folder-drop-meter")?.remove();
+}
+
+function folderDropClearTarget(){
+  if (folderDrop.armTimer){
+    clearTimeout(folderDrop.armTimer);
+    folderDrop.armTimer = null;
+  }
+  if (folderDrop.targetEl){
+    folderDrop.targetEl.classList.remove("folder-drop-hover", "folder-drop-armed");
+    folderDropRemoveMeter(folderDrop.targetEl);
+  }
+  folderDrop.targetEl = null;
+  folderDrop.targetPath = null;
+  folderDrop.armed = false;
+}
+
+function folderDropAddMeter(el){
+  folderDropRemoveMeter(el);
+  const meter = document.createElement("div");
+  meter.className = "folder-drop-meter";
+  meter.innerHTML = `<div class="folder-drop-meter-bar"></div><span class="folder-drop-meter-label">悬停放入…</span>`;
+  el.appendChild(meter);
+}
+
+function folderDropSetTarget(t){
+  const path = t.path || "/";
+  if (state.selF.has(path)) return;
+  folderDrop.targetEl = t.el;
+  folderDrop.targetPath = path;
+  if (!folderDrop.armRequired){
+    folderDrop.armed = true;
+    t.el.classList.add("folder-drop-armed");
+    return;
+  }
+  t.el.classList.add("folder-drop-hover");
+  folderDropAddMeter(t.el);
+  folderDrop.armTimer = setTimeout(()=>{
+    if (folderDrop.targetEl !== t.el) return;
+    folderDrop.armed = true;
+    t.el.classList.remove("folder-drop-hover");
+    t.el.classList.add("folder-drop-armed");
+    const label = t.el.querySelector(".folder-drop-meter-label");
+    if (label) label.textContent = "松手放入 ✓";
+  }, FOLDER_DROP_ARM_MS);
+}
+
+function folderDropUpdateTarget(x, y){
+  const t = folderDropTileAt(x, y);
+  const path = t ? (t.path || "/") : null;
+  if (folderDrop.targetEl === (t?.el || null) && folderDrop.targetPath === path) return;
+  folderDropClearTarget();
+  if (!t || !path) return;
+  folderDropSetTarget(t);
+}
+
+function folderDropFindVideoTile(id){
+  return (state.tiles || []).find(t => t && t.type === "video" && String(t.vid) === String(id)) || null;
+}
+
+function folderDropPreviewCardForId(id, stackIndex){
+  const card = document.createElement("div");
+  card.className = "folder-drop-ghost-card";
+  card.style.setProperty("--stack-i", String(stackIndex));
+
+  const tile = folderDropFindVideoTile(id);
+  if (tile?.el){
+    const thumbImg = tile.el.querySelector(".thumb img");
+    if (thumbImg?.src){
+      const img = document.createElement("img");
+      img.src = thumbImg.src;
+      img.alt = "";
+      img.draggable = false;
+      card.appendChild(img);
+      return card;
+    }
+  }
+
+  const panel = folderDrop.panel;
+  if (panel && String(panel.dataset.vid || "") === String(id)){
+    const video = panel.querySelector("video.watch-float-video");
+    if (video && video.videoWidth > 0 && video.videoHeight > 0){
+      try{
+        const c = document.createElement("canvas");
+        const aspect = video.videoWidth / video.videoHeight;
+        c.height = 88;
+        c.width = Math.max(48, Math.round(c.height * aspect));
+        c.getContext("2d")?.drawImage(video, 0, 0, c.width, c.height);
+        const img = document.createElement("img");
+        img.src = c.toDataURL("image/jpeg", 0.72);
+        img.alt = "";
+        img.draggable = false;
+        card.appendChild(img);
+        return card;
+      }catch(_){}
+    }
+    const title = panel.querySelector(".watch-float-title")?.textContent?.trim();
+    card.innerHTML = `<div class="folder-drop-ghost-float-label">${_escHtml(title || "视频")}</div>`;
+    return card;
+  }
+
+  const title = tile?.title || `视频 ${id}`;
+  card.innerHTML = `<div class="folder-drop-ghost-float-label">${_escHtml(title)}</div>`;
+  return card;
+}
+
+function folderDropSetSourceDim(payload, on){
+  const p = normalizeMovePayload(payload);
+  const set = new Set(p.ids);
+  for (const t of state.tiles || []){
+    if (t?.type === "video" && set.has(String(t.vid))){
+      t.el?.classList.toggle("folder-drop-source-dim", on);
+    }
+    if (t?.type === "folder" && p.folderPaths.includes(String(t.path))){
+      t.el?.classList.toggle("folder-drop-source-dim", on);
+    }
+  }
+  if (folderDrop.panel){
+    const pid = String(folderDrop.panel.dataset.vid || "");
+    if (!on || set.has(pid)){
+      folderDrop.panel.classList.toggle("folder-drop-source-dim", on);
+    }
+  }
+}
+
+function folderDropPreviewCardForFolder(path, stackIndex){
+  const card = document.createElement("div");
+  card.className = "folder-drop-ghost-card";
+  card.style.setProperty("--stack-i", String(stackIndex));
+  const tile = (state.tiles || []).find(t => t.type === "folder" && t.path === path);
+  const title = tile?.title || String(path).split("/").filter(Boolean).pop() || "文件夹";
+  card.innerHTML = `<div class="folder-drop-ghost-float-label">📁 ${_escHtml(title)}</div>`;
+  return card;
+}
+
+function folderDropCreateGhost(payload, opts={}){
+  folderDrop.ghost?.remove();
+  const p = normalizeMovePayload(payload);
+  const folderPaths = [...new Set(p.folderPaths)];
+  const ids = [...new Set(p.ids)];
+  const stackItems = [
+    ...folderPaths.map(path => ({ kind:"folder", path })),
+    ...ids.map(id => ({ kind:"video", id })),
+  ];
+  const count = stackItems.length;
+  folderDrop.sourcePayload = { ids, folderPaths };
+
+  const g = document.createElement("div");
+  g.className = "folder-drop-ghost";
+  const inner = document.createElement("div");
+  inner.className = "folder-drop-ghost-inner";
+
+  const stack = document.createElement("div");
+  stack.className = "folder-drop-ghost-stack";
+  const stackCount = Math.min(3, count);
+  for (let i = 0; i < stackCount; i++){
+    const item = stackItems[i];
+    stack.appendChild(item.kind === "folder"
+      ? folderDropPreviewCardForFolder(item.path, i)
+      : folderDropPreviewCardForId(item.id, i));
+  }
+  inner.appendChild(stack);
+
+  if (count > 1){
+    const badge = document.createElement("span");
+    badge.className = "folder-drop-ghost-badge";
+    badge.textContent = String(count);
+    inner.appendChild(badge);
+  }
+
+  const caption = document.createElement("span");
+  caption.className = "folder-drop-ghost-caption";
+  if (count > 1){
+    caption.textContent = `移动 ${count} 项`;
+  } else if (stackItems[0]?.kind === "folder"){
+    const tile = (state.tiles || []).find(t => t.type === "folder" && t.path === stackItems[0].path);
+    caption.textContent = tile?.title || "文件夹";
+  } else {
+    const primary = folderDropFindVideoTile(stackItems[0]?.id);
+    caption.textContent = primary?.title || folderDrop.panel?.querySelector(".watch-float-title")?.textContent?.trim() || "移动";
+  }
+  inner.appendChild(caption);
+
+  g.appendChild(inner);
+  document.body.appendChild(g);
+  folderDrop.ghost = g;
+  if (!opts.skipSourceDim) folderDropSetSourceDim({ ids, folderPaths }, true);
+}
+
+function folderDropMoveGhost(x, y){
+  if (!folderDrop.ghost) return;
+  folderDrop.ghost.style.transform = `translate(${x + 14}px, ${y + 12}px)`;
+}
+
+function folderDropCleanupListeners(){
+  if (folderDrop._move) document.removeEventListener("pointermove", folderDrop._move);
+  if (folderDrop._up) document.removeEventListener("pointerup", folderDrop._up);
+  if (folderDrop._cancel) document.removeEventListener("pointercancel", folderDrop._cancel);
+  folderDrop._move = folderDrop._up = folderDrop._cancel = null;
+}
+
+function folderDropCancelVisual(){
+  folderDropClearTarget();
+  if (folderDrop.sourcePayload) folderDropSetSourceDim(folderDrop.sourcePayload, false);
+  folderDrop.sourcePayload = null;
+  folderDrop.ghost?.remove();
+  folderDrop.ghost = null;
+  folderDrop.panel?.classList.remove("folder-drop-dragging", "folder-drop-source-dim");
+  document.body.classList.remove("folder-drop-active");
+}
+
+function folderDropReset(){
+  folderDropCleanupListeners();
+  folderDropCancelVisual();
+  folderDrop.pending = false;
+  folderDrop.active = false;
+  folderDrop.pointerId = null;
+  folderDrop.ids = null;
+  folderDrop.payload = null;
+  folderDrop.idsPreset = null;
+  folderDrop.dragSourceTile = null;
+  folderDrop.panel = null;
+  folderDrop.armRequired = false;
+}
+
+async function folderDropResolvePayload(){
+  if (folderDrop.idsPreset?.length){
+    return { ids: folderDrop.idsPreset.map(String).filter(Boolean), folderPaths: [] };
+  }
+  const src = folderDrop.dragSourceTile;
+  if (src?.type === "folder"){
+    return { ids: [], folderPaths: [String(src.path)] };
+  }
+  if (src?.type === "video"){
+    return { ids: [String(src.vid)], folderPaths: [] };
+  }
+  return collectMovePayload();
+}
+
+async function folderDropActivate(ev){
+  if (folderDrop.active) return;
+  folderDrop.pending = false;
+  folderDrop.active = true;
+  folderDrop.suppressClickUntil = Date.now() + 400;
+  document.body.classList.add("folder-drop-active");
+  folderDrop.panel?.classList.add("folder-drop-dragging");
+
+  const payload = await folderDropResolvePayload();
+  if (movePayloadEmpty(payload)){
+    folderDropReset();
+    return;
+  }
+  folderDrop.payload = payload;
+  folderDropCreateGhost(payload);
+  try{ document.body.setPointerCapture(ev.pointerId); }catch(_){}
+  folderDropMoveGhost(ev.clientX, ev.clientY);
+}
+
+async function folderDropFinish(x, y){
+  const t = folderDropTileAt(x, y);
+  const path = t ? (t.path || "/") : null;
+  const payload = folderDrop.payload || normalizeMovePayload([]);
+  const canDrop = folderDrop.armed || !folderDrop.armRequired;
+
+  if (canDrop && path && !movePayloadEmpty(payload) && folderDrop.targetPath === path && folderDropDestValid(path, payload)){
+    t.el.classList.add("folder-drop-success");
+    setTimeout(()=> t.el.classList.remove("folder-drop-success"), 500);
+    await moveIdsAndRefresh(payload, path);
+  } else if (folderDrop.active && path && folderDrop.armRequired && !folderDrop.armed){
+    showNotice("悬停文件夹约 0.7 秒后再松手");
+    setTimeout(clearNotice, 1800);
+  }
+  folderDropReset();
+}
+
+function folderDropBeginPending(ev, opts={}){
+  if (WALLPAPER_MODE) return;
+  if (folderDrop.pending || folderDrop.active) return;
+  if (state.dragging) return;
+
+  folderDrop.pending = true;
+  folderDrop.pointerId = ev.pointerId;
+  folderDrop.startX = ev.clientX;
+  folderDrop.startY = ev.clientY;
+  folderDrop.idsPreset = opts.ids || null;
+  folderDrop.dragSourceTile = opts.dragSourceTile || null;
+  folderDrop.panel = opts.panel || null;
+  folderDrop.armRequired = !!opts.armRequired;
+
+  const onMove = (e)=>{
+    if (!folderDrop.pending && !folderDrop.active) return;
+    if (e.pointerId !== folderDrop.pointerId) return;
+    const dx = e.clientX - folderDrop.startX;
+    const dy = e.clientY - folderDrop.startY;
+    if (!folderDrop.active){
+      if (Math.hypot(dx, dy) < FOLDER_DROP_THRESHOLD) return;
+      folderDropActivate(e);
+      return;
+    }
+    if (folderDrop.active){
+      e.preventDefault();
+      folderDropMoveGhost(e.clientX, e.clientY);
+      folderDropUpdateTarget(e.clientX, e.clientY);
+    }
+  };
+
+  const onUp = (e)=>{
+    if (e.pointerId !== folderDrop.pointerId) return;
+    if (folderDrop.active) e.preventDefault();
+    const wasActive = folderDrop.active;
+    const x = e.clientX, y = e.clientY;
+    folderDropCleanupListeners();
+    if (wasActive) folderDropFinish(x, y);
+    else folderDropReset();
+  };
+
+  const onCancel = (e)=>{
+    if (e.pointerId !== folderDrop.pointerId) return;
+    folderDropReset();
+  };
+
+  folderDrop._move = onMove;
+  folderDrop._up = onUp;
+  folderDrop._cancel = onCancel;
+  document.addEventListener("pointermove", onMove, { passive:false });
+  document.addEventListener("pointerup", onUp);
+  document.addEventListener("pointercancel", onCancel);
+}
+
+function onFolderDropTilePointerDown(ev){
+  if (ev.button !== 0) return;
+  const thumbEl = ev.target.closest(".tile .thumb");
+  if (!thumbEl) return;
+  const tileEl = thumbEl.closest(".tile");
+  if (!tileEl) return;
+  const t = getTile(tileEl);
+  if (!t || (t.type !== "video" && t.type !== "folder")) return;
+
+  const totalSel = state.selV.size + state.selF.size;
+  const multiSel = isSel(t) && totalSel > 1;
+  if (multiSel){
+    folderDropBeginPending(ev, { armRequired: false });
+    return;
+  }
+  if (t.type === "video"){
+    folderDropBeginPending(ev, { armRequired: false, ids: [String(t.vid)] });
+    return;
+  }
+  folderDropBeginPending(ev, { armRequired: false, dragSourceTile: t });
+}
+
+function installFolderDrop(){
+  if (installFolderDrop._bound) return;
+  installFolderDrop._bound = true;
+  const g = grid();
+  if (g) g.addEventListener("pointerdown", onFolderDropTilePointerDown, { capture:true });
+}
+
+function folderDropShouldSuppressClick(){
+  return Date.now() < folderDrop.suppressClickUntil || folderDrop.active;
+}
+
 // ★ 新增：在指定父路径下创建文件夹
 async function promptCreateFolder(parentPath){
   const name = sanitizeFolderTitle(prompt(`在「${parentPath}」下新建文件夹：`, ""));
@@ -1482,7 +3434,7 @@ async function loadNextPage(){
 
     if (data.total_items === 0 && state.page === 2 && !state.q) showDiagIfEmpty();
 
-    bindDelegatedEvents(); bindRubber(); schedulePrefetch();
+    bindDelegatedEvents(); bindRubber(); installFolderDrop(); schedulePrefetch();
   }catch{ setInfStatus("加载失败，请重试"); }
   finally{ state.isLoading=false; queueMicrotask(()=>autoFillViewport(3)); }
 }
@@ -1542,6 +3494,7 @@ function appendTiles(data){
                     </div>
                     <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
                     <div class="title" data-full-title="${_escHtml(v.title)}">${v.title}</div>
+                    <div class="author" data-full-author="${_escHtml(v.author || "")}">${tileAuthorHtml(v)}</div>
                     <div class="meta">${tileMetaHtml(v)}</div>
                     <button class="tile-menu" title="菜单">⋮</button>`;
     grid().appendChild(el); state.tiles.push({el, type:"video", vid:v.id, idx, title:v.title}); idx++;
@@ -1636,6 +3589,7 @@ function createTileFromSpec(spec, idx){
                   </div>
                   <button class="watched-btn ${done?'on':'off'}" aria-label="切换观看状态" aria-pressed="${done?'true':'false'}" title="${done?'点击标记为未观看':'点击标记为已观看'}">✓</button>
                   <div class="title" data-full-title="${_escHtml(v.title)}">${v.title}</div>
+                  <div class="author" data-full-author="${_escHtml(v.author || "")}">${tileAuthorHtml(v)}</div>
                   <div class="meta">${tileMetaHtml(v)}</div>
                   <button class="tile-menu" title="菜单">⋮</button>`;
   return { el, type:"video", vid:String(v.id), idx, title:v.title };
@@ -1648,11 +3602,17 @@ function updateTileFromSpec(tile, spec, idx){
     tile.vid = String(v.id);
     tile.title = v.title;
     const titleEl = tile.el && tile.el.querySelector(".title");
+    const authorEl = tile.el && tile.el.querySelector(".author");
     const metaEl = tile.el && tile.el.querySelector(".meta");
     const badgeEl = tile.el && tile.el.querySelector(".rating-badge");
     if (titleEl) {
       if (titleEl.textContent !== v.title) titleEl.textContent = v.title;
       titleEl.dataset.fullTitle = v.title || "";
+    }
+    if (authorEl) {
+      const author = String(v.author || "").trim();
+      if (authorEl.textContent !== author) authorEl.textContent = author;
+      authorEl.dataset.fullAuthor = author;
     }
     if (metaEl) metaEl.innerHTML = tileMetaHtml(v);
     if (badgeEl) {
@@ -1683,7 +3643,7 @@ function ensureTitleTip(){
   return el;
 }
 function showTitleTip(target, ev){
-  const text = target?.dataset?.fullTitle || target?.textContent || "";
+  const text = target?.dataset?.fullTitle || target?.dataset?.fullAuthor || target?.textContent || "";
   if (!text.trim()) return;
   const el = ensureTitleTip();
   titleTip.active = target;
@@ -1708,7 +3668,7 @@ function installTitleTooltip(){
   if (installTitleTooltip.installed) return;
   installTitleTooltip.installed = true;
   document.addEventListener("mouseover", (ev)=>{
-    const title = ev.target && ev.target.closest && ev.target.closest(".tile .title");
+    const title = ev.target && ev.target.closest && ev.target.closest(".tile .title, .tile .author");
     if (!title) return;
     showTitleTip(title, ev);
   });
@@ -1716,7 +3676,7 @@ function installTitleTooltip(){
     if (titleTip.active) moveTitleTip(ev);
   });
   document.addEventListener("mouseout", (ev)=>{
-    const title = ev.target && ev.target.closest && ev.target.closest(".tile .title");
+    const title = ev.target && ev.target.closest && ev.target.closest(".tile .title, .tile .author");
     if (!title) return;
     if (ev.relatedTarget && title.contains(ev.relatedTarget)) return;
     hideTitleTip();
@@ -1766,7 +3726,7 @@ async function softRefreshCurrentScanContext(){
     state.hasMore = pages.length < last.total_pages;
     setInfStatus(state.hasMore ? "下拉加载更多…" : "已到底部");
     if (videoIds.length) syncWatched(videoIds);
-    bindDelegatedEvents(); bindRubber(); resetPrefetch(); schedulePrefetch();
+    bindDelegatedEvents(); bindRubber(); installFolderDrop(); resetPrefetch(); schedulePrefetch();
     try{ window.scrollTo(scrollX, scrollY); }catch(_){}
   }catch(_){
     setInfStatus("自动更新失败，稍后重试");
@@ -1898,11 +3858,13 @@ function installPopStateGuard(){
     // During or shortly after track switching, Android Chrome may fire spurious
     // popstate events (e.g. fullscreen state changes). Block them and re-push.
     if (_switchingAdvanceLock || (Date.now() - _lastPlayIndexTS < 3000)) {
+      if (POPOUT_MODE) return;
       try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
       return;
     }
     fsOverlayInHistory = false;
-    exitPlayer();
+    if (POPOUT_MODE) exitPlayerOrClosePopout();
+    else exitPlayer();
   });
 }
 installPopStateGuard();
@@ -1951,6 +3913,10 @@ installPopStateGuard();
   function handleSwipeBack(){
     if (window.__touchLocked) return;
     if (isPlayerActive()){
+      if (POPOUT_MODE){
+        exitPlayerOrClosePopout();
+        return;
+      }
       exitPlayer();
       // 同一路径下仅退出播放器并恢复滚动，不刷新列表
       let curPath = "/";
@@ -2210,7 +4176,7 @@ function _writeLearnedMseBudget(bytes){
   }catch(_){}
 }
 
-function _computeMseBudget(env){
+function _computeMseBudget(env, instanceCount){
   const learned = _readLearnedMseBudget();
   const mobile = !!env?.is_mobile;
   const devGb = Number(env?.device_memory_gb) || (mobile ? 4 : 8);
@@ -2230,7 +4196,12 @@ function _computeMseBudget(env){
   }
   raw = Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, raw - decodeBytes);
   const cap = mobile ? HLS_MSE_BUDGET_CAP_MOBILE : HLS_MSE_BUDGET_CAP_DESKTOP;
-  let budget = Math.min(raw, cap);
+  const instances = Math.max(1, Number(instanceCount) || _playbackInstanceCount());
+  let budgetCap = cap;
+  if (instances > 1 || POPOUT_MODE){
+    budgetCap = Math.min(budgetCap, Math.floor((88 * 1024 * 1024) / instances));
+  }
+  let budget = Math.min(raw, budgetCap);
   if (learned > 0) budget = Math.min(budget, learned);
   return Math.max(HLS_MSE_BUDGET_FLOOR_BYTES, budget);
 }
@@ -2252,9 +4223,11 @@ function _hlsJsConfigFromBudget(mseBudgetBytes, bps, isMobile){
     maxBufferSize,
     backBufferLength,
     startFragPrefetch: maxBufferSize >= 32 * 1024 * 1024,
-    maxBufferHole: 0.5,
+    maxBufferHole: 1.5,
+    maxSeekHole: 4,
     highBufferWatchdogPeriod: 2,
-    nudgeMaxRetries: 5,
+    nudgeOffset: 0.08,
+    nudgeMaxRetries: 8,
     mseBudgetBytes: budget,
   };
 }
@@ -2262,6 +4235,7 @@ function _hlsJsConfigFromBudget(mseBudgetBytes, bps, isMobile){
 function _installHlsBufferGuard(hls, v, seq, hlsInfo){
   if (!hls || v._hlsBufferGuard) return;
   v._hlsBufferGuard = true;
+  const isFloat = v.classList?.contains("watch-float-video");
   let shrinkCount = 0;
   let lastShrinkAt = 0;
   const bps = Number(hlsInfo?.estimated_bitrate_bps || 0);
@@ -2273,7 +4247,7 @@ function _installHlsBufferGuard(hls, v, seq, hlsInfo){
     hls.config.maxMaxBufferLength = cfg.maxMaxBufferLength;
     hls.config.backBufferLength = cfg.backBufferLength;
     hls.config.startFragPrefetch = cfg.startFragPrefetch;
-    _writeLearnedMseBudget(nextBudget);
+    if (!isFloat) _writeLearnedMseBudget(nextBudget);
     console.warn("[hls] MSE budget adjust:", reason, cfg);
   };
 
@@ -2305,10 +4279,10 @@ function _videoIdFromMp4Src(src){
   return m ? decodeURIComponent(m[1]) : null;
 }
 
-function _hlsPlaylistUrl(src){
+function _hlsPlaylistUrl(src, tier = "full"){
   const vid = _videoIdFromMp4Src(src);
   if (!vid) return null;
-  // 不需要 cacheBust：HLS 段是 immutable 的，浏览器 304 命中即可
+  if (tier === "preview") return `/media/hls/${encodeURIComponent(vid)}/preview/playlist.m3u8`;
   return `/media/hls/${encodeURIComponent(vid)}/playlist.m3u8`;
 }
 
@@ -2384,16 +4358,20 @@ function _collectSupportedCodecs(v){
 function _playbackIsMobile(){
   return /Android|webOS|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
 }
-async function _negotiatePlayback(vid, v, position){
+async function _negotiatePlayback(vid, v, position, opts = {}){
   if (!vid) return null;
+  const tier = opts.isFloat ? "preview" : "full";
   const env = _collectPlaybackEnvironment(v);
-  const mseBudget = _computeMseBudget(env);
+  const mseBudget = opts.isFloat
+    ? FLOAT_PLAYER_MSE_BYTES
+    : _computeMseBudget(env, _playbackInstanceCount());
   try{
     const r = await fetch("/api/playback/negotiate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         video_id: String(vid),
+        playback_tier: tier,
         is_mobile: env.is_mobile,
         supports_mse: !!(window.MediaSource || window.WebKitMediaSource),
         browser: (navigator.userAgent || "").slice(0, 120),
@@ -2420,7 +4398,7 @@ function _preferNativeMp4ForInfo(info){
 function _hlsJsConfigForInfo(info){
   const bps = Number(info?.estimated_bitrate_bps || 0);
   const env = _collectPlaybackEnvironment(null);
-  const budget = _computeMseBudget(env);
+  const budget = _computeMseBudget(env, _playbackInstanceCount());
   return _hlsJsConfigFromBudget(budget, bps, env.is_mobile);
 }
 async function _ensureHlsInfoForSrc(src){
@@ -2454,6 +4432,7 @@ function _nativeHlsSupported(v){
 /* 销毁 video 元素上挂着的 HLS controller，避免泄漏。 */
 function teardownMSE(v){
   if (!v) return;
+  _releaseFloatHlsSlot(v);
   if (v._hls){
     try { v._hls.stopLoad(); } catch(_){}
     try { v._hls.detachMedia(); } catch(_){}
@@ -2463,6 +4442,7 @@ function teardownMSE(v){
   v._hlsSrc = null;
   v._hlsSeq = 0;
   v._hlsBufferGuard = false;
+  v._hlsPlaybackTier = null;
 }
 
 /* 原生 src 路径（兜底）：可以是原 MP4，也可以是 HLS playlist（Safari 原生支持） */
@@ -2555,15 +4535,28 @@ function _stripQuery(u){
   return i < 0 ? (u || "") : u.slice(0, i);
 }
 
-async function attachVideoSrc(src, resumeAt){
-  const v = media.v || $("fsVideo");
+async function attachVideoSrc(src, resumeAt, opts = {}){
+  const v = opts.target || media.v || $("fsVideo");
   if (!v) return;
   enforceNoPIP(v);
+  const playbackTier = opts.isFloat ? "preview" : "full";
+  const floatPanel = opts.floatPanel || null;
+  const floatLoadToken = opts.isFloat ? (opts.floatLoadToken ?? v._floatLoadToken) : null;
+  const floatStillValid = ()=>{
+    if (!opts.isFloat) return true;
+    return !v._floatClosed
+      && v._floatLoadToken === floatLoadToken
+      && _floatPanelActive(floatPanel, v);
+  };
+  const abortFloatAttach = ()=>{
+    if (!opts.isFloat) return;
+    try { teardownMSE(v); } catch(_){}
+  };
   const vidForInfo = _videoIdFromMp4Src(src);
   if (vidForInfo) v._expectedDuration = _serverDurationForSrc(src);
 
-  // 已经挂的是同一个视频 → 只调进度就行
-  if (v._hls && _stripQuery(v._hlsSrc) === _stripQuery(src)){
+  // 已经挂的是同一个视频 + 同一 tier → 只调进度就行
+  if (v._hls && _stripQuery(v._hlsSrc) === _stripQuery(src) && (v._hlsPlaybackTier || "full") === playbackTier){
     setCurrentTimeWhenReady(v, resumeAt||0);
     pinHlsDuration(v._hls, v, v._expectedDuration);
     return;
@@ -2571,29 +4564,51 @@ async function attachVideoSrc(src, resumeAt){
   const seq = ++hlsAttachSeq;
   teardownMSE(v);
 
+  const decision = vidForInfo ? await _negotiatePlayback(vidForInfo, v, resumeAt||0, opts) : null;
+  if (!floatStillValid()){ abortFloatAttach(); return; }
+
+  // 浮窗：拉 playlist（=触发后端 ffmpeg 冷启）前先排队，错峰冷启动避免 NAS IO/GPU init 抢占
+  if (opts.isFloat && decision?.method !== "direct_play"){
+    await _acquireFloatWarmupSlot(floatPanel, v);
+    if (!floatStillValid()){ _releaseFloatWarmupSlot(v); abortFloatAttach(); return; }
+    v._floatWarmupStartedAt = Date.now();
+    v._floatLastMoveAt = Date.now();   // warmup 看门狗从“真正开始预热”计时
+    if (vidForInfo) apiHlsResume(vidForInfo, "preview");
+  }
+
   const prewarmP = (()=>{
-    const pl = _hlsPlaylistUrl(src);
+    const pl = decision?.url || _hlsPlaylistUrl(src, playbackTier);
     if (pl) return fetch(pl, { cache:"no-store", credentials:"same-origin" }).catch(()=>{});
     return prewarmMediaConnection(src);
   })();
-  const decision = vidForInfo ? await _negotiatePlayback(vidForInfo, v, resumeAt||0) : null;
   await prewarmP.catch(()=>{});
+  if (!floatStillValid()){ _releaseFloatWarmupSlot(v); abortFloatAttach(); return; }
 
   if (decision?.meta){
     _cachePlaybackMeta(vidForInfo, decision.meta);
     if (decision.meta.duration > 0) v._expectedDuration = decision.meta.duration;
+    if (opts.isFloat){
+      console.info("[float] negotiate:", decision.method, vidForInfo,
+        "v=", decision.meta.video_codec || "?", "a=", decision.meta.audio_codec || "?");
+    }
   }
 
-  const playlistUrl = decision?.url || _hlsPlaylistUrl(src);
+  const playlistUrl = decision?.url || _hlsPlaylistUrl(src, playbackTier);
   let hlsInfo = _hlsInfoForSrc(src);
   if (!hlsInfo){
     hlsInfo = await _ensureHlsInfoForSrc(src);
     if (hlsInfo?.duration > 0) v._expectedDuration = hlsInfo.duration;
   }
+  if (!floatStillValid()){ abortFloatAttach(); return; }
 
   const useDirectPlay = decision?.method === "direct_play";
 
   if (useDirectPlay){
+    if (opts.isFloat){
+      v._floatDirectPlay = true;
+      _releaseFloatWarmupSlot(v);
+      console.info("[float] client direct play:", src);
+    }
     console.info("[playback] direct play:", src, decision?.method || "fallback");
     v.dataset.playbackEngine = "native";
     await _attachDirectPlayVideo(v, src, resumeAt);
@@ -2604,19 +4619,44 @@ async function attachVideoSrc(src, resumeAt){
   const useHlsJs = decision?.method === "hls_js"
     || (!decision && playlistUrl && _hlsSupported() && (hlsInfo || vidForInfo));
   if (useHlsJs){
+    if (opts.isFloat){
+      v._floatDirectPlay = false;
+      await _acquireFloatHlsSlot();
+      if (!floatStillValid()){
+        _cancelFloatHlsSlotAcquire();
+        abortFloatAttach();
+        return;
+      }
+      v._floatHlsSlotHeld = true;
+    }
+    if (!floatStillValid()){
+      if (opts.isFloat){
+        if (v._floatHlsSlotHeld) _releaseFloatHlsSlot(v);
+        else _cancelFloatHlsSlotAcquire();
+      }
+      abortFloatAttach();
+      return;
+    }
     v._expectedDuration = _serverDurationForSrc(src) || v._expectedDuration || 0;
-    const bufCfg = decision?.config ? { ...decision.config } : _hlsJsConfigForInfo(hlsInfo);
-    console.info("[hls] MSE budget:", bufCfg.mseBudgetBytes, "maxBufferSize:", bufCfg.maxBufferSize, "maxBufferLength:", bufCfg.maxBufferLength);
+    let bufCfg = decision?.config ? { ...decision.config } : _hlsJsConfigForInfo(hlsInfo);
+    if (opts.isFloat){
+      const bps = Number(hlsInfo?.estimated_bitrate_bps || decision?.meta?.estimated_bitrate_bps || 0);
+      v._hlsBitrateBps = bps;
+      const floatBudget = _floatPlaybackBudgetBytes();
+      bufCfg = _hlsJsConfigFromBudget(floatBudget, bps, _playbackIsMobile());
+      bufCfg.maxBufferLength = Math.max(18, Math.min(bufCfg.maxBufferLength || 50, 55));
+      bufCfg.maxMaxBufferLength = bufCfg.maxBufferLength;
+      bufCfg.mseBudgetBytes = floatBudget;
+      const nf = Math.max(1, _floatPlayerCount());
+      bufCfg.maxMaxConcurrentFragments = nf > 6 ? 1 : (nf > 3 ? 2 : 4);
+    }
     const hls = new window.Hls({
-      // 短视频尽量多缓冲；超大/高码率文件按 /info 动态收紧，避免 MSE 撑爆内存。
       ...bufCfg,
       autoStartLoad: true,
-      // 段加载并发 + 重试
       fragLoadPolicy: {
         default: {
-          // 后端可能正在等连续 ffmpeg 生成目标段，首字节不能太短，否则会频繁 abort。
-          maxTimeToFirstByteMs: 120000,
-          maxLoadTimeMs: 180000,
+          maxTimeToFirstByteMs: opts.isFloat ? 240000 : 120000,
+          maxLoadTimeMs: opts.isFloat ? 300000 : 180000,
           timeoutRetry: { maxNumRetry: 8, retryDelayMs: 800, maxRetryDelayMs: 5000 },
           errorRetry:   { maxNumRetry: 8, retryDelayMs: 800, maxRetryDelayMs: 5000 },
         },
@@ -2637,6 +4677,7 @@ async function attachVideoSrc(src, resumeAt){
     v._hls = hls;
     v._hlsSrc = src;
     v._hlsSeq = seq;
+    v._hlsPlaybackTier = playbackTier;
     v.dataset.playbackEngine = "hls";
     _installHlsBufferGuard(hls, v, seq, hlsInfo);
     let fatalNetworkRetries = 0;
@@ -2661,10 +4702,13 @@ async function attachVideoSrc(src, resumeAt){
     });
     hls.on(window.Hls.Events.MANIFEST_PARSED, ()=>{
       if (v._hlsSeq !== seq) return;
-      console.info("[hls] attached:", playlistUrl);
+      console.info("[hls] attached:", playlistUrl, opts.isFloat ? "(float)" : "");
       v._expectedDuration = _serverDurationForSrc(src) || v._expectedDuration || 0;
       pinHlsDuration(hls, v, v._expectedDuration);
-      setTimeout(fixPortraitVideoInFullscreen, 50);
+      if (opts.isFloat){
+        v._floatSyncUi?.();
+        if (!v._floatUserPaused && !v._floatClosed) v.play().catch(()=>{});
+      } else setTimeout(fixPortraitVideoInFullscreen, 50);
     });
     if (window.Hls.Events.LEVEL_LOADED){
       hls.on(window.Hls.Events.LEVEL_LOADED, (_evt, data)=>{
@@ -2677,12 +4721,14 @@ async function attachVideoSrc(src, resumeAt){
           else if (d > 0) v._expectedDuration = d;
         }catch(_){}
         pinHlsDuration(hls, v, v._expectedDuration);
+        if (opts.isFloat) v._floatSyncUi?.();
       });
     }
     if (window.Hls.Events.BUFFER_CREATED){
       hls.on(window.Hls.Events.BUFFER_CREATED, ()=>{
         if (v._hlsSeq !== seq) return;
         pinHlsDuration(hls, v, v._expectedDuration);
+        if (opts.isFloat) v._floatSyncUi?.();
       });
     }
     hls.on(window.Hls.Events.ERROR, (_evt, data)=>{
@@ -2716,6 +4762,13 @@ async function attachVideoSrc(src, resumeAt){
       }
     });
 
+    if (!floatStillValid()){
+      try { hls.stopLoad(); } catch(_){}
+      try { hls.detachMedia(); } catch(_){}
+      try { hls.destroy(); } catch(_){}
+      v._hls = null;
+      return;
+    }
     hls.attachMedia(v);
     hls.loadSource(playlistUrl);
     return;
@@ -3220,15 +5273,8 @@ function flushProgressOnLeave(){
 window.addEventListener("pagehide", (e)=> { 
   flushProgressOnLeave();
   if (BACKGROUND_AUDIO_MODE && !WALLPAPER_MODE && isPlayerActive() && !scrubGuard.active && !_repairInProgress && !isPipActiveOrPending()) switchToAudio();
-  // 如果是进入 bfcache，保持保活机制
-  if (e.persisted){
-    // 不停止保活，让它在后台继续
-  } else {
-    stopBgKeepAlive();
-  }
+  if (!e.persisted) stopBgKeepAlive();
 });
-window.addEventListener("beforeunload", stopBgKeepAlive);
-window.addEventListener("unload", stopBgKeepAlive);
 document.addEventListener("freeze", ()=>{
   // 页面被冻结时，尝试保持播放
   if (isPlayerActive() && playbackMode === "audio"){
@@ -3516,25 +5562,49 @@ function fixPortraitVideoInFullscreen(){
 }
 
 /* ★ 视口高度自适应 & 滚动拦截（进入/退出时安装/卸载） */
-const SUPPORTS_DVH = (typeof CSS !== "undefined" && CSS.supports && CSS.supports("height","100dvh"));
+function fsViewportMetrics(){
+  const wrap = $("playerFS");
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  const vv = window.visualViewport;
+  let w = window.innerWidth;
+  let h = window.innerHeight;
+  let top = 0;
+  let left = 0;
+  if (vv){
+    w = Math.ceil(vv.width || w);
+    h = Math.ceil(vv.height || h);
+    top = Math.ceil(vv.offsetTop || 0);
+    left = Math.ceil(vv.offsetLeft || 0);
+  }
+  if (wrap && fsEl === wrap){
+    const cw = Math.ceil(wrap.clientWidth || 0);
+    const ch = Math.ceil(wrap.clientHeight || 0);
+    if (cw > 0) w = cw;
+    if (ch > 0) h = ch;
+    top = 0;
+    left = 0;
+  }
+  return { w: Math.max(1, w), h: Math.max(1, h), top, left };
+}
+
 function adjustFSViewport(){
   const wrap = $("playerFS");
-  if (!wrap) return;
-
-  if (SUPPORTS_DVH){
-    wrap.style.height = "100dvh";
-    const v = $("fsVideo"); const ov = $("overlay");
-    if (v) v.style.height = "100dvh";
-    if (ov) ov.style.height = "100dvh";
-    return;
-  }
-
-  const vv = window.visualViewport;
-  const h = Math.ceil((vv && vv.height) ? vv.height : window.innerHeight);
+  if (!wrap || wrap.style.display === "none") return;
+  const { w, h, top, left } = fsViewportMetrics();
+  wrap.style.width = w + "px";
   wrap.style.height = h + "px";
-  const v = $("fsVideo"); const ov = $("overlay");
-  if (v) v.style.height = h + "px";
-  if (ov) ov.style.height = h + "px";
+  wrap.style.top = top + "px";
+  wrap.style.left = left + "px";
+  const v = $("fsVideo");
+  const ov = $("overlay");
+  if (v){
+    v.style.width = "100%";
+    v.style.height = "100%";
+  }
+  if (ov){
+    ov.style.width = "100%";
+    ov.style.height = "100%";
+  }
 }
 const _fsGuards = { installed:false, wheel:null, touch:null, vv:null, resize:null, orient:null, vvResize:null, vvScroll:null };
 function installFsGuards(){
@@ -3558,10 +5628,12 @@ function installFsGuards(){
     window.visualViewport.addEventListener("scroll", _fsGuards.vvScroll);
   }
 
-  const fixFS = ()=> setTimeout(adjustFSViewport, 50);
   const fixPortraitOnFullscreenChange = ()=>{
-    fixFS();
-    setTimeout(fixPortraitVideoInFullscreen, 100);
+    adjustFSViewport();
+    setTimeout(()=>{
+      adjustFSViewport();
+      fixPortraitVideoInFullscreen();
+    }, 50);
   };
   document.addEventListener("fullscreenchange", fixPortraitOnFullscreenChange);
   document.addEventListener("webkitfullscreenchange", fixPortraitOnFullscreenChange);
@@ -3577,16 +5649,20 @@ function installFsGuards(){
 }
 /* 正确卸载（修复顶部黑条的那版仍保留） */
 function removeFsGuards(){
-  if (_fsGuards.installed) return;
+  if (!_fsGuards.installed) return;
   const wrap = $("playerFS");
   if (wrap){
     if (_fsGuards.wheel) wrap.removeEventListener("wheel", _fsGuards.wheel, { passive:false });
     if (_fsGuards.touch) wrap.removeEventListener("touchmove", _fsGuards.touch, { passive:false });
     wrap.style.height = "";
+    wrap.style.width = "";
+    wrap.style.top = "";
+    wrap.style.left = "";
   }
-  const v = $("fsVideo"); const ov = $("overlay");
-  if (v) v.style.height = "";
-  if (ov) v.style.height = "";
+  const v = $("fsVideo");
+  const ov = $("overlay");
+  if (v){ v.style.height = ""; v.style.width = ""; }
+  if (ov){ ov.style.height = ""; ov.style.width = ""; }
   if (_fsGuards.resize) window.removeEventListener("resize", _fsGuards.resize);
   if (_fsGuards.orient) window.removeEventListener("orientationchange", _fsGuards.orient);
   if (window.visualViewport){
@@ -3603,11 +5679,12 @@ function removeFsGuards(){
 async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   cancelProgressive();
 
+  const popout = POPOUT_MODE || !!options.popout;
   showBusy("正在准备播放器…");
 
   // 记录进入播放器前的滚动位置，便于退出时恢复
   try{
-    if (typeof window !== "undefined"){
+    if (!popout && typeof window !== "undefined"){
       player.returnScrollY = window.scrollY || document.documentElement.scrollTop || 0;
     }
   }catch(_){}
@@ -3618,6 +5695,12 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   player.returnPath = returnPath || state.path;
   player.loop = !!options.loop;
 
+  if (popout){
+    const curId = player.ids[player.index];
+    const curTitle = player.titles[curId] || `视频 ${curId}`;
+    try { document.title = `${curTitle} · Wallpaper WebUI`; } catch(_){}
+  }
+
   const wrap = $("playerFS");
   const v = $("fsVideo");
   const a = $("bgAudio");
@@ -3625,7 +5708,7 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   playbackMode = "video";
 
   wrap.style.display = "flex";
-  if (!WALLPAPER_MODE) {
+  if (!WALLPAPER_MODE && !popout) {
     requestPlayerFullscreen({ requireActivation:true });
   }
   if (WALLPAPER_MODE && typeof window.__setTouchLocked === "function"){
@@ -3643,7 +5726,13 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
     wrap.appendChild(backBtn);
   }
   setCpcIcon(backBtn, "back");
+  backBtn.title = popout ? "关闭窗口" : "返回";
+  backBtn.setAttribute("aria-label", popout ? "关闭窗口" : "返回");
   backBtn.onclick = ()=>{
+    if (popout){
+      exitPlayerOrClosePopout();
+      return;
+    }
     exitPlayer();
     // 如果仍在同一路径，仅退出播放器并恢复滚动，不重新刷新列表
     let curPath = "/";
@@ -3662,6 +5751,8 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
   installFsGuards();
 
   enforceNoPIP(v);
+
+  installPopoutPlayheadReporter(v);
 
   if (!v._bound) {
     v.addEventListener("ended", ()=> handleEndedFromAny(v));
@@ -3755,11 +5846,11 @@ async function startPlaylist(items, startIndex=0, returnPath=null, options={}){
     await applyWallpaperVisibility(wallpaperDesktopVisible, "playlist-start");
   }
 
-  if (!WALLPAPER_MODE){
+  if (!WALLPAPER_MODE && !popout){
     try { history.pushState({ fsOverlay:true }, ""); fsOverlayInHistory = true; } catch(_) {}
   }
 
-  if (!WALLPAPER_MODE) await waitReady;
+  if (!WALLPAPER_MODE && !popout) await waitReady;
   hideBusy();
 }
 
@@ -3835,6 +5926,10 @@ async function playIndex(i, opts = {}){
   if (a0){ try{ a0.muted = true; a0.volume = 0; }catch(_){ } }
 
   const id = player.ids[i];
+  if (POPOUT_MODE){
+    const t = player.titles[id] || `视频 ${id}`;
+    try { document.title = `${t} · Wallpaper WebUI`; } catch(_){}
+  }
   if (_repairedVideos.has(String(id))){
     cacheBust = true;
     forceVideo = true;
@@ -4451,6 +6546,8 @@ async function deleteByIds(ids){
 function removeTilesByVideoIds(ids){
   const set = new Set((ids || []).map(String).filter(Boolean));
   if (!set.size) return;
+  // 视频被删除/取消订阅后，自动关闭其对应的浮窗播放器
+  set.forEach(id=>{ try{ closeWatchFloatPanel(id); }catch(_){} });
   const g = grid();
   if (!g) return;
   
@@ -4507,11 +6604,17 @@ function bindDelegatedEvents(){
   const el = grid();
   if (el._allBound) return;
   el._allBound = true;
+  installTileTextPickGuard(el);
 
   //---------------------------------------------------------
   // 左键点击处理 (保持不变)
   //---------------------------------------------------------
   el.addEventListener("click", async (ev)=>{
+    if (folderDropShouldSuppressClick()){
+      ev.preventDefault();
+      ev.stopPropagation();
+      return;
+    }
     const wbtn = ev.target.closest(".watched-btn");
     if (wbtn){
       ev.preventDefault();
@@ -4541,9 +6644,24 @@ function bindDelegatedEvents(){
     const t = getTile(ev.target);
     if (!t) return;
 
+    if (t.type === "video" && shouldIgnoreTileClick(t)) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      clearTileTextPickSuppress();
+      return;
+    }
+
     if (t.type === "parent") {
       ev.preventDefault();
       navigateToPath(t.path || "/");
+      return;
+    }
+
+    // Alt+点击：打开浮动播放窗（可连续多个，各自独立加载，始终浮在主页上方）
+    if (ev.altKey && t.type === "video") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openPopoutWatch(t.vid, t.title);
       return;
     }
 
@@ -4587,6 +6705,19 @@ function bindDelegatedEvents(){
     }
 
     // 普通单击
+    if (t.type === "video") {
+      const textEl = ev.target.closest(".tile .title, .tile .author");
+      if (textEl) {
+        t.el.classList.add("pulse");
+        setTimeout(()=> t.el.classList.remove("pulse"), 200);
+        clearSel();
+        setSel(t, true);
+        state.lastIdx = t.idx;
+        ev.preventDefault();
+        return;
+      }
+    }
+
     t.el.classList.add("pulse");
     setTimeout(()=> t.el.classList.remove("pulse"), 200);
 
@@ -4924,27 +7055,17 @@ function openContextMenu(x,y){
       }
     })();
   }
-  function openMoveSubMenu(getIds){
+  function openMoveSubMenu(getPayload){
     openSubMenuAsync("移动到…", async ()=>{
-      const ids = await getIds();
-      if (!ids || !ids.length){
-        return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
-      }
-      const entries = [];
-      // 主页
-      entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(ids, "/"); } });
-
-      // 文件夹树（扁平化 + 缩进）
-      const tree = flattenFolderTree(await getFoldersMenuTree());
-      const MAX = 240; // 防止菜单过长
-      for (let i=0;i<tree.length && i<MAX;i++){
-        const n = tree[i];
-        const indent = "　".repeat(Math.min(10, n.depth||0)); // 全角空格，移动端更对齐
-        const label = `${indent}${n.title} (${n.path})`;
-        entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
-      }
-      return entries;
+      const payload = typeof getPayload === "function" ? getPayload() : getPayload;
+      return buildMoveSubmenuEntries(payload);
     }, {moveStyle:true});
+  }
+  function addMoveToMenu(){
+    add("移动到…", ()=>{}, {
+      keepOpen:true,
+      submenuAsyncLoader: moveSubmenuLoader(()=> collectMovePayload()),
+    });
   }
   function sep(){ const s=document.createElement("div"); s.className="sep"; menu.appendChild(s); }
 
@@ -4970,26 +7091,7 @@ function openContextMenu(x,y){
       add("取消订阅", ()=> openBulkUnsub([vid], 0));  // batch=0 表示单项模式
     }
     sep();
-    add("移动到…", ()=>{}, {
-      keepOpen:true,
-      submenuAsyncLoader: async ()=>{
-        const ids = [String(vid)];
-        if (!ids || !ids.length){
-          return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
-        }
-        const entries = [];
-        entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(ids, "/"); } });
-        const tree = flattenFolderTree(await getFoldersMenuTree());
-        const MAX = 240;
-        for (let i=0;i<tree.length && i<MAX;i++){
-          const n = tree[i];
-          const indent = "　".repeat(Math.min(10, n.depth||0));
-          const label = `${indent}${n.title} (${n.path})`;
-          entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
-        }
-        return entries;
-      }
-    });
+    addMoveToMenu();
     sep();
     add("删除", async ()=>{
       if (!confirm("确定要永久删除该条目吗？此操作不可恢复。")) return;
@@ -5024,6 +7126,8 @@ function openContextMenu(x,y){
     });
     sep();
     add("在该文件夹下新建子文件夹…", ()=> promptCreateFolder(path));
+    sep();
+    addMoveToMenu();
     sep();
     add("删除", ()=>{}, {
       keepOpen:true,
@@ -5106,26 +7210,7 @@ function openContextMenu(x,y){
       await openBulkUnsub(ids, 2);  // batch=2 表示批量模式
     });
     sep();
-    add("移动到…", ()=>{}, {
-      keepOpen:true,
-      submenuAsyncLoader: async ()=>{
-        const ids = await collectSelectedIds();
-        if (!ids || !ids.length){
-          return [{ text:"（没有可移动的条目）", fn: ()=>{} }];
-        }
-        const entries = [];
-        entries.push({ text:"主页 (/)", fn: async ()=>{ await moveIdsAndRefresh(ids, "/"); } });
-        const tree = flattenFolderTree(await getFoldersMenuTree());
-        const MAX = 240;
-        for (let i=0;i<tree.length && i<MAX;i++){
-          const n = tree[i];
-          const indent = "　".repeat(Math.min(10, n.depth||0));
-          const label = `${indent}${n.title} (${n.path})`;
-          entries.push({ text: label, fn: async ()=>{ await moveIdsAndRefresh(ids, n.path); } });
-        }
-        return entries;
-      }
-    });
+    addMoveToMenu();
     sep();
     add("删除", ()=>{}, {
       keepOpen:true,
@@ -5366,16 +7451,24 @@ function initCustomSortSelect(){
   rebuild();
 }
 
-$("sort").onchange = ()=> changeContext({sort_idx: parseInt($("sort").value,10)});
+$("sort") && ($("sort").onchange = ()=> changeContext({sort_idx: parseInt($("sort").value,10)}));
 initCustomSortSelect();
-$("mature").onchange = ()=> changeContext({mature_only: $("mature").checked});
-$("refresh").onclick = ()=> refreshCurrentScanContext("manual");
+$("mature") && ($("mature").onchange = ()=> changeContext({mature_only: $("mature").checked}));
+$("refresh") && ($("refresh").onclick = ()=> refreshCurrentScanContext("manual"));
 let qTimer=null;
-$("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContext({q:$("q").value.trim()}), 250); };
-$("playUnwatched").onclick = handlePlayUnwatched;
+$("q") && ($("q").oninput = ()=>{ clearTimeout(qTimer); qTimer=setTimeout(()=> changeContext({q:$("q").value.trim()}), 250); });
+$("playUnwatched") && ($("playUnwatched").onclick = handlePlayUnwatched);
 
 window.addEventListener("load", ()=>{
+  if (POPOUT_MODE){
+    installTitleTooltip();
+    const title = URL_PARAMS.get("title") || `视频 ${POPOUT_VID}`;
+    startPlaylist([{ id: POPOUT_VID, title }], 0, null);
+    return;
+  }
   installTitleTooltip();
+  installFolderDrop();
+  installMoveUndoHotkey();
   const initPath = pathFromHash();
   renderSkeleton(buildCrumbHtml(initPath));
   changeContext({path: initPath});

@@ -1,12 +1,49 @@
 # app/main.py (fs-35 audio-direct: add /media/audio/{vid_id} + inplace faststart + keepalive)
-import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil, json
+import os, math, mimetypes, re, sqlite3, threading, io, hashlib, subprocess, glob, shutil, json, signal
 import time, logging, asyncio  # ★ 新增：用于 /api/keepalive 时间与日志过滤
 import secrets  # ★ 新增
 from urllib.parse import quote
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, NamedTuple
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_RUNTIME_ENV_LOADED: list[str] = []
+
+
+def _load_runtime_env_files() -> None:
+  """从挂载目录 runtime.env 读取配置（群晖改文件 + docker restart 即可，不必重建容器）。"""
+  global _RUNTIME_ENV_LOADED
+  _RUNTIME_ENV_LOADED = []
+  for name in ("runtime.env", "docker.local.env"):
+    path = os.path.join(APP_DIR, name)
+    if not os.path.isfile(path):
+      continue
+    try:
+      with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+          line = raw.strip()
+          if not line or line.startswith("#"):
+            continue
+          if line.lower().startswith("export "):
+            line = line[7:].strip()
+          if "=" not in line:
+            continue
+          key, _, val = line.partition("=")
+          key = key.strip()
+          if not key:
+            continue
+          val = val.strip()
+          if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+          os.environ[key] = val
+      _RUNTIME_ENV_LOADED.append(name)
+    except Exception as e:
+      print(f"[config] load {path} failed: {e}", flush=True)
+
+
+_load_runtime_env_files()
 
 from fastapi import FastAPI, Query, Request, HTTPException, Body  # ★ 添加 Body
 from fastapi.responses import (
@@ -45,20 +82,20 @@ class DirectPlayFileResponse(FileResponse):
         await asyncio.sleep(0)
     await super().__call__(scope, receive, paced_send)
 
+from .steam_authors import schedule_steam_author_enrich
 from .we_scan import (
     load_we_config, extract_folders_list, build_folder_tree, scan_workshop_items,
     scan_single_workshop_item, scan_single_myproject_item,
     scan_myprojects_items, scan_config_linked_project_videos,
     collect_unassigned_items, find_node_by_path, all_ids_recursive, delete_id_dir,
     delete_myprojects_local_dir, delete_we_projects_path_video,
-    create_folder as ws_create_folder, move_items as ws_move_items, delete_folders as ws_delete_folders,
+    create_folder as ws_create_folder, move_items as ws_move_items, move_folders as ws_move_folders, delete_folders as ws_delete_folders,
 )
 from .models import ScanResponse, FolderOut, VideoOut, DeleteRequest, PlaylistRequest, FolderDeleteRequest
 
 # === 可配置路径 ===
 WORKSHOP_PATH = os.getenv("WORKSHOP_PATH", "/data/workshop/content/431960")
 WE_PATH       = os.getenv("WE_PATH", "/data/wallpaper_engine")
-APP_DIR       = os.path.dirname(__file__)
 DATA_DIR      = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -94,13 +131,80 @@ HLS_PIPELINE_VERSION = "hls-av-job-v17"
 HLS_START_WAIT_SEC = float(os.getenv("HLS_START_WAIT_SEC", "90"))
 HLS_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PLAYLIST_PRIME_SEGMENTS", "3"))
 HLS_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PLAYLIST_PRIME_WAIT_SEC", "6"))
+HLS_DISCONTINUITY_AFTER_GAP_SEGMENTS = int(os.getenv("HLS_DISCONTINUITY_AFTER_GAP_SEGMENTS", "2"))
 # 局域网优先原文件/原码率：默认允许 stream copy；若产出异常大分片，会运行时熔断并回退转码。
 HLS_ALLOW_COPY = os.getenv("HLS_ALLOW_COPY", "1").lower() in {"1", "true", "yes", "on"}
+HLS_QSV_DEVICE = os.getenv("HLS_QSV_DEVICE", "/dev/dri/renderD128")
+_hls_nvenc_probe_cuda = False
+HLS_HW_PROBE_RESET = os.getenv("HLS_HW_PROBE_RESET", "").lower() in {"1", "true", "yes", "on"}
 HLS_COPY_MAX_SOURCE_BYTES = int(os.getenv("HLS_COPY_MAX_SOURCE_BYTES", str(2 * 1024 * 1024 * 1024)))
 HLS_COPY_MAX_BITRATE_BPS = int(os.getenv("HLS_COPY_MAX_BITRATE_BPS", str(30 * 1000 * 1000)))
 HLS_HUGE_FILE_BYTES = int(os.getenv("HLS_HUGE_FILE_BYTES", str(8 * 1024 * 1024 * 1024)))
 HLS_MAX_REASONABLE_SEGMENT_BYTES = int(os.getenv("HLS_MAX_REASONABLE_SEGMENT_BYTES", str(128 * 1024 * 1024)))
 HLS_ENCODE_AHEAD_SEC = int(os.getenv("HLS_ENCODE_AHEAD_SEC", "60"))
+
+# Alt+浮动预览：独立低码率 HLS 缓存（与全屏 full 分开，多窗并发更快）
+HLS_PREVIEW_CACHE_DIR = os.getenv("HLS_PREVIEW_CACHE_DIR", os.path.join(DATA_DIR, "hls_cache_preview"))
+os.makedirs(HLS_PREVIEW_CACHE_DIR, exist_ok=True)
+HLS_PREVIEW_PIPELINE_VERSION = "hls-preview-v1"
+HLS_PREVIEW_MAX_WIDTH = int(os.getenv("HLS_PREVIEW_MAX_WIDTH", "960"))
+HLS_PREVIEW_MAX_HEIGHT = int(os.getenv("HLS_PREVIEW_MAX_HEIGHT", "540"))
+HLS_PREVIEW_AUDIO_BITRATE = os.getenv("HLS_PREVIEW_AUDIO_BITRATE", "96k")
+HLS_PREVIEW_PLAYLIST_PRIME_SEGMENTS = int(os.getenv("HLS_PREVIEW_PLAYLIST_PRIME_SEGMENTS", "1"))
+HLS_PREVIEW_PLAYLIST_PRIME_WAIT_SEC = float(os.getenv("HLS_PREVIEW_PLAYLIST_PRIME_WAIT_SEC", "4"))
+# NVENC/QSV 探测分辨率（128x128 低于 NVENC 最小尺寸会误报失败）
+HLS_HW_PROBE_SIZE = os.getenv("HLS_HW_PROBE_SIZE", "256x256")
+# 并发硬编：独显 NVENC / 集显 QSV·VAAPI 分开限流，双卡可同时干活。
+# 4060 Ti 消费级驱动 NVENC 官方上限 8 路；12 代 QSV 无驱动路数锁（实际吞吐约 10~14 路 1080p）。
+# preview 540p 负载更低，Intel 侧可单独抬高；NVENC 仍受会话数限制。
+_hls_nvenc_max_full = max(1, int(os.getenv("HLS_NVENC_MAX", os.getenv("HLS_HW_ENCODE_MAX", "8"))))
+_hls_intel_max_full = max(1, int(os.getenv("HLS_INTEL_MAX", os.getenv("HLS_HW_ENCODE_MAX", "12"))))
+HLS_NVENC_MAX = _hls_nvenc_max_full
+HLS_INTEL_MAX = _hls_intel_max_full
+HLS_NVENC_MAX_PREVIEW = max(1, int(os.getenv("HLS_NVENC_MAX_PREVIEW", str(_hls_nvenc_max_full))))
+HLS_INTEL_MAX_PREVIEW = max(1, int(os.getenv("HLS_INTEL_MAX_PREVIEW", str(max(_hls_intel_max_full, 14)))))
+HLS_HW_SLOTS_DYNAMIC = os.getenv("HLS_HW_SLOTS_DYNAMIC", "1").lower() in {"1", "true", "yes", "on"}
+HLS_HW_ENCODE_SLOT_WAIT_SEC = float(os.getenv("HLS_HW_ENCODE_SLOT_WAIT_SEC", "300"))
+HLS_PREFER_GPU = os.getenv("HLS_PREFER_GPU", "1").lower() in {"1", "true", "yes", "on"}
+HLS_DUAL_GPU = os.getenv("HLS_DUAL_GPU", "auto").lower()  # auto | 1 | 0
+# 浮动 preview 首段就绪后是否继续整片编码（默认关，避免关窗后 ffmpeg 常驻吃 CPU/GPU）
+HLS_PREVIEW_KEEP_ENCODING = os.getenv("HLS_PREVIEW_KEEP_ENCODING", "0").lower() in {"1", "true", "yes", "on"}
+HLS_PREVIEW_IDLE_KILL_SEC = float(os.getenv("HLS_PREVIEW_IDLE_KILL_SEC", "20"))
+# 浮动窗直出 MP4（默认关：大文件直连 NAS 慢，preview HLS 540p 转码起播更快）
+HLS_PREVIEW_DIRECT_PLAY = os.getenv("HLS_PREVIEW_DIRECT_PLAY", "0").lower() in {"1", "true", "yes", "on"}
+HLS_PREVIEW_DIRECT_MAX_BYTES = int(os.getenv("HLS_PREVIEW_DIRECT_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
+HLS_PREVIEW_DIRECT_MAX_BITRATE_BPS = int(os.getenv("HLS_PREVIEW_DIRECT_MAX_BITRATE_BPS", str(35 * 1000 * 1000)))
+
+_hls_nvenc_env_cuda = os.getenv("HLS_NVENC_CUDA", "1").lower() in {"1", "true", "yes", "on"}
+
+def _hls_nvenc_has_nvidia() -> bool:
+  try:
+    if os.path.exists("/dev/nvidia0"):
+      return True
+    return any(str(n).startswith("nvidia") for n in os.listdir("/dev"))
+  except Exception:
+    return False
+
+def _hls_use_nvenc_cuda() -> bool:
+  """转码是否走 CUDA 硬解/硬缩放 + NVENC（需 NVIDIA 设备；与探测用 plain 通过不冲突）。"""
+  if not _hls_nvenc_env_cuda or not _hls_nvenc_has_nvidia():
+    return False
+  if _hls_mode_disabled("nvenc"):
+    return False
+  cached = _hls_encoder_probe_cache.get("nvenc")
+  return cached is not False
+
+def _hls_norm_tier(tier: str = "full") -> str:
+  return "preview" if str(tier or "full").lower() == "preview" else "full"
+
+def _hls_pipeline_version(tier: str = "full") -> str:
+  return HLS_PREVIEW_PIPELINE_VERSION if _hls_norm_tier(tier) == "preview" else HLS_PIPELINE_VERSION
+
+def _hls_playhead_key(vid_id: str, tier: str = "full") -> str:
+  return f"{vid_id}@preview" if _hls_norm_tier(tier) == "preview" else str(vid_id)
+
+def _hls_is_preview_tier(tier: str = "full") -> bool:
+  return _hls_norm_tier(tier) == "preview"
 
 # === 音频缓存定时清理（避免 audio_cache 无限膨胀） ===
 # - AUDIO_CACHE_MAX_AGE_DAYS：超过多少天的缓存直接删除
@@ -185,6 +289,27 @@ class ProgressSet(BaseModel):
     position: float
     duration: float = 0
 
+class HlsPlayheadSet(BaseModel):
+    id: str
+    position: float = 0
+    tier: str = "full"
+
+class HlsStopRequest(BaseModel):
+    id: str
+    tier: str = "preview"
+
+class HlsStopAllRequest(BaseModel):
+    tier: str = "preview"
+
+class HlsResumeRequest(BaseModel):
+    id: str
+    tier: str = "preview"
+
+class HlsPriorityRequest(BaseModel):
+    id: str
+    priority: float = 0
+    tier: str = "preview"
+
 class ProgressClear(BaseModel):
     ids: List[str]
 
@@ -195,6 +320,7 @@ class CreateFolderRequest(BaseModel):  # ★ 新增
 
 class MoveRequest(BaseModel):  # ★ 新增
     ids: List[str] = []
+    folder_paths: List[str] = []
     dest_path: str = "/"
 
 class PlaybackNegotiateRequest(BaseModel):
@@ -209,6 +335,7 @@ class PlaybackNegotiateRequest(BaseModel):
     js_heap_used_bytes: int = 0
     screen_pixels: int = 0
     mse_budget_bytes: int = 0
+    playback_tier: str = "full"  # full | preview（Alt+浮动窗）
 
 # ========= 预览图缓存 =========
 PREVIEW_CACHE_DIR = os.getenv("PREVIEW_CACHE_DIR", os.path.join(DATA_DIR, "preview_cache"))
@@ -540,6 +667,8 @@ def _scan_state():
         _MERGED.update(valid=True, folder_roots=folder_roots, id_map=id_map,
                        root_unassigned=root_unassigned, path_map=path_map)
 
+        schedule_steam_author_enrich(id_map)
+
         changed = []
         if cfg_dirty: changed.append("config")
         if ws_dirty: changed.append("workshop")
@@ -644,6 +773,9 @@ def api_diag():
         },
         "scan_merged_valid": _MERGED.get("valid", False),
         "issues": checks,
+        "gpu": _hls_gpu_diag(),
+        "runtime_env_files": list(_RUNTIME_ENV_LOADED),
+        "runtime_env_dir": APP_DIR,
     })
 
 def _fs_safe_vid_token(vid_id: str) -> str:
@@ -657,6 +789,7 @@ def _build_video_out(id_map, vid_id) -> VideoOut:
   return VideoOut(
     id=str(vid_id),
     title=v.title,
+    author=getattr(v, "author", "") or "",
     mtime=v.mtime,
     size=v.size,
     rating=v.rating or "",
@@ -720,18 +853,33 @@ def _video_orientation_meta(v):
   _video_orientation_cache[key] = meta
   return meta
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-  # 给模板一个 cache-bust 参数，避免前端 app.js 被浏览器长期缓存导致功能不更新
+def _template_ts(request: Request):
   try:
     request.scope["ts"] = str(int(time.time()))
   except Exception:
     request.scope["ts"] = "0"
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+  # 给模板一个 cache-bust 参数，避免前端 app.js 被浏览器长期缓存导致功能不更新
+  _template_ts(request)
   return templates.TemplateResponse(request, "index.html", {"request": request})
+
+@app.get("/watch/{vid_id}", response_class=HTMLResponse)
+def watch_page(request: Request, vid_id: str):
+  """独立窗口播放页：主页 Alt+点击 通过 window.open 打开，每个视频各自加载。"""
+  _template_ts(request)
+  return templates.TemplateResponse(request, "watch.html", {"request": request, "vid_id": vid_id})
 
 # ★ 启动异步预扫描（预热缓存）
 @app.on_event("startup")
 def prewarm_scan():
+  if _RUNTIME_ENV_LOADED:
+    logging.info("[config] loaded runtime env: %s", ", ".join(_RUNTIME_ENV_LOADED))
+  _hls_bootstrap_hw_state()
+  threading.Thread(target=_hls_log_startup_gpu_probe, daemon=True, name="gpu-probe").start()
+  threading.Thread(target=_hls_preview_idle_reaper, daemon=True, name="hls-preview-reaper").start()
+  threading.Thread(target=_hls_hw_slot_recovery, daemon=True, name="hls-slot-recovery").start()
   threading.Thread(target=_scan_state, daemon=True).start()
 
 # ==========（新）已播放 API ==========
@@ -806,11 +954,11 @@ def api_set_progress(payload: ProgressSet):
   pos = max(0.0, float(payload.position or 0))
   dur = max(0.0, float(payload.duration or 0))
   try:
-    _hls_set_playhead(vid, pos)
+    _hls_set_playhead(vid, pos, "full")
     src_path = _hls_source_for_vid(vid)
-    out_dir = _hls_dir_for(vid)
-    key = _hls_job_key(vid, src_path)
-    _hls_maybe_throttle_job(vid, out_dir, _hls_job_for(key))
+    out_dir = _hls_dir_for(vid, "full")
+    key = _hls_job_key(vid, src_path, "full")
+    _hls_maybe_throttle_job(vid, out_dir, _hls_job_for(key), "full")
   except Exception:
     pass
 
@@ -863,6 +1011,79 @@ def api_clear_progress(payload: ProgressClear):
     conn.close()
   return {"ok": True, "count": len(ids)}
 
+@app.post("/api/hls/playhead")
+def api_hls_playhead(payload: HlsPlayheadSet):
+  """轻量播放头上报：仅驱动 HLS encode-ahead 节流，不写 DB。"""
+  vid = str(payload.id or "").strip()
+  if not vid:
+    return {"ok": False, "error": "missing-id"}
+  pos = max(0.0, float(payload.position or 0))
+  tier = _hls_norm_tier(getattr(payload, "tier", "full") or "full")
+  try:
+    _hls_set_playhead(vid, pos, tier)
+    src_path = _hls_source_for_vid(vid)
+    out_dir = _hls_dir_for(vid, tier)
+    key = _hls_job_key(vid, src_path, tier)
+    _hls_maybe_throttle_job(vid, out_dir, _hls_job_for(key), tier)
+  except Exception:
+    pass
+  return {"ok": True}
+
+@app.post("/api/hls/stop")
+def api_hls_stop(payload: HlsStopRequest):
+  """客户端关闭播放窗口：立即停止该视频的 HLS 转码 job。"""
+  vid = str(payload.id or "").strip()
+  if not vid:
+    return {"ok": False, "error": "missing-id"}
+  tier = _hls_norm_tier(getattr(payload, "tier", "preview") or "preview")
+  try:
+    return _hls_stop_transcode(vid, tier)
+  except HTTPException:
+    raise
+  except Exception as e:
+    logging.warning("[hls] stop failed vid=%s tier=%s: %s", vid, tier, e)
+    return {"ok": False, "error": str(e)}
+
+@app.post("/api/hls/stop-all")
+def api_hls_stop_all(payload: HlsStopAllRequest):
+  """关闭全部浮动窗等场景：批量停止某 tier 的全部转码 job。"""
+  tier = _hls_norm_tier(getattr(payload, "tier", "preview") or "preview")
+  try:
+    return _hls_stop_all_transcode(tier)
+  except Exception as e:
+    logging.warning("[hls] stop-all failed tier=%s: %s", tier, e)
+    return {"ok": False, "error": str(e)}
+
+@app.post("/api/hls/resume")
+def api_hls_resume(payload: HlsResumeRequest):
+  """重新打开播放窗口：允许该视频再次启动转码。"""
+  vid = str(payload.id or "").strip()
+  if not vid:
+    return {"ok": False, "error": "missing-id"}
+  tier = _hls_norm_tier(getattr(payload, "tier", "preview") or "preview")
+  _hls_clear_abandoned(vid, tier)
+  return {"ok": True, "vid": vid, "tier": tier}
+
+@app.post("/api/hls/priority")
+def api_hls_priority(payload: HlsPriorityRequest):
+  """浮动窗打开/聚焦时上报优先级（数值越大越优先占用 GPU 转码槽位）。"""
+  vid = str(payload.id or "").strip()
+  if not vid:
+    return {"ok": False, "error": "missing-id"}
+  tier = _hls_norm_tier(getattr(payload, "tier", "preview") or "preview")
+  pri = float(payload.priority or 0)
+  _hls_set_preview_priority(vid, pri)
+  _hls_clear_abandoned(vid, tier)
+  return {"ok": True, "vid": vid, "tier": tier, "priority": pri}
+
+@app.get("/api/hls/capacity")
+def api_hls_capacity(tier: str = Query("preview")):
+  """返回当前 tier 的 GPU 转码并发上限（供前端浮动窗调度）。"""
+  try:
+    return _hls_hw_capacity(tier)
+  except Exception as e:
+    return {"ok": False, "error": str(e)}
+
 @app.post("/api/playback/negotiate")
 def api_playback_negotiate(payload: PlaybackNegotiateRequest):
   """根据浏览器能力与源文件元数据，选择 direct_play / native_hls / hls_js。"""
@@ -870,10 +1091,82 @@ def api_playback_negotiate(payload: PlaybackNegotiateRequest):
   if not vid:
     raise HTTPException(400, "missing video_id")
   path = _hls_source_for_vid(vid)
+  tier = _hls_norm_tier(getattr(payload, "playback_tier", "full") or "full")
   pos = max(0.0, float(payload.position or 0))
   if pos > 0:
-    _hls_set_playhead(vid, pos)
+    _hls_set_playhead(vid, pos, tier)
   return _negotiate_playback(path, vid, payload)
+
+class ScanFilterTerm(NamedTuple):
+  text: str
+  field: str   # any | title | author
+  exact: bool  # True = 全字/整词匹配
+
+def _parse_scan_filter(q: str) -> List[ScanFilterTerm]:
+  """
+  解析筛选串：
+  - a:关键词  仅上传者；t:关键词  仅标题
+  - =关键词  全字/整词匹配（可写 a:=词 t:=词）
+  无前缀词同时在标题+上传者中子串匹配。
+  """
+  terms: List[ScanFilterTerm] = []
+  for raw in (q or "").split():
+    tok = raw.strip()
+    if not tok:
+      continue
+    field = "any"
+    m = re.match(r"^(a|t):(.*)$", tok, re.I)
+    if m:
+      field = "author" if m.group(1).lower() == "a" else "title"
+      tok = (m.group(2) or "").strip()
+    exact = False
+    if tok.startswith("="):
+      exact = True
+      tok = tok[1:].strip()
+    if not tok:
+      continue
+    terms.append(ScanFilterTerm(tok.casefold(), field, exact))
+  return terms
+
+def _contains_exact_word(text_cf: str, word_cf: str) -> bool:
+  if not word_cf:
+    return True
+  if not text_cf:
+    return False
+  if text_cf == word_cf:
+    return True
+  if re.search(r"(?<!\w)" + re.escape(word_cf) + r"(?!\w)", text_cf, re.UNICODE):
+    return True
+  sep = r"[\s\-_·|/\\，。！？、：；（）【】《》「」『』\"'\[\]{}<>]"
+  return bool(re.search(r"(?:^|" + sep + r")" + re.escape(word_cf) + r"(?:$|" + sep + r")", text_cf))
+
+def _text_matches_term(text_cf: str, term: ScanFilterTerm) -> bool:
+  if not term.text:
+    return True
+  if term.exact:
+    return _contains_exact_word(text_cf, term.text)
+  return term.text in text_cf
+
+def _video_passes_scan_filter(v, mature_only: bool, terms: List[ScanFilterTerm]) -> bool:
+  if not v:
+    return False
+  if mature_only and (v.rating or "").lower() != "mature":
+    return False
+  if not terms:
+    return True
+  title_cf = (v.title or "").casefold()
+  author_cf = (getattr(v, "author", "") or "").casefold()
+  haystack = f"{title_cf} {author_cf}".strip()
+  for term in terms:
+    if term.field == "title":
+      target = title_cf
+    elif term.field == "author":
+      target = author_cf
+    else:
+      target = haystack
+    if not _text_matches_term(target, term):
+      return False
+  return True
 
 # ========== 扫描 / 列表 ==========
 @app.get("/api/scan")
@@ -883,7 +1176,7 @@ def api_scan(
   per_page: int = Query(45, ge=1, le=500),  # 放宽到 500
   sort_idx: int = Query(0, ge=0, le=5),
   mature_only: bool = Query(False),
-  q: str = Query("", description="标题筛选，空格分词，全部包含")
+  q: str = Query("", description="筛选：a:上传者 t:标题 =全字匹配，空格分词且全部包含")
 ):
   folder_roots, id_map, root_unassigned = _scan_state()
 
@@ -908,19 +1201,11 @@ def api_scan(
       current_subfolders, current_item_ids = find_node_by_path(folder_roots, parts)
       breadcrumb = parts
 
-  tokens = [t.casefold() for t in q.split() if t.strip()]
+  filter_terms = _parse_scan_filter(q)
+  has_filter = bool(filter_terms)
 
   def _passes(vid: str) -> bool:
-    v = id_map.get(vid)
-    if not v:
-      return False
-    if mature_only and (v.rating or "").lower() != "mature":
-      return False
-    if tokens:
-      title_cf = v.title.casefold()
-      if not all(tok in title_cf for tok in tokens):
-        return False
-    return True
+    return _video_passes_scan_filter(id_map.get(vid), mature_only, filter_terms)
 
   # 当前目录「直属」视频按过滤条件保留；搜索时也只平铺当前层，不把子文件夹里
   # 的命中项拉上来，避免用户反馈的「搜索后全部被拍平」。
@@ -935,7 +1220,7 @@ def api_scan(
   #     前端仍会携带 q 参数请求，内部照样按关键词过滤。这样就保留了目录结构。
   folders_out: List[FolderOut] = []
   for sf in current_subfolders:
-    if tokens:
+    if has_filter:
       sub_ids = all_ids_recursive([sf])
       if not any(_passes(i) for i in sub_ids):
         continue
@@ -1052,9 +1337,16 @@ def api_folder_create(req: CreateFolderRequest):
 @app.post("/api/move")  # ★ 新增
 def api_move(req: MoveRequest):
   _, id_map, _ = _scan_state()
-  ws_move_items(WE_PATH, req.ids or [], req.dest_path or "/", id_map)
+  dest = req.dest_path or "/"
+  moved_ids = 0
+  moved_folders = 0
+  if req.ids:
+    ws_move_items(WE_PATH, req.ids or [], dest, id_map)
+    moved_ids = len(req.ids or [])
+  if req.folder_paths:
+    moved_folders = ws_move_folders(WE_PATH, req.folder_paths or [], dest)
   _invalidate_config_cache()
-  return {"ok": True, "moved": len(req.ids or [])}
+  return {"ok": True, "moved": moved_ids, "moved_folders": moved_folders}
 
 # === 直接删除（危险操作，已在前端加确认框） ===
 @app.post("/api/delete")
@@ -1470,11 +1762,17 @@ def api_repair_inplace(vid_id: str, mode: str = Query("auto", description="auto|
 # 媒体传输（预览 & 视频）
 # =======================
 def _etag_for(path: str) -> str:
-  st = os.stat(path)
+  try:
+    st = os.stat(path)
+  except OSError:
+    return ""
   return f'W/"{st.st_ino}-{st.st_size}-{int(st.st_mtime)}"'
 
 def _last_modified_str(path: str) -> str:
-  st = os.stat(path)
+  try:
+    st = os.stat(path)
+  except OSError:
+    return ""
   dt = datetime.utcfromtimestamp(st.st_mtime)
   return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
@@ -1743,6 +2041,8 @@ def media_preview(vid_id: str, request: Request,
   v = id_map.get(vid_id)
   if not v: raise HTTPException(404)
   src_path = v.preview_path
+  if not src_path or not os.path.isfile(src_path):
+    raise HTTPException(404, detail="preview not available")
 
   # 基础元数据
   src_mime, _ = mimetypes.guess_type(src_path)
@@ -1932,8 +2232,9 @@ def media_preview(vid_id: str, request: Request,
 # =======================
 # HLS 切片（ffmpeg 输出 m3u8 + ts 段，HLS.js 播）
 # =======================
-def _hls_dir_for(vid_id: str) -> str:
-  return os.path.join(HLS_CACHE_DIR, str(vid_id))
+def _hls_dir_for(vid_id: str, tier: str = "full") -> str:
+  root = HLS_PREVIEW_CACHE_DIR if _hls_is_preview_tier(tier) else HLS_CACHE_DIR
+  return os.path.join(root, str(vid_id))
 
 # 同 vid_id 同时只跑一个 ffmpeg
 _hls_locks: dict[str, threading.Lock] = {}
@@ -1943,10 +2244,225 @@ _hls_jobs_guard = threading.Lock()
 _hls_disabled_modes: set[str] = set()
 _hls_disabled_modes_guard = threading.Lock()
 _hls_encoder_probe_cache: dict[str, bool] = {}
+_HLS_HW_STATE_PATH = os.path.join(DATA_DIR, "hls_hw_state.json")
+_HLS_HW_ERR_MARKERS = (
+  "mfx session",
+  "error creating a mfx",
+  "no capable devices",
+  "openencodesessionex",
+  "incompatible client key",
+  "cannot load nvcuda",
+  "does not support nvenc",
+  "device failed",
+  "not supported on this device",
+)
+_HLS_HW_ERR_TRANSIENT = (
+  "too many",
+  "out of memory",
+  "resource temporarily unavailable",
+  "try again",
+  "encoder busy",
+  "no free encoder",
+  "insufficient resources",
+  "exceeded",
+  "max concurrent",
+  "cannot create channel",
+  "busy",
+  "temporarily",
+  "too many clients",
+  "encode session",
+)
+_hls_runtime_probe_last_errors: dict[str, str] = {}
+_hls_runtime_probe_attempt_errors: dict[str, dict[str, str]] = {}
+_hls_qsv_hw_prefix: list[str] = []
+
+
+class _HlsHwSlotPool:
+  """NVENC / Intel 分池限流；preview 与 full 可有不同上限；遇瞬时错误可动态回退。"""
+
+  def __init__(self, name: str, ceiling_full: int, ceiling_preview: int, floor: int = 1):
+    self.name = name
+    self.ceiling_full = max(1, int(ceiling_full))
+    self.ceiling_preview = max(1, int(ceiling_preview))
+    self.floor = max(1, int(floor))
+    self._in_use = 0
+    self._lock = threading.RLock()
+    self._cond = threading.Condition(self._lock)
+    self._pressure_level = 0
+    self._pressure_until = 0.0
+
+  def ceiling(self, tier: str = "full") -> int:
+    return self.ceiling_preview if _hls_is_preview_tier(tier) else self.ceiling_full
+
+  def effective_max(self, tier: str = "full") -> int:
+    base = self.ceiling(tier)
+    if not HLS_HW_SLOTS_DYNAMIC:
+      return base
+    with self._lock:
+      if self._pressure_level > 0 and time.time() < self._pressure_until:
+        return max(self.floor, base - self._pressure_level)
+      return base
+
+  def note_transient_pressure(self, step: int = 1):
+    if not HLS_HW_SLOTS_DYNAMIC:
+      return
+    with self._lock:
+      cap = max(self.ceiling_full, self.ceiling_preview)
+      self._pressure_level = min(cap - self.floor, self._pressure_level + max(1, step))
+      self._pressure_until = time.time() + 75
+      eff_full = max(self.floor, self.ceiling_full - self._pressure_level)
+      eff_prev = max(self.floor, self.ceiling_preview - self._pressure_level)
+      logging.info("[hls] %s slot pressure -> effective full≤%s preview≤%s (level=%s)",
+                   self.name, eff_full, eff_prev, self._pressure_level)
+      self._cond.notify_all()
+
+  def tick_recovery(self):
+    if not HLS_HW_SLOTS_DYNAMIC:
+      return
+    with self._lock:
+      if self._pressure_level <= 0:
+        return
+      if time.time() < self._pressure_until:
+        return
+      self._pressure_level = max(0, self._pressure_level - 1)
+      if self._pressure_level > 0:
+        self._pressure_until = time.time() + 45
+      else:
+        self._pressure_until = 0.0
+      logging.info("[hls] %s slot pressure eased level=%s", self.name, self._pressure_level)
+      self._cond.notify_all()
+
+  def acquire(self, tier: str, timeout: float) -> bool:
+    deadline = time.time() + max(0.05, float(timeout))
+    with self._cond:
+      while True:
+        if self._in_use < self.effective_max(tier):
+          self._in_use += 1
+          return True
+        remaining = deadline - time.time()
+        if remaining <= 0:
+          return False
+        self._cond.wait(timeout=min(2.0, remaining))
+
+  def release(self):
+    with self._cond:
+      self._in_use = max(0, self._in_use - 1)
+      self._cond.notify()
+
+  def stats(self, tier: str = "full") -> dict:
+    with self._lock:
+      return {
+        "name": self.name,
+        "in_use": self._in_use,
+        "ceiling": self.ceiling(tier),
+        "effective_max": self.effective_max(tier),
+        "pressure_level": self._pressure_level,
+        "pressure_until": int(self._pressure_until) if self._pressure_until else 0,
+      }
+
+
+_hls_nvenc_pool = _HlsHwSlotPool("nvenc", HLS_NVENC_MAX, HLS_NVENC_MAX_PREVIEW)
+_hls_intel_pool = _HlsHwSlotPool("intel", HLS_INTEL_MAX, HLS_INTEL_MAX_PREVIEW)
+_hls_hw_assign_counter = 0
+_hls_hw_assign_lock = threading.Lock()
 _hls_copy_blocked_sources: dict[str, str] = {}
 _hls_copy_blocked_guard = threading.Lock()
 _hls_playheads: dict[str, tuple[float, float]] = {}
 _hls_playheads_guard = threading.Lock()
+# 段请求推断的缓冲前沿（多窗口/iframe 时 progress 上报可能被节流，避免误杀 ffmpeg）
+_hls_segment_demand: dict[str, tuple[float, float]] = {}
+_hls_segment_demand_guard = threading.Lock()
+_hls_abandoned: set[str] = set()
+_hls_abandoned_guard = threading.Lock()
+_hls_preview_priority: dict[str, tuple[float, float]] = {}
+_hls_preview_priority_guard = threading.Lock()
+
+def _hls_norm_vid_id(vid_id: str) -> str:
+  v = str(vid_id or "").strip()
+  if v.lower().startswith("mp:"):
+    return v[3:]
+  return v
+
+def _hls_vid_matches(job_vid: str, req_vid: str) -> bool:
+  a = str(job_vid or "").strip()
+  b = str(req_vid or "").strip()
+  if not a or not b:
+    return False
+  if a == b:
+    return True
+  return _hls_norm_vid_id(a) == _hls_norm_vid_id(b)
+
+def _hls_abandon_key(vid_id: str, tier: str = "preview") -> str:
+  return f"{_hls_norm_vid_id(vid_id)}@{_hls_norm_tier(tier)}"
+
+def _hls_mark_abandoned(vid_id: str, tier: str = "preview"):
+  with _hls_abandoned_guard:
+    _hls_abandoned.add(_hls_abandon_key(vid_id, tier))
+
+def _hls_clear_abandoned(vid_id: str, tier: str = "preview"):
+  with _hls_abandoned_guard:
+    _hls_abandoned.discard(_hls_abandon_key(vid_id, tier))
+
+def _hls_is_abandoned(vid_id: str, tier: str = "preview") -> bool:
+  with _hls_abandoned_guard:
+    return _hls_abandon_key(vid_id, tier) in _hls_abandoned
+
+def _hls_priority_key(vid_id: str, tier: str = "preview") -> str:
+  return _hls_abandon_key(vid_id, tier)
+
+def _hls_set_preview_priority(vid_id: str, priority: float, tier: str = "preview"):
+  key = _hls_priority_key(vid_id, tier)
+  with _hls_preview_priority_guard:
+    _hls_preview_priority[key] = (float(priority), time.time())
+
+def _hls_get_preview_priority(vid_id: str, tier: str = "preview") -> float:
+  key = _hls_priority_key(vid_id, tier)
+  with _hls_preview_priority_guard:
+    return float((_hls_preview_priority.get(key) or (0.0, 0.0))[0])
+
+def _hls_preview_job_has_segment(job: dict, idx: int | None = None) -> bool:
+  if not job:
+    return False
+  vid = str(job.get("vid_id") or "")
+  tier = _hls_norm_tier(str(job.get("tier") or "preview"))
+  start = max(0, int(idx if idx is not None else job.get("start_index") or 0))
+  out_dir = _hls_dir_for(vid, tier)
+  return _hls_segment_file_ready(_hls_segment_path(out_dir, start))
+
+def _hls_evict_lower_preview_jobs(vid_id: str, only_if_slot_needed: bool = False) -> int:
+  """仅 evict 已有首段就绪的低优先级 job；warming（尚无 seg0）永不杀，避免 HLS 已 attach 但黑屏。"""
+  my_pri = _hls_get_preview_priority(vid_id, "preview")
+  victims: list[tuple[float, dict]] = []
+  with _hls_jobs_guard:
+    for job in list(_hls_jobs.values()):
+      if not job or job.get("done"):
+        continue
+      if _hls_norm_tier(str(job.get("tier") or "full")) != "preview":
+        continue
+      jvid = str(job.get("vid_id") or "")
+      if _hls_vid_matches(jvid, vid_id):
+        continue
+      jpri = _hls_get_preview_priority(jvid, "preview")
+      if jpri >= my_pri:
+        continue
+      if not _hls_preview_job_has_segment(job, 0):
+        continue
+      victims.append((jpri, job))
+  victims.sort(key=lambda x: x[0])
+  killed = 0
+  for _, job in victims:
+    logging.info(
+      "[hls] evict lower-priority preview job vid=%s pri=%s for vid=%s pri=%s",
+      job.get("vid_id"),
+      _hls_get_preview_priority(str(job.get("vid_id") or ""), "preview"),
+      vid_id,
+      my_pri,
+    )
+    _hls_kill_job(job)
+    killed += 1
+    if only_if_slot_needed:
+      break
+  return killed
 
 def _hls_lock(vid_id: str) -> threading.Lock:
   with _hls_locks_guard:
@@ -1959,13 +2475,585 @@ def _hls_mode_disabled(mode: str) -> bool:
     return mode in _hls_disabled_modes
 
 def _hls_disable_mode(mode: str, err: str = ""):
-  if mode not in {"nvenc", "qsv"}:
+  if mode not in _hls_hw_modes():
+    return
+  if not _hls_should_disable_mode(mode, err):
+    logging.warning("[hls] transient hw error mode=%s (not disabling): %s", mode, (err or "")[-240:])
     return
   with _hls_disabled_modes_guard:
     if mode in _hls_disabled_modes:
       return
     _hls_disabled_modes.add(mode)
+  _hls_encoder_probe_cache[mode] = False
+  _hls_save_hw_encoder_state()
   logging.warning("[hls] disable mode=%s after failure: %s", mode, (err or "")[-300:])
+
+def _hls_hardware_encoder_error(err: str) -> bool:
+  low = (err or "").casefold()
+  return any(m in low for m in _HLS_HW_ERR_MARKERS)
+
+def _hls_transient_hw_error(err: str) -> bool:
+  low = (err or "").casefold()
+  return any(m in low for m in _HLS_HW_ERR_TRANSIENT)
+
+def _hls_should_disable_mode(mode: str, err: str) -> bool:
+  if mode not in {"nvenc", "qsv", "vaapi"}:
+    return False
+  if not err:
+    return False
+  if _hls_transient_hw_error(err):
+    return False
+  return _hls_hardware_encoder_error(err)
+
+def _hls_hw_modes() -> set[str]:
+  return {"nvenc", "qsv", "vaapi"}
+
+def _hls_is_hw_mode(mode: str) -> bool:
+  return str(mode or "") in _hls_hw_modes()
+
+def _hls_release_job_hw_slot(job: dict | None):
+  if not job or job.get("hw_slot_released"):
+    return
+  if job.get("hw_slot"):
+    mode = str(job.get("hw_slot_mode") or job.get("mode") or "")
+    _hls_release_hw_slot(mode)
+  job["hw_slot_released"] = True
+
+def _hls_hw_slot_group(mode: str) -> str:
+  if mode == "nvenc":
+    return "nvenc"
+  if mode in {"qsv", "vaapi"}:
+    return "intel"
+  return ""
+
+def _hls_hw_slot_pool(grp: str) -> _HlsHwSlotPool | None:
+  if grp == "nvenc":
+    return _hls_nvenc_pool
+  if grp == "intel":
+    return _hls_intel_pool
+  return None
+
+def _hls_acquire_hw_slot(mode: str, timeout: float, tier: str = "full") -> bool:
+  grp = _hls_hw_slot_group(mode)
+  pool = _hls_hw_slot_pool(grp)
+  if pool is None:
+    return True
+  return pool.acquire(tier, timeout)
+
+def _hls_release_hw_slot(mode: str):
+  grp = _hls_hw_slot_group(mode)
+  pool = _hls_hw_slot_pool(grp)
+  if pool is None:
+    return
+  try:
+    pool.release()
+  except ValueError:
+    pass
+
+def _hls_note_hw_slot_pressure(mode: str, err: str = ""):
+  if err and not _hls_transient_hw_error(err):
+    return
+  grp = _hls_hw_slot_group(mode)
+  pool = _hls_hw_slot_pool(grp)
+  if pool:
+    pool.note_transient_pressure()
+
+def _hls_hw_concurrent_max(tier: str = "preview") -> int:
+  tier = _hls_norm_tier(tier)
+  hw = _hls_available_hw_modes()
+  total = 0
+  if "nvenc" in hw and not _hls_mode_disabled("nvenc"):
+    total += _hls_nvenc_pool.effective_max(tier)
+  if any(m in hw for m in ("qsv", "vaapi")) and not (
+    _hls_mode_disabled("qsv") and _hls_mode_disabled("vaapi")
+  ):
+    total += _hls_intel_pool.effective_max(tier)
+  return max(1, total)
+
+def _hls_hw_capacity(tier: str = "preview") -> dict:
+  tier = _hls_norm_tier(tier)
+  hw = _hls_available_hw_modes()
+  out = {
+    "ok": True,
+    "tier": tier,
+    "dynamic": HLS_HW_SLOTS_DYNAMIC,
+    "dual_gpu": _hls_dual_gpu_enabled(),
+    "concurrent_max": _hls_hw_concurrent_max(tier),
+    "nvenc": _hls_nvenc_pool.stats(tier) if "nvenc" in hw else None,
+    "intel": _hls_intel_pool.stats(tier) if any(m in hw for m in ("qsv", "vaapi")) else None,
+    "nvenc_max_full": HLS_NVENC_MAX,
+    "intel_max_full": HLS_INTEL_MAX,
+    "nvenc_max_preview": HLS_NVENC_MAX_PREVIEW,
+    "intel_max_preview": HLS_INTEL_MAX_PREVIEW,
+  }
+  return out
+
+def _hls_hw_slot_recovery():
+  while True:
+    try:
+      time.sleep(30)
+      _hls_nvenc_pool.tick_recovery()
+      _hls_intel_pool.tick_recovery()
+    except Exception as e:
+      logging.warning("[hls] hw slot recovery error: %s", e)
+
+def _hls_available_hw_modes() -> list[str]:
+  modes: list[str] = []
+  if not _hls_mode_disabled("nvenc") and _hls_encoder_available("nvenc"):
+    modes.append("nvenc")
+  intel: str | None = None
+  if not _hls_mode_disabled("qsv") and _hls_encoder_available("qsv"):
+    intel = "qsv"
+  elif not _hls_mode_disabled("vaapi") and _hls_encoder_available("vaapi"):
+    intel = "vaapi"
+  if intel:
+    modes.append(intel)
+  return modes
+
+def _hls_dual_gpu_enabled() -> bool:
+  if HLS_DUAL_GPU in {"0", "false", "no", "off"}:
+    return False
+  if HLS_DUAL_GPU in {"1", "true", "yes", "on"}:
+    return True
+  hw = _hls_available_hw_modes()
+  return ("nvenc" in hw) and any(m in hw for m in ("qsv", "vaapi"))
+
+def _hls_pick_hw_mode(vid_id: str | None) -> str | None:
+  modes = _hls_available_hw_modes()
+  if not modes:
+    return None
+  if len(modes) == 1:
+    return modes[0]
+  if not _hls_dual_gpu_enabled():
+    return modes[0]
+  seed = str(vid_id or "")
+  with _hls_hw_assign_lock:
+    global _hls_hw_assign_counter
+    _hls_hw_assign_counter += 1
+    n = _hls_hw_assign_counter
+  nvenc_ok = "nvenc" in modes
+  intel_mode = next((m for m in modes if m != "nvenc"), None)
+  if nvenc_ok and intel_mode:
+    if seed:
+      return "nvenc" if (hash(seed) % 2 == 0) else intel_mode
+    return "nvenc" if (n % 2 == 0) else intel_mode
+  return modes[n % len(modes)]
+
+def _hls_running_jobs_summary() -> dict:
+  summary = {"total": 0, "hw": 0, "by_mode": {}, "jobs": []}
+  with _hls_jobs_guard:
+    for key, job in _hls_jobs.items():
+      if not job or job.get("done") or job.get("killed"):
+        continue
+      proc = job.get("proc")
+      try:
+        running = proc is None or proc.poll() is None
+      except Exception:
+        running = False
+      if not running:
+        continue
+      mode = str(job.get("mode") or "")
+      summary["total"] += 1
+      if _hls_is_hw_mode(mode):
+        summary["hw"] += 1
+      summary["by_mode"][mode] = int(summary["by_mode"].get(mode) or 0) + 1
+      if len(summary["jobs"]) < 12:
+        summary["jobs"].append({
+          "key": key,
+          "vid": job.get("vid_id"),
+          "mode": mode,
+          "tier": job.get("tier") or "full",
+        })
+  summary["nvenc_max"] = HLS_NVENC_MAX
+  summary["intel_max"] = HLS_INTEL_MAX
+  summary["nvenc_max_preview"] = HLS_NVENC_MAX_PREVIEW
+  summary["intel_max_preview"] = HLS_INTEL_MAX_PREVIEW
+  summary["nvenc_slots"] = _hls_nvenc_pool.stats("full")
+  summary["intel_slots"] = _hls_intel_pool.stats("full")
+  summary["preview_concurrent_max"] = _hls_hw_concurrent_max("preview")
+  summary["prefer_gpu"] = HLS_PREFER_GPU
+  summary["dual_gpu"] = _hls_dual_gpu_enabled()
+  return summary
+
+def _hls_load_hw_encoder_state():
+  try:
+    with open(_HLS_HW_STATE_PATH, "r", encoding="utf-8") as f:
+      data = json.load(f)
+  except Exception:
+    return
+  if not isinstance(data, dict):
+    return
+  saved_ff = str(data.get("ffmpeg_version") or "").strip()
+  current_ff = _hls_ffmpeg_version()
+  if not saved_ff or (current_ff and saved_ff != current_ff):
+    if data.get("probe") or data.get("disabled"):
+      logging.info("[hls] ignore stale hw probe cache (ffmpeg_version missing or changed)")
+    return
+  for mode, ok in (data.get("probe") or {}).items():
+    if mode in {"nvenc", "qsv", "vaapi"}:
+      _hls_encoder_probe_cache[str(mode)] = bool(ok)
+  with _hls_disabled_modes_guard:
+    for mode in (data.get("disabled") or []):
+      if mode in {"nvenc", "qsv", "vaapi"}:
+        _hls_disabled_modes.add(str(mode))
+
+def _hls_save_hw_encoder_state():
+  try:
+    with _hls_disabled_modes_guard:
+      disabled = sorted(_hls_disabled_modes)
+    data = {
+      "ffmpeg_version": _hls_ffmpeg_version(),
+      "probe": {k: v for k, v in _hls_encoder_probe_cache.items() if k in {"nvenc", "qsv", "vaapi"}},
+      "disabled": disabled,
+      "updated_at": int(time.time()),
+    }
+    tmp = _HLS_HW_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+      json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _HLS_HW_STATE_PATH)
+  except Exception as e:
+    logging.warning("[hls] save hw encoder state failed: %s", e)
+
+def _hls_qsv_init_options() -> list[tuple[str, list[str]]]:
+  """ffmpeg 7 QSV 设备初始化（按优先级尝试）。"""
+  dev = HLS_QSV_DEVICE
+  if not dev or not os.path.exists(dev):
+    return []
+  driver = os.getenv("LIBVA_DRIVER_NAME", "iHD")
+  return [
+    ("legacy-qsv", ["-qsv_device", dev]),
+    ("hw-child-vaapi", [
+      "-init_hw_device", f"qsv=hw,child_device={dev},child_device_type=vaapi",
+      "-filter_hw_device", "hw",
+    ]),
+    ("hw-child", [
+      "-init_hw_device", f"qsv=hw,child_device={dev}",
+      "-filter_hw_device", "hw",
+    ]),
+    ("va-derived", [
+      "-init_hw_device", f"vaapi=va:{dev},driver={driver}",
+      "-init_hw_device", "qsv=hw@va",
+      "-filter_hw_device", "hw",
+    ]),
+  ]
+
+def _hls_ffmpeg_hw_prefix(mode: str) -> list[str]:
+  if mode == "qsv":
+    if _hls_qsv_hw_prefix:
+      return list(_hls_qsv_hw_prefix)
+    opts = _hls_qsv_init_options()
+    return list(opts[0][1]) if opts else []
+  if mode == "vaapi":
+    dev = HLS_QSV_DEVICE
+    driver = os.getenv("LIBVA_DRIVER_NAME", "iHD")
+    if dev and os.path.exists(dev):
+      return ["-init_hw_device", f"vaapi=va:{dev},driver={driver}", "-filter_hw_device", "va"]
+    return []
+  if mode == "nvenc" and _hls_use_nvenc_cuda():
+    return ["-init_hw_device", "cuda=cu:0", "-filter_hw_device", "cu"]
+  return []
+
+def _hls_runtime_probe_encoder(mode: str) -> bool:
+  global _hls_nvenc_probe_cuda, _hls_qsv_hw_prefix
+  if mode == "nvenc":
+    attempts: list[tuple[str, list[str]]] = []
+    if _hls_nvenc_env_cuda and _hls_nvenc_has_nvidia():
+      attempts.append(("cuda", ["-init_hw_device", "cuda=cu:0", "-filter_hw_device", "cu"]))
+    attempts += [
+      ("plain", []),
+      ("plain-auto", []),
+    ]
+  elif mode == "qsv":
+    attempts = _hls_qsv_init_options()
+  else:
+    return False
+  last_err = ""
+  attempt_errors: dict[str, str] = {}
+  for variant, hw_prefix in attempts:
+    cmd = _hls_runtime_probe_cmd(mode, variant, hw_prefix)
+    try:
+      proc = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=15,
+      )
+      if proc.returncode == 0:
+        if mode == "nvenc":
+          _hls_nvenc_probe_cuda = (variant == "cuda")
+          logging.info("[hls] nvenc probe ok via %s (probe_cuda=%s transcode_cuda=%s)",
+                       variant, _hls_nvenc_probe_cuda, _hls_use_nvenc_cuda())
+        elif mode == "qsv":
+          _hls_qsv_hw_prefix = list(hw_prefix)
+          logging.info("[hls] qsv probe ok via %s", variant)
+        _hls_runtime_probe_last_errors.pop(mode, None)
+        _hls_runtime_probe_attempt_errors.pop(mode, None)
+        return True
+      last_err = (proc.stderr or b"").decode("utf-8", errors="ignore")
+      attempt_errors[variant] = last_err[-600:]
+    except Exception as e:
+      last_err = str(e)
+      attempt_errors[variant] = last_err
+  if attempt_errors:
+    _hls_runtime_probe_attempt_errors[mode] = attempt_errors
+  if last_err:
+    _hls_runtime_probe_last_errors[mode] = last_err
+  if _hls_hardware_encoder_error(last_err):
+    _hls_disable_mode(mode, last_err)
+  return False
+
+def _hls_runtime_probe_vaapi() -> bool:
+  dev = HLS_QSV_DEVICE
+  driver = os.getenv("LIBVA_DRIVER_NAME", "iHD")
+  if not dev or not os.path.exists(dev):
+    return False
+  cmd = [
+    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+    "-init_hw_device", f"vaapi=va:{dev},driver={driver}",
+    "-filter_hw_device", "va",
+    "-f", "lavfi", "-i", f"testsrc=size={HLS_HW_PROBE_SIZE}:rate=1",
+    "-frames:v", "1", "-an",
+    "-vf", "format=nv12,hwupload",
+    "-c:v", "h264_vaapi", "-qp", "24",
+    "-f", "null", "-",
+  ]
+  try:
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+    if proc.returncode == 0:
+      _hls_runtime_probe_last_errors.pop("vaapi", None)
+      return True
+    err = (proc.stderr or b"").decode("utf-8", errors="ignore")
+    _hls_runtime_probe_last_errors["vaapi"] = err
+    _hls_runtime_probe_attempt_errors["vaapi"] = {"vaapi": err[-600:]}
+    return False
+  except Exception as e:
+    _hls_runtime_probe_last_errors["vaapi"] = str(e)
+    return False
+
+def _hls_runtime_probe_cmd(mode: str, variant: str, hw_prefix: list[str] | None = None) -> list[str]:
+  encoder = "h264_nvenc" if mode == "nvenc" else "h264_qsv"
+  cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+  prefix = list(hw_prefix or [])
+  input_args = [
+    "-f", "lavfi", "-i", f"testsrc=size={HLS_HW_PROBE_SIZE}:rate=1",
+    "-frames:v", "1", "-an",
+  ]
+  if mode == "qsv":
+    cmd += prefix
+    if variant == "legacy-qsv":
+      cmd += input_args + ["-pix_fmt", "nv12", "-c:v", encoder]
+    else:
+      cmd += input_args + ["-vf", "format=nv12,hwupload=extra_hw_frames=64", "-c:v", encoder]
+  elif mode == "nvenc" and variant == "cuda":
+    cmd += prefix + input_args + [
+      "-vf", "format=nv12,hwupload=extra_hw_frames=64",
+      "-c:v", encoder,
+    ]
+  else:
+    cmd += prefix + input_args + ["-pix_fmt", "yuv420p", "-c:v", encoder]
+    if mode == "nvenc" and variant == "plain":
+      cmd += ["-gpu", "0"]
+  cmd += ["-f", "null", "-"]
+  return cmd
+
+def _hls_preview_scale_dims(src_path: str) -> tuple[int, int]:
+  """preview 缩放目标尺寸：保持宽高比、偶数、≤ 配置上限，且不放大。
+
+  scale_qsv 这版不支持 force_original_aspect_ratio、scale_cuda 配 format 又会触发
+  格式转换错误，所以这里在 Python 里算好定宽高，直接喂给硬件 scaler（最兼容）。
+  """
+  info = _probe_hls_codecs(src_path)
+  try:
+    sw = int(info.get("width") or 0)
+    sh = int(info.get("height") or 0)
+  except Exception:
+    sw = sh = 0
+  maxw, maxh = HLS_PREVIEW_MAX_WIDTH, HLS_PREVIEW_MAX_HEIGHT
+  if sw <= 0 or sh <= 0:
+    return maxw, maxh
+  scale = min(maxw / sw, maxh / sh, 1.0)
+  tw = max(2, (int(round(sw * scale)) // 2) * 2)
+  th = max(2, (int(round(sh * scale)) // 2) * 2)
+  return tw, th
+
+def _hls_video_filter_chain(mode: str, pix_fmt: str, tier: str = "full", src_path: str = "") -> list[str]:
+  preview = _hls_is_preview_tier(tier)
+  is_hw = mode in {"nvenc", "qsv", "vaapi"} and not (mode == "nvenc" and not _hls_use_nvenc_cuda())
+  if is_hw:
+    # GPU 解码帧在显存里，缩放必须用对应硬件 scaler，且只传定宽高（不用 force_original_aspect_ratio
+    # / format / 表达式 —— 部分 jellyfin-ffmpeg 版本不支持，会直接 Option not found 或格式转换失败）。
+    # 全屏不缩放：不加 -vf，编码器直接吃 GPU 帧（8bit/10bit 由 nvenc/qsv 内部处理）。
+    if not preview:
+      return []
+    tw, th = _hls_preview_scale_dims(src_path) if src_path else (HLS_PREVIEW_MAX_WIDTH, HLS_PREVIEW_MAX_HEIGHT)
+    if mode == "qsv":
+      return ["-vf", f"scale_qsv=w={tw}:h={th}:format=nv12"]
+    if mode == "vaapi":
+      return ["-vf", f"scale_vaapi=w={tw}:h={th}:format=nv12"]
+    return ["-vf", f"scale_cuda={tw}:{th}"]  # nvenc/cuda：不带 format，nvenc 直接编码 cuda 帧
+  # 软件编码（libx264 / nvenc 无 cuda）：系统内存帧，CPU 滤镜可用全功能语法
+  w, h = HLS_PREVIEW_MAX_WIDTH, HLS_PREVIEW_MAX_HEIGHT
+  chain = ""
+  if preview:
+    chain = f"scale='min(iw,{w})':'min(ih,{h})':force_original_aspect_ratio=decrease,"
+  chain += "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+  chain += f",format={pix_fmt}"
+  return ["-vf", chain]
+
+def _hls_color_out_args(mode: str) -> list[str]:
+  """硬件转码路径用输出参数打 bt709 色彩标签（替代会破坏 GPU 帧的 setparams 滤镜）。"""
+  if mode in {"nvenc", "qsv", "vaapi"}:
+    return ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+  return []
+
+def _hls_bootstrap_hw_state():
+  if HLS_HW_PROBE_RESET:
+    with _hls_disabled_modes_guard:
+      _hls_disabled_modes.clear()
+    _hls_encoder_probe_cache.clear()
+    global _hls_qsv_hw_prefix
+    _hls_qsv_hw_prefix = []
+    try:
+      os.remove(_HLS_HW_STATE_PATH)
+      logging.info("[hls] hardware encoder state reset (HLS_HW_PROBE_RESET=1)")
+    except FileNotFoundError:
+      pass
+    except OSError as e:
+      logging.warning("[hls] hw probe reset failed: %s", e)
+    return
+  _hls_load_hw_encoder_state()
+  with _hls_disabled_modes_guard:
+    stale = sorted(_hls_disabled_modes)
+  if stale:
+    recovered: list[str] = []
+    for mode in stale:
+      with _hls_disabled_modes_guard:
+        _hls_disabled_modes.discard(mode)
+      _hls_encoder_probe_cache.pop(mode, None)
+      if _hls_encoder_available(mode):
+        recovered.append(mode)
+    if recovered:
+      logging.info("[hls] recovered hw modes from stale state file: %s", recovered)
+      _hls_save_hw_encoder_state()
+    elif stale:
+      logging.warning(
+        "[hls] disabled_modes=%s still failing; delete %s or set HLS_HW_PROBE_RESET=1",
+        stale, _HLS_HW_STATE_PATH,
+      )
+
+def _hls_gpu_diag() -> dict:
+  qsv_dev = HLS_QSV_DEVICE
+  out = {
+    "ffmpeg_version": _hls_ffmpeg_version(),
+    "qsv_device": qsv_dev,
+    "qsv_device_exists": bool(qsv_dev and os.path.exists(qsv_dev)),
+    "nvenc_cuda": _hls_use_nvenc_cuda(),
+    "nvenc_probe_cuda": _hls_nvenc_probe_cuda,
+    "nvenc_env_cuda": _hls_nvenc_env_cuda,
+    "hw_encode_max": HLS_NVENC_MAX + HLS_INTEL_MAX,
+    "hw_encode_max_preview": HLS_NVENC_MAX_PREVIEW + HLS_INTEL_MAX_PREVIEW,
+    "preview_concurrent_max": _hls_hw_concurrent_max("preview"),
+    "full_concurrent_max": _hls_hw_concurrent_max("full"),
+    "hw_slots_dynamic": HLS_HW_SLOTS_DYNAMIC,
+    "nvenc_slots": _hls_nvenc_pool.stats("preview"),
+    "intel_slots": _hls_intel_pool.stats("preview"),
+    "nvenc_max": HLS_NVENC_MAX,
+    "intel_max": HLS_INTEL_MAX,
+    "nvenc_max_preview": HLS_NVENC_MAX_PREVIEW,
+    "intel_max_preview": HLS_INTEL_MAX_PREVIEW,
+    "prefer_gpu": HLS_PREFER_GPU,
+    "dual_gpu": _hls_dual_gpu_enabled(),
+    "available_hw_modes": _hls_available_hw_modes(),
+    "running_jobs": _hls_running_jobs_summary(),
+    "disabled_modes": sorted(_hls_disabled_modes),
+    "probe_cache": dict(_hls_encoder_probe_cache),
+    "hw_state_path": _HLS_HW_STATE_PATH,
+  }
+  try:
+    proc = subprocess.run(
+      ["vainfo"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      timeout=8,
+      text=True,
+    )
+    out["vainfo_rc"] = proc.returncode
+    out["vainfo"] = (proc.stdout or "")[-2000:]
+  except Exception as e:
+    out["vainfo_error"] = str(e)
+  try:
+    proc = subprocess.run(
+      ["nvidia-smi", "-L"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      timeout=5,
+      text=True,
+    )
+    out["nvidia_smi_rc"] = proc.returncode
+    out["nvidia_smi"] = (proc.stdout or "").strip()[:500]
+  except Exception as e:
+    out["nvidia_smi_error"] = str(e)
+  try:
+    out["nvidia_devices"] = sorted(
+      n for n in os.listdir("/dev") if n.startswith("nvidia") or n == "nvidiactl"
+    )
+  except Exception as e:
+    out["nvidia_devices_error"] = str(e)
+  out["nvidia_driver_capabilities"] = os.getenv("NVIDIA_DRIVER_CAPABILITIES", "")
+  if out.get("nvidia_smi_rc") == 0 and not any("uvm" in str(d) for d in (out.get("nvidia_devices") or [])):
+    out["nvidia_hint"] = (
+      "nvidia-smi 可用但可能未挂载 video 编码设备；"
+      "请在 docker run / 群晖创建容器时设置 "
+      "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility（runtime.env 太晚无效）"
+    )
+  for mode in ("nvenc", "qsv", "vaapi"):
+    try:
+      ok = _hls_encoder_available(mode) if not _hls_mode_disabled(mode) else False
+      out[f"{mode}_available"] = ok
+      if not ok:
+        err = _hls_runtime_probe_last_errors.get(mode, "")
+        if err:
+          out[f"{mode}_probe_error"] = err[-800:]
+        attempts = _hls_runtime_probe_attempt_errors.get(mode)
+        if attempts:
+          out[f"{mode}_probe_attempts"] = attempts
+    except Exception as e:
+      out[f"{mode}_available"] = False
+      out[f"{mode}_error"] = str(e)
+  return out
+
+def _hls_ffmpeg_version() -> str:
+  try:
+    proc = subprocess.run(
+      ["ffmpeg", "-hide_banner", "-version"],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+      timeout=5,
+      text=True,
+    )
+    line = (proc.stdout or "").splitlines()[0] if proc.stdout else ""
+    return line.strip()
+  except Exception:
+    return ""
+
+def _hls_log_startup_gpu_probe():
+  try:
+    ver = _hls_ffmpeg_version()
+    if ver:
+      logging.info("[hls] %s", ver)
+    diag = _hls_gpu_diag()
+    logging.info(
+      "[hls] gpu probe: nvenc=%s qsv=%s vaapi=%s disabled=%s qsv_dev=%s",
+      diag.get("nvenc_available"),
+      diag.get("qsv_available"),
+      diag.get("vaapi_available"),
+      diag.get("disabled_modes"),
+      diag.get("qsv_device"),
+    )
+    if diag.get("disabled_modes"):
+      logging.info("[hls] tip: delete %s or set HLS_HW_PROBE_RESET=1 after fixing GPU", _HLS_HW_STATE_PATH)
+  except Exception as e:
+    logging.warning("[hls] startup gpu probe failed: %s", e)
 
 def _hls_copy_block_key(src_path: str) -> str:
   return _hls_source_version(src_path)
@@ -1985,12 +3073,14 @@ def _hls_block_copy_for_source(src_path: str, reason: str):
   logging.warning("[hls] disable copy for source=%s: %s", src_path, reason)
 
 def _hls_encoder_available(mode: str) -> bool:
-  if mode not in {"nvenc", "qsv"}:
+  if mode not in {"nvenc", "qsv", "vaapi"}:
     return True
+  if _hls_mode_disabled(mode):
+    return False
   cached = _hls_encoder_probe_cache.get(mode)
   if cached is not None:
     return cached
-  encoder = "h264_nvenc" if mode == "nvenc" else "h264_qsv"
+  encoder = {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "vaapi": "h264_vaapi"}[mode]
   try:
     proc = subprocess.run(
       ["ffmpeg", "-hide_banner", "-loglevel", "error", "-h", f"encoder={encoder}"],
@@ -1998,12 +3088,24 @@ def _hls_encoder_available(mode: str) -> bool:
       stderr=subprocess.PIPE,
       timeout=5,
     )
-    ok = proc.returncode == 0
-  except Exception:
-    ok = False
+    if proc.returncode != 0:
+      err = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="ignore")[-500:]
+      _hls_encoder_probe_cache[mode] = False
+      _hls_disable_mode(mode, f"encoder unavailable: {encoder} {err}")
+      return False
+  except Exception as e:
+    _hls_encoder_probe_cache[mode] = False
+    _hls_disable_mode(mode, str(e))
+    return False
+  if mode == "vaapi":
+    ok = _hls_runtime_probe_vaapi()
+  else:
+    ok = _hls_runtime_probe_encoder(mode)
   _hls_encoder_probe_cache[mode] = ok
-  if not ok:
-    _hls_disable_mode(mode, f"encoder unavailable: {encoder}")
+  if ok:
+    _hls_save_hw_encoder_state()
+  elif not _hls_mode_disabled(mode):
+    logging.warning("[hls] %s runtime probe failed (not disabled); check GPU mount", mode)
   return ok
 
 def _hls_meta_path(out_dir: str) -> str:
@@ -2013,7 +3115,7 @@ def _hls_source_stat(src_path: str) -> tuple[int, int]:
   st = os.stat(src_path)
   return int(st.st_mtime), int(st.st_size)
 
-def _hls_cache_matches(out_dir: str, src_path: str) -> bool:
+def _hls_cache_matches(out_dir: str, src_path: str, tier: str = "full") -> bool:
   try:
     with open(_hls_meta_path(out_dir), "r", encoding="utf-8") as f:
       meta = json.load(f)
@@ -2023,7 +3125,7 @@ def _hls_cache_matches(out_dir: str, src_path: str) -> bool:
       logging.warning("[hls] invalidate oversized segment cache: %s size=%s", first_seg, os.path.getsize(first_seg))
       return False
     return (
-      meta.get("pipeline_version") == HLS_PIPELINE_VERSION
+      meta.get("pipeline_version") == _hls_pipeline_version(tier)
       and int(meta.get("source_mtime") or 0) == mtime
       and int(meta.get("source_size") or 0) == size
     )
@@ -2060,7 +3162,7 @@ def _probe_hls_codecs(src_path: str) -> dict:
     p = subprocess.run(
       [
         "ffprobe", "-v", "error",
-        "-show_entries", "stream=index,codec_type,codec_name,pix_fmt,duration,avg_frame_rate,r_frame_rate,color_space,color_transfer,color_primaries:format=duration",
+        "-show_entries", "stream=index,codec_type,codec_name,pix_fmt,width,height,duration,avg_frame_rate,r_frame_rate,color_space,color_transfer,color_primaries:format=duration",
         "-of", "json",
         src_path,
       ],
@@ -2090,6 +3192,11 @@ def _probe_hls_codecs(src_path: str) -> dict:
       if typ == "video" and not info["video"]:
         info["video"] = (s.get("codec_name") or "").lower()
         info["pix_fmt"] = (s.get("pix_fmt") or "").lower()
+        try:
+          info["width"] = int(s.get("width") or 0)
+          info["height"] = int(s.get("height") or 0)
+        except Exception:
+          info["width"] = info["height"] = 0
         info["color_space"] = (s.get("color_space") or "").lower()
         info["color_transfer"] = (s.get("color_transfer") or "").lower()
         info["color_primaries"] = (s.get("color_primaries") or "").lower()
@@ -2256,26 +3363,32 @@ def _hls_keyframe_args(src_path: str, mode: str, start_number: int = 0) -> list[
     "-keyint_min:v:0", str(gop),
     "-sc_threshold:v:0", "0",
   ]
-  if mode in {"nvenc", "qsv"}:
+  if mode in {"nvenc", "qsv", "vaapi"}:
     return gop_args
   if mode == "libx264":
     # 与 Jellyfin 的 HLS 转码策略一致：libx264 用强制关键帧，并关闭场景切换关键帧干扰。
     return keyframes + ["-sc_threshold:v:0", "0"]
   return keyframes + gop_args
 
-def _hls_color_normalize_filter(pix_fmt: str = "yuv420p") -> list[str]:
-  return [
-    "-vf",
-    # 先覆盖色彩属性，再做像素格式转换；不需要缩放时避免额外 scale 触发异常源的色彩矩阵校验。
-    "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
-    f"format={pix_fmt}",
-  ]
+def _hls_color_normalize_filter(pix_fmt: str = "yuv420p", mode: str = "", tier: str = "full", src_path: str = "") -> list[str]:
+  return _hls_video_filter_chain(mode, pix_fmt, tier, src_path)
 
-def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, start_number: int = 0, start_time: float = 0.0) -> list[str]:
+def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, start_number: int = 0, start_time: float = 0.0, tier: str = "full") -> list[str]:
   """生成单个连续 HLS job 的 ffmpeg 命令。"""
+  preview = _hls_is_preview_tier(tier)
+  audio_br = HLS_PREVIEW_AUDIO_BITRATE if preview else "192k"
   muxer = _hls_base_muxer_args(seg_pat, playlist, start_number)
   keyframes = _hls_keyframe_args(src_path, mode, start_number)
   base = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y"]
+  base += _hls_ffmpeg_hw_prefix(mode)
+  if mode == "nvenc" and _hls_use_nvenc_cuda():
+    base += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+  elif mode == "qsv":
+    base += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+  elif mode == "vaapi":
+    dev = HLS_QSV_DEVICE
+    if dev and os.path.exists(dev):
+      base += ["-hwaccel", "vaapi", "-hwaccel_device", dev, "-hwaccel_output_format", "vaapi"]
   if start_time > 0:
     base += ["-ss", f"{max(0.0, start_time):.3f}"]
   base += [
@@ -2284,11 +3397,16 @@ def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, sta
     "-map_chapters", "-1",
     "-map", "0:v:0?",
     "-map", "0:a:0?",
-    "-copyts",
-    "-avoid_negative_ts", "disabled",
-    "-start_at_zero",
-    "-max_muxing_queue_size", "1024",
   ]
+  is_copy = mode in {"copy", "copyfix"}
+  # copyts/start_at_zero 仅用于 copy（保段间连续）和 seek 续接；从头转码用它们时，
+  # 若源起始 PTS 偏大或音视频起点错位，HLS 切片器会一直等对齐导致 seg0 永不产出。
+  # 从头转码改用默认时间戳归零，seg0 立即可切。
+  if is_copy or start_time > 0:
+    base += ["-copyts", "-avoid_negative_ts", "disabled", "-start_at_zero"]
+  else:
+    base += ["-avoid_negative_ts", "make_zero"]
+  base += ["-max_muxing_queue_size", "1024"]
   if mode == "copy":
     # 纯 remux，秒切、零 GPU；只在探测为浏览器可播时进入 copy。
     return base + ["-c", "copy"] + muxer
@@ -2298,27 +3416,40 @@ def _hls_cmd_for_mode(mode: str, src_path: str, seg_pat: str, playlist: str, sta
       "-bsf:v", "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
     ] + muxer
   if mode == "nvenc":
-    return base + [
-      "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
-      "-rc", "vbr", "-cq", "24", "-b:v", "0",
-      *keyframes,
-      *_hls_color_normalize_filter("yuv420p"),
-      "-c:a", "aac", "-b:a", "192k",
+    cq = "28" if preview else "24"
+    enc = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
+           "-rc", "vbr", "-cq", cq, "-b:v", "0"]
+    if preview:
+      enc += ["-maxrate", "3M", "-bufsize", "6M"]
+    if not _hls_use_nvenc_cuda():
+      enc += ["-gpu", "0"]
+    return base + enc + keyframes + _hls_color_normalize_filter("yuv420p", mode, tier, src_path) + _hls_color_out_args(mode) + [
+      "-c:a", "aac", "-b:a", audio_br,
     ] + muxer
   if mode == "qsv":
+    gq = "28" if preview else "22"
     return base + [
-      "-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "22",
+      "-c:v", "h264_qsv", "-preset", "medium", "-global_quality", gq,
       *keyframes,
-      *_hls_color_normalize_filter("nv12"),
-      "-c:a", "aac", "-b:a", "192k",
+      *_hls_color_normalize_filter("nv12", mode, tier, src_path),
+      *_hls_color_out_args(mode),
+      "-c:a", "aac", "-b:a", audio_br,
     ] + muxer
-  return base + [
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-    *keyframes,
-    # 有些创意工坊视频带异常/缺失色彩元数据，ffmpeg 自动 scale/filter 会报
-    # "Invalid color space"。转码路径显式指定输入/输出矩阵，避免首段完全产不出。
-    *_hls_color_normalize_filter("yuv420p"),
-    "-c:a", "aac", "-b:a", "192k",
+  if mode == "vaapi":
+    qp = "28" if preview else "24"
+    return base + [
+      "-c:v", "h264_vaapi", "-qp", qp,
+      *keyframes,
+      *_hls_color_normalize_filter("nv12", "vaapi", tier, src_path),
+      *_hls_color_out_args("vaapi"),
+      "-c:a", "aac", "-b:a", audio_br,
+    ] + muxer
+  crf = "26" if preview else "22"
+  x264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf]
+  if preview:
+    x264 += ["-maxrate", "3M", "-bufsize", "6M"]
+  return base + x264 + keyframes + _hls_color_normalize_filter("yuv420p", "libx264", tier, src_path) + [
+    "-c:a", "aac", "-b:a", audio_br,
   ] + muxer
 
 def _hls_attempt_chain() -> list[str]:
@@ -2332,35 +3463,89 @@ def _hls_attempt_chain() -> list[str]:
     return prefix + ["qsv"]
   if HLS_TRANSCODE_FALLBACK == "libx264":
     return prefix + ["libx264"]
-  # auto：默认 nvenc → qsv → libx264；显式 HLS_ALLOW_COPY=1 时才先 copy
-  return prefix + ["nvenc", "qsv", "libx264"]
+  # auto：默认 nvenc → qsv → vaapi → libx264；显式 HLS_ALLOW_COPY=1 时才先 copy
+  return prefix + ["nvenc", "qsv", "vaapi", "libx264"]
 
-def _hls_attempt_chain_for_source(src_path: str) -> list[str]:
+def _hls_attempt_chain_for_source(src_path: str, tier: str = "full", vid_id: str | None = None) -> list[str]:
   attempts = _hls_attempt_chain()
+  if _hls_is_preview_tier(tier):
+    attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
   copy_blocked = _hls_copy_blocked_for_source(src_path)
   if HLS_ALLOW_COPY and not copy_blocked and _hls_can_copy_for_browser(src_path) and _hls_needs_h264_metadata_fix(src_path):
     attempts = ["copyfix"] + [x for x in attempts if x != "copy"]
   if copy_blocked:
     attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
-  if _hls_copy_risky_for_browser(src_path):
-    # 超大/高码率 + 长 GOP：copy 首段可能 GB 级，hls.js 解析即 OOM → 直接走带关键帧的转码
+  # 全屏(full)：浏览器可播的 H.264/AAC 一律优先 copy（只切片、不转码、不占 GPU），
+  # 即使码率/体积大；万一某段 copy 出来超大，由 _hls_segment_oversized 自动回退转码。
+  # preview 顶上已剔除 copy（必须降分辨率），这里的 copy_risky 仅在“非 full 或不可 copy”时才剔。
+  if _hls_copy_risky_for_browser(src_path) and not (
+    not _hls_is_preview_tier(tier) and _hls_can_copy_for_browser(src_path)
+  ):
     attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
   if ("copy" in attempts or "copyfix" in attempts) and not _hls_can_copy_for_browser(src_path):
-    # fallback=none 明确表示只想 copy，就尊重配置；其他模式直接跳过注定会被浏览器解析失败的 copy。
     if HLS_TRANSCODE_FALLBACK != "none":
       attempts = [x for x in attempts if x not in {"copy", "copyfix"}]
+
+  copy_prefix = [x for x in attempts if x in {"copy", "copyfix"}]
+  hw_modes = _hls_available_hw_modes()
+  if hw_modes:
+    primary = _hls_pick_hw_mode(vid_id)
+    if primary and primary in hw_modes:
+      hw_chain = [primary] + [m for m in hw_modes if m != primary]
+    else:
+      hw_chain = list(hw_modes)
+    # NVDEC 对 H.264 不保证 >1080p（4K H.264 常解码空转）。高分辨率 H.264 优先走
+    # Intel QSV 解码（4K H.264 没问题），nvenc 退到后面；HEVC/4K 等 NVDEC 原生支持不受影响。
+    info = _probe_hls_codecs(src_path)
+    if (info.get("video") or "") == "h264" and int(info.get("height") or 0) > 1080:
+      intel = next((m for m in hw_chain if m in {"qsv", "vaapi"}), None)
+      if intel:
+        hw_chain = [intel] + [m for m in hw_chain if m != intel]
+    attempts = copy_prefix + hw_chain
+  else:
+    attempts = [x for x in attempts if x in {"copy", "copyfix"} or not _hls_is_hw_mode(x)]
+
   attempts = [x for x in attempts if not _hls_mode_disabled(x)]
-  attempts = [x for x in attempts if _hls_encoder_available(x)]
-  if not attempts and HLS_TRANSCODE_FALLBACK != "none":
-    attempts = ["libx264"]
+  validated: list[str] = []
+  for x in attempts:
+    if x in {"copy", "copyfix", "libx264"}:
+      validated.append(x)
+    elif _hls_is_hw_mode(x):
+      if _hls_encoder_available(x):
+        validated.append(x)
+    else:
+      validated.append(x)
+  attempts = validated
+
+  if HLS_PREFER_GPU and hw_modes:
+    attempts = [x for x in attempts if x != "libx264"]
+  elif not attempts and HLS_TRANSCODE_FALLBACK != "none":
+    if hw_modes and HLS_PREFER_GPU:
+      attempts = list(hw_modes)
+    else:
+      attempts = ["libx264"]
+  # preview：链尾保留 libx264 软解兜底。GPU 硬解可能对某些源空转（如 NVDEC 啃不动
+  # 4K H.264），硬件模式全卡死时用 CPU 解码+编码保证至少能出预览（前面的硬件模式
+  # 仍优先，只有它们 0 段被判定卡死后才会走到这里）。
+  if (
+    _hls_is_preview_tier(tier)
+    and hw_modes
+    and HLS_TRANSCODE_FALLBACK != "none"
+    and not _hls_mode_disabled("libx264")
+    and "libx264" not in attempts
+  ):
+    attempts = attempts + ["libx264"]
+  if "libx264" in attempts and hw_modes and not _hls_is_preview_tier(tier):
+    logging.warning("[hls] libx264 fallback while GPU available modes=%s (check %s)", hw_modes, _HLS_HW_STATE_PATH)
   return attempts
 
-def _write_hls_meta(out_dir: str, src_path: str, mode: str):
+def _write_hls_meta(out_dir: str, src_path: str, mode: str, tier: str = "full"):
   try:
     st = os.stat(src_path)
     meta = {
       "mode": mode,
-      "pipeline_version": HLS_PIPELINE_VERSION,
+      "tier": _hls_norm_tier(tier),
+      "pipeline_version": _hls_pipeline_version(tier),
       "source_mtime": int(st.st_mtime),
       "source_size": int(st.st_size),
       "codecs": _probe_hls_codecs(src_path),
@@ -2370,6 +3555,36 @@ def _write_hls_meta(out_dir: str, src_path: str, mode: str):
       json.dump(meta, f, ensure_ascii=False, indent=2)
   except Exception as e:
     logging.warning("[hls] write meta failed: %s", e)
+
+def _hls_discontinuity_path(out_dir: str) -> str:
+  return os.path.join(out_dir, "discontinuities.json")
+
+def _hls_read_discontinuities(out_dir: str) -> set[int]:
+  try:
+    data = _read_json(_hls_discontinuity_path(out_dir))
+    return {
+      int(x)
+      for x in (data.get("indexes") or [])
+      if int(x) > 0
+    }
+  except Exception:
+    return set()
+
+def _hls_mark_discontinuity(out_dir: str, idx: int):
+  if idx <= 0:
+    return
+  try:
+    indexes = _hls_read_discontinuities(out_dir)
+    if idx in indexes:
+      return
+    indexes.add(int(idx))
+    _write_json_atomic(_hls_discontinuity_path(out_dir), {
+      "indexes": sorted(indexes),
+      "updated_at": int(time.time()),
+    })
+    logging.info("[hls] marked discontinuity at segment %s in %s", idx, out_dir)
+  except Exception as e:
+    logging.warning("[hls] failed to mark discontinuity: %s", e)
 
 def _stamp_hls_playlist(playlist: str, src_path: str):
   """给 segment URL 加源文件版本，避开浏览器/HLS.js 对旧坏段的缓存。"""
@@ -2399,7 +3614,10 @@ def _hls_source_for_vid(vid_id: str) -> str:
     raise HTTPException(404)
   src_path = v.video_path
   cache_path = _get_video_cache_path_if_any(vid_id, src_path)
-  return cache_path or src_path
+  resolved = cache_path or src_path
+  if not resolved or not os.path.isfile(resolved):
+    raise HTTPException(404, detail="video not found (may still be downloading)")
+  return resolved
 
 def _hls_duration_for(src_path: str) -> float:
   dur = float((_probe_hls_codecs(src_path).get("duration") or 0))
@@ -2444,26 +3662,31 @@ def _hls_actual_playlist_durations(out_dir: str) -> dict[int, float]:
     logging.warning("[hls] parse actual playlist durations failed: %s", e)
   return out
 
-def _ensure_hls_dynamic_cache_dir(vid_id: str, src_path: str):
-  out_dir = _hls_dir_for(vid_id)
-  if os.path.isdir(out_dir) and not _hls_cache_matches(out_dir, src_path):
+def _ensure_hls_dynamic_cache_dir(vid_id: str, src_path: str, tier: str = "full"):
+  out_dir = _hls_dir_for(vid_id, tier)
+  if os.path.isdir(out_dir) and not _hls_cache_matches(out_dir, src_path, tier):
     try:
       shutil.rmtree(out_dir)
     except Exception:
       pass
   os.makedirs(out_dir, exist_ok=True)
-  if not _hls_cache_matches(out_dir, src_path):
-    _write_hls_meta(out_dir, src_path, "dynamic")
+  if not _hls_cache_matches(out_dir, src_path, tier):
+    _write_hls_meta(out_dir, src_path, "dynamic", tier)
+    try:
+      _write_json_atomic(_hls_discontinuity_path(out_dir), {"indexes": [], "updated_at": int(time.time())})
+    except Exception:
+      pass
   return out_dir
 
-def _hls_dynamic_playlist(vid_id: str, src_path: str) -> str:
+def _hls_dynamic_playlist(vid_id: str, src_path: str, tier: str = "full") -> str:
   """立即返回 VOD playlist；segment 在请求时按需生成并缓存。"""
-  out_dir = _ensure_hls_dynamic_cache_dir(vid_id, src_path)
+  out_dir = _ensure_hls_dynamic_cache_dir(vid_id, src_path, tier)
   dur = _hls_duration_for(src_path)
   seg = max(1, int(HLS_SEGMENT_SEC))
   count = max(1, int(math.ceil(dur / seg)))
   ver = _hls_source_version(src_path)
   actual_durs = _hls_actual_playlist_durations(out_dir)
+  discontinuities = _hls_read_discontinuities(out_dir)
   max_seg_dur = max([float(seg), *actual_durs.values()], default=float(seg))
   lines = [
     "#EXTM3U",
@@ -2483,13 +3706,15 @@ def _hls_dynamic_playlist(vid_id: str, src_path: str) -> str:
     if i == count - 1:
       seg_dur = max(0.1, dur - acc)
     acc += seg_dur
+    if i in discontinuities:
+      lines.append("#EXT-X-DISCONTINUITY")
     lines.append(f"#EXTINF:{seg_dur:.3f},")
     lines.append(f"seg_{i:05d}.ts?v={ver}")
   lines.append("#EXT-X-ENDLIST")
   return "\n".join(lines) + "\n"
 
-def _hls_job_key(vid_id: str, src_path: str) -> str:
-  return f"{vid_id}:{_hls_source_version(src_path)}"
+def _hls_job_key(vid_id: str, src_path: str, tier: str = "full") -> str:
+  return f"{vid_id}:{_hls_norm_tier(tier)}:{_hls_source_version(src_path)}"
 
 def _hls_job_for(key: str) -> dict | None:
   with _hls_jobs_guard:
@@ -2508,7 +3733,7 @@ def _hls_segment_oversized(seg_path: str) -> bool:
   except Exception:
     return False
 
-def _hls_reset_bad_copy_cache(key: str, vid_id: str, src_path: str, job: dict | None, seg_path: str):
+def _hls_reset_bad_copy_cache(key: str, vid_id: str, src_path: str, job: dict | None, seg_path: str, tier: str = "full"):
   try:
     size = os.path.getsize(seg_path) if os.path.isfile(seg_path) else 0
   except Exception:
@@ -2518,14 +3743,14 @@ def _hls_reset_bad_copy_cache(key: str, vid_id: str, src_path: str, job: dict | 
   if job:
     _hls_kill_job(job)
   _hls_forget_job(key)
-  out_dir = _hls_dir_for(vid_id)
+  out_dir = _hls_dir_for(vid_id, tier)
   try:
     if os.path.isdir(out_dir):
       shutil.rmtree(out_dir)
   except Exception as e:
     logging.warning("[hls] failed to remove bad copy cache for %s: %s", vid_id, e)
   os.makedirs(out_dir, exist_ok=True)
-  _write_hls_meta(out_dir, src_path, "dynamic")
+  _write_hls_meta(out_dir, src_path, "dynamic", tier)
   return reason
 
 def _hls_existing_segment_indexes(out_dir: str) -> list[int]:
@@ -2582,26 +3807,93 @@ def _hls_delete_last_transcoding_file(out_dir: str):
   except Exception:
     pass
 
-def _hls_set_playhead(vid_id: str, position: float):
+def _hls_clear_client_state(vid_id: str, tier: str = "full"):
+  key = _hls_playhead_key(vid_id, tier)
   with _hls_playheads_guard:
-    _hls_playheads[str(vid_id)] = (max(0.0, float(position)), time.time())
+    _hls_playheads.pop(key, None)
+  with _hls_segment_demand_guard:
+    _hls_segment_demand.pop(key, None)
 
-def _hls_get_playhead(vid_id: str) -> float:
+def _hls_set_playhead(vid_id: str, position: float, tier: str = "full"):
+  key = _hls_playhead_key(vid_id, tier)
   with _hls_playheads_guard:
-    return float((_hls_playheads.get(str(vid_id)) or (0.0, 0.0))[0])
+    _hls_playheads[key] = (max(0.0, float(position)), time.time())
+
+def _hls_get_playhead(vid_id: str, tier: str = "full") -> float:
+  key = _hls_playhead_key(vid_id, tier)
+  with _hls_playheads_guard:
+    return float((_hls_playheads.get(key) or (0.0, 0.0))[0])
+
+def _hls_note_segment_demand(vid_id: str, idx: int, tier: str = "full"):
+  """记录客户端仍在拉取段 → 推断缓冲前沿，供 encode-ahead 节流使用。"""
+  key = _hls_playhead_key(vid_id, tier)
+  seg = max(1, int(HLS_SEGMENT_SEC))
+  demand_sec = max(0.0, (int(idx) + 3) * seg)
+  now = time.time()
+  with _hls_segment_demand_guard:
+    prev = float((_hls_segment_demand.get(key) or (0.0, 0.0))[0])
+    _hls_segment_demand[key] = (max(prev, demand_sec), now)
+
+def _hls_effective_playhead(vid_id: str, tier: str = "full") -> float:
+  """取 progress 上报与段请求推断的较大值，避免后台窗口进度停更后 ffmpeg 被误杀。"""
+  key = _hls_playhead_key(vid_id, tier)
+  reported = _hls_get_playhead(vid_id, tier)
+  now = time.time()
+  with _hls_segment_demand_guard:
+    demand, ts = _hls_segment_demand.get(key, (0.0, 0.0))
+  if now - ts <= 180:
+    return max(reported, max(0.0, demand - 90))
+  return reported
 
 def _hls_encoded_position_sec(out_dir: str, job: dict | None) -> float:
-  seg_len = max(1, int(HLS_SEGMENT_SEC))
-  indexes = _hls_existing_segment_indexes(out_dir)
-  if indexes:
-    return (max(indexes) + 1) * seg_len
-  if job:
-    return max(0, int(job.get("start_index") or 0)) * seg_len
-  return 0.0
+  return _hls_job_encoded_position_sec(out_dir, job)
 
-def _hls_maybe_throttle_job(vid_id: str, out_dir: str, job: dict | None):
-  """编码进度超前播放头过多时终止 ffmpeg，避免临时目录被撑爆。"""
+def _hls_job_encoded_position_sec(out_dir: str, job: dict | None) -> float:
+  """只统计当前 job 启动后新写的段，避免旧缓存导致误杀。"""
+  seg_len = max(1, int(HLS_SEGMENT_SEC))
+  if not job:
+    indexes = _hls_existing_segment_indexes(out_dir)
+    if indexes:
+      return (max(indexes) + 1) * seg_len
+    return 0.0
+  start_idx = max(0, int(job.get("start_index") or 0))
+  started_at = float(job.get("started_at") or 0)
+  fresh: list[int] = []
+  for idx in _hls_existing_segment_indexes(out_dir):
+    if idx < start_idx:
+      continue
+    if started_at > 0:
+      try:
+        if os.path.getmtime(_hls_segment_path(out_dir, idx)) < started_at - 0.5:
+          continue
+      except Exception:
+        pass
+    fresh.append(idx)
+  if fresh:
+    return (max(fresh) + 1) * seg_len
+  return start_idx * seg_len
+
+def _hls_running_job_count() -> int:
+  n = 0
+  with _hls_jobs_guard:
+    for job in _hls_jobs.values():
+      if not job or job.get("done") or job.get("killed"):
+        continue
+      proc = job.get("proc")
+      try:
+        if proc is not None and proc.poll() is None:
+          n += 1
+      except Exception:
+        pass
+  return n
+
+def _hls_maybe_throttle_job(vid_id: str, out_dir: str, job: dict | None, tier: str = "full"):
   if not job or job.get("done") or job.get("killed"):
+    return
+  tier = _hls_norm_tier(tier)
+  if _hls_is_abandoned(vid_id, tier):
+    logging.info("[hls] kill abandoned job vid=%s tier=%s", vid_id, tier)
+    _hls_kill_job(job)
     return
   proc = job.get("proc")
   try:
@@ -2610,16 +3902,24 @@ def _hls_maybe_throttle_job(vid_id: str, out_dir: str, job: dict | None):
     running = False
   if not running:
     return
-  playhead = _hls_get_playhead(vid_id)
-  encoded = _hls_encoded_position_sec(out_dir, job)
+  playhead = _hls_effective_playhead(vid_id, tier)
+  encoded = _hls_job_encoded_position_sec(out_dir, job)
   ahead = encoded - playhead
-  if ahead <= HLS_ENCODE_AHEAD_SEC:
+  if _hls_is_preview_tier(tier):
+    if playhead <= 0 and _hls_preview_last_activity(vid_id, tier) <= 0:
+      return
+    limit = max(30, HLS_ENCODE_AHEAD_SEC + 10)
+    if ahead > limit:
+      logging.info("[hls] preview ahead kill vid=%s ahead=%.1fs limit=%ss", vid_id, ahead, limit)
+      _hls_kill_job(job)
     return
-  logging.info(
-    "[hls] throttle encode-ahead vid=%s playhead=%.1fs encoded=%.1fs ahead=%.1fs limit=%ss",
-    vid_id, playhead, encoded, ahead, HLS_ENCODE_AHEAD_SEC,
-  )
-  _hls_kill_job(job)
+  concurrent = max(1, _hls_running_job_count())
+  limit = HLS_ENCODE_AHEAD_SEC * concurrent + 90
+  if ahead > limit * 2:
+    logging.debug(
+      "[hls] encode-ahead high (not killing) vid=%s tier=%s playhead=%.1fs encoded=%.1fs ahead=%.1fs limit=%ss concurrent=%s",
+      vid_id, tier, playhead, encoded, ahead, limit, concurrent,
+    )
 
 def _media_container_for(src_path: str) -> str:
   ext = os.path.splitext(src_path)[1].lower().lstrip(".")
@@ -2634,6 +3934,24 @@ def _browser_supports_source_codecs(info: dict, supported: dict | None) -> bool:
   if audio in {"aac", "mp4a"} and not sc.get("aac"):
     return False
   return True
+
+def _hls_preview_can_client_decode(src_path: str, payload: PlaybackNegotiateRequest) -> bool:
+  """浮动 preview：浏览器能硬解则直出 MP4，NAS 只读盘发字节，不跑 ffmpeg。"""
+  if not HLS_PREVIEW_DIRECT_PLAY:
+    return False
+  if _hls_copy_blocked_for_source(src_path):
+    return False
+  info = _probe_hls_codecs(src_path)
+  video = (info.get("video") or "").lower()
+  audio = (info.get("audio") or "").lower()
+  sc = getattr(payload, "supported_codecs", None) or {}
+  if video == "h264":
+    return _hls_can_copy_for_browser(src_path)
+  if video in {"hevc", "h265"} and sc.get("hevc"):
+    if audio and audio not in {"aac", "mp4a", "mp3", ""}:
+      return False
+    return True
+  return False
 
 def _hls_js_config_for_client(src_path: str, payload: PlaybackNegotiateRequest) -> dict:
   """按客户端上报的 MSE 内存预算 + 码率，尽量填满 Chrome 缓冲而不 OOM。"""
@@ -2681,16 +3999,23 @@ def _hls_js_config_for_client(src_path: str, payload: PlaybackNegotiateRequest) 
   }
 
 def _negotiate_playback(src_path: str, vid_id: str, payload: PlaybackNegotiateRequest) -> dict:
+  tier = _hls_norm_tier(getattr(payload, "playback_tier", "full") or "full")
   duration = _hls_duration_for(src_path)
   source_size = _hls_source_size(src_path)
   bitrate = int(_hls_estimated_bitrate_bps(src_path) or 0)
+  if _hls_is_preview_tier(tier):
+    bitrate = min(bitrate or 3_000_000, 3_000_000)
   direct_ok = _hls_can_copy_for_browser(src_path)
   copy_risky = _hls_copy_risky_for_browser(src_path)
   copy_blocked = _hls_copy_blocked_for_source(src_path)
   info = _probe_hls_codecs(src_path)
   container = _media_container_for(src_path)
-  playlist_url = f"/media/hls/{quote(vid_id, safe='')}/playlist.m3u8"
-  direct_url = f"/media/video/{quote(vid_id, safe='')}"
+  qid = quote(vid_id, safe="")
+  if _hls_is_preview_tier(tier):
+    playlist_url = f"/media/hls/{qid}/preview/playlist.m3u8"
+  else:
+    playlist_url = f"/media/hls/{qid}/playlist.m3u8"
+  direct_url = f"/media/video/{qid}"
   meta = {
     "id": str(vid_id),
     "duration": duration,
@@ -2702,7 +4027,27 @@ def _negotiate_playback(src_path: str, vid_id: str, payload: PlaybackNegotiateRe
     "container": container,
     "video_codec": info.get("video") or "",
     "audio_codec": info.get("audio") or "",
+    "playback_tier": tier,
   }
+
+  # 浮动窗：可硬解则直出（H.264 全走；HEVC 需客户端上报 hevc 支持）
+  if _hls_is_preview_tier(tier) and _hls_preview_can_client_decode(src_path, payload):
+    logging.info(
+      "[playback] preview direct_play vid=%s v=%s a=%s (client decode, no transcode)",
+      vid_id, info.get("video"), info.get("audio"),
+    )
+    return {
+      "method": "direct_play",
+      "url": direct_url,
+      "direct_url": direct_url,
+      "meta": meta,
+    }
+  if _hls_is_preview_tier(tier) and meta.get("direct_play_ok"):
+    logging.info(
+      "[playback] preview hls_js vid=%s v=%s (direct_play skipped: blocked=%s hevc_no_client=%s)",
+      vid_id, info.get("video"), copy_blocked,
+      (info.get("video") or "").lower() not in {"h264", "hevc", "h265"},
+    )
 
   # iOS/Safari：无 MSE，走原生 HLS（系统自己控内存）
   if not payload.supports_mse:
@@ -2725,23 +4070,145 @@ def _hls_kill_job(job: dict | None):
   if not job:
     return
   job["killed"] = True
+  _hls_release_job_hw_slot(job)
   proc = job.get("proc")
   try:
     if proc is not None and proc.poll() is None:
-      proc.terminate()
+      try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+      except Exception:
+        proc.terminate()
       try:
         proc.wait(timeout=2)
       except Exception:
-        proc.kill()
+        try:
+          os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+          proc.kill()
   except Exception:
     pass
   job.update({"done": True, "proc": None})
 
-def _hls_bg_cmd(mode: str, src_path: str, out_dir: str, start_idx: int) -> list[str]:
+def _hls_kill_jobs_for_vid(vid_id: str, tier: str = "preview") -> int:
+  tier = _hls_norm_tier(tier)
+  killed = 0
+  keys: list[str] = []
+  with _hls_jobs_guard:
+    for key, job in list(_hls_jobs.items()):
+      if not job:
+        continue
+      if _hls_norm_tier(str(job.get("tier") or "full")) != tier:
+        continue
+      if not _hls_vid_matches(str(job.get("vid_id") or ""), vid_id):
+        continue
+      if not job.get("done"):
+        _hls_kill_job(job)
+        killed += 1
+      keys.append(key)
+  for key in keys:
+    _hls_forget_job(key)
+  return killed
+
+def _hls_stop_transcode(vid_id: str, tier: str = "preview") -> dict:
+  tier = _hls_norm_tier(tier)
+  killed = _hls_kill_jobs_for_vid(vid_id, tier)
+  _hls_mark_abandoned(vid_id, tier)
+  _hls_clear_client_state(vid_id, tier)
+  logging.info("[hls] stop transcode vid=%s tier=%s killed=%s", vid_id, tier, killed)
+  return {"ok": True, "killed": killed > 0, "killed_count": killed, "vid": vid_id, "tier": tier}
+
+def _hls_stop_all_transcode(tier: str = "preview") -> dict:
+  tier = _hls_norm_tier(tier)
+  killed = 0
+  vids: set[str] = set()
+  with _hls_jobs_guard:
+    for job in list(_hls_jobs.values()):
+      if not job:
+        continue
+      if _hls_norm_tier(str(job.get("tier") or "full")) != tier:
+        continue
+      vids.add(str(job.get("vid_id") or ""))
+      if not job.get("done"):
+        _hls_kill_job(job)
+        killed += 1
+  with _hls_jobs_guard:
+    for key, job in list(_hls_jobs.items()):
+      if job and _hls_norm_tier(str(job.get("tier") or "full")) == tier:
+        _hls_jobs.pop(key, None)
+  for vid in vids:
+    if vid:
+      _hls_mark_abandoned(vid, tier)
+      _hls_clear_client_state(vid, tier)
+  logging.info("[hls] stop-all tier=%s killed=%s vids=%s", tier, killed, len(vids))
+  return {"ok": True, "killed_count": killed, "tier": tier, "videos": len(vids)}
+
+def _hls_preview_last_activity(vid_id: str, tier: str = "preview") -> float:
+  key = _hls_playhead_key(vid_id, tier)
+  now = time.time()
+  last = 0.0
+  with _hls_playheads_guard:
+    ts = (_hls_playheads.get(key) or (0.0, 0.0))[1]
+    if ts:
+      last = max(last, ts)
+  with _hls_segment_demand_guard:
+    ts = (_hls_segment_demand.get(key) or (0.0, 0.0))[1]
+    if ts:
+      last = max(last, ts)
+  return last
+
+def _hls_preview_idle_reaper():
+  while True:
+    try:
+      time.sleep(10)
+      now = time.time()
+      idle_limit = max(5.0, HLS_PREVIEW_IDLE_KILL_SEC)
+      with _hls_jobs_guard:
+        snapshot = [
+          (key, job)
+          for key, job in _hls_jobs.items()
+          if job and not job.get("done")
+        ]
+      for key, job in snapshot:
+        tier = _hls_norm_tier(str(job.get("tier") or "full"))
+        if tier != "preview":
+          continue
+        vid = str(job.get("vid_id") or "")
+        if not vid:
+          continue
+        with _hls_jobs_guard:
+          live = _hls_jobs.get(key)
+          if not live or live.get("done"):
+            continue
+          job = live
+        if _hls_is_abandoned(vid, tier):
+          logging.info("[hls] preview abandoned kill vid=%s", vid)
+          _hls_kill_job(job)
+          continue
+        if not _hls_preview_job_has_segment(job, 0):
+          continue
+        last = _hls_preview_last_activity(vid, tier)
+        if last and now - last > idle_limit:
+          logging.info("[hls] preview idle kill vid=%s idle=%.1fs", vid, now - last)
+          _hls_kill_job(job)
+          continue
+        out_dir = _hls_dir_for(vid, tier)
+        playhead = _hls_effective_playhead(vid, tier)
+        last = _hls_preview_last_activity(vid, tier)
+        if playhead <= 0 and last <= 0:
+          continue
+        encoded = _hls_job_encoded_position_sec(out_dir, job)
+        ahead = encoded - playhead
+        if ahead > max(30, HLS_ENCODE_AHEAD_SEC + 15):
+          logging.info("[hls] preview ahead kill vid=%s ahead=%.1fs playhead=%.1fs", vid, ahead, playhead)
+          _hls_kill_job(job)
+    except Exception as e:
+      logging.warning("[hls] preview reaper error: %s", e)
+
+def _hls_bg_cmd(mode: str, src_path: str, out_dir: str, start_idx: int, tier: str = "full") -> list[str]:
   playlist = os.path.join(out_dir, "playlist.m3u8")
   seg_pat = os.path.join(out_dir, "seg_%05d.ts")
   start_time = max(0, int(start_idx)) * max(1, int(HLS_SEGMENT_SEC))
-  return _hls_cmd_for_mode(mode, src_path, seg_pat, playlist, start_idx, start_time)
+  return _hls_cmd_for_mode(mode, src_path, seg_pat, playlist, start_idx, start_time, tier)
 
 def _hls_monitor_job(key: str, run_id: str, vid_id: str, start_idx: int, mode: str, proc: subprocess.Popen, started_at: float):
   try:
@@ -2754,7 +4221,9 @@ def _hls_monitor_job(key: str, run_id: str, vid_id: str, start_idx: int, mode: s
   with _hls_jobs_guard:
     job = _hls_jobs.get(key)
     if not job or job.get("run_id") != run_id:
+      _hls_release_job_hw_slot(job)
       return
+    _hls_release_job_hw_slot(job)
     if job.get("killed"):
       job.update({"done": True, "error": "", "proc": None, "exit_code": rc})
       return
@@ -2766,29 +4235,67 @@ def _hls_monitor_job(key: str, run_id: str, vid_id: str, start_idx: int, mode: s
     logging.info("[hls] job encoded %s start=%s mode=%s in %.1fs", vid_id, start_idx, mode, time.time() - started_at)
     threading.Thread(target=_cleanup_hls_cache_dir, daemon=True).start()
   else:
-    logging.warning("[hls] job mode=%s failed for %s start=%s rc=%s: %s", mode, vid_id, start_idx, rc, err)
+    if _hls_should_disable_mode(mode, err):
+      _hls_disable_mode(mode, err)
+    else:
+      _hls_note_hw_slot_pressure(mode, err)
+    logging.warning("[hls] job mode=%s failed for %s start=%s rc=%s: %s", mode, vid_id, start_idx, rc, err[-500:])
 
-def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: int, timeout_s: float | None = None, keep_running_on_timeout: bool = False) -> dict:
-  out_dir = _hls_dir_for(vid_id)
+def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: int, timeout_s: float | None = None, keep_running_on_timeout: bool = False, tier: str = "full") -> dict:
+  if not src_path or not os.path.isfile(src_path):
+    raise HTTPException(404, detail=f"video source missing for {vid_id}")
+  tier = _hls_norm_tier(tier)
+  out_dir = _hls_dir_for(vid_id, tier)
   target = _hls_segment_path(out_dir, idx)
-  attempts = _hls_attempt_chain_for_source(src_path)
+  attempts = _hls_attempt_chain_for_source(src_path, tier, vid_id=vid_id)
   last_err = ""
   attempt_errors: list[str] = []
   last_cmd: list[str] = []
-  logging.info("[hls] start job vid=%s target=%s attempts=%s seg=%ss allow_copy=%s",
-               vid_id, idx, attempts, HLS_SEGMENT_SEC, HLS_ALLOW_COPY)
+  slot_wait = float(timeout_s if timeout_s is not None else HLS_HW_ENCODE_SLOT_WAIT_SEC)
+  logging.info("[hls] start job vid=%s tier=%s target=%s attempts=%s seg=%ss allow_copy=%s prefer_gpu=%s dual_gpu=%s",
+               vid_id, tier, idx, attempts, HLS_SEGMENT_SEC, HLS_ALLOW_COPY and not _hls_is_preview_tier(tier),
+               HLS_PREFER_GPU, _hls_dual_gpu_enabled())
   for mode in attempts:
+    slot_acquired = False
     try:
+      if _hls_is_hw_mode(mode):
+        deadline = time.time() + max(5.0, slot_wait)
+        evict_tried = False
+        while time.time() < deadline:
+          if _hls_acquire_hw_slot(mode, timeout=min(2.0, max(0.1, deadline - time.time())), tier=tier):
+            slot_acquired = True
+            break
+          if (
+            _hls_is_preview_tier(tier)
+            and not evict_tried
+            and _hls_evict_lower_preview_jobs(vid_id, only_if_slot_needed=True) > 0
+          ):
+            evict_tried = True
+            continue
+          time.sleep(0.15)
+        if not slot_acquired:
+          grp = _hls_hw_slot_group(mode)
+          pool = _hls_hw_slot_pool(grp)
+          eff = pool.effective_max(tier) if pool else 0
+          last_err = f"hw slot busy ({grp} effective_max={eff} tier={tier})"
+          attempt_errors.append(f"{mode}: {last_err}")
+          logging.info("[hls] waiting next hw mode for %s tier=%s: %s", vid_id, tier, last_err)
+          continue
       os.makedirs(out_dir, exist_ok=True)
-      _write_hls_meta(out_dir, src_path, mode)
-      cmd = _hls_bg_cmd(mode, src_path, out_dir, idx)
+      _write_hls_meta(out_dir, src_path, mode, tier)
+      cmd = _hls_bg_cmd(mode, src_path, out_dir, idx, tier)
       last_cmd = cmd
       t0 = time.time()
-      proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+      proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
     except Exception as e:
+      if slot_acquired:
+        _hls_release_hw_slot(mode)
+        slot_acquired = False
       last_err = str(e)
       attempt_errors.append(f"{mode}: {last_err}")
-      _hls_disable_mode(mode, last_err)
+      _hls_note_hw_slot_pressure(mode, last_err)
+      if _hls_should_disable_mode(mode, last_err):
+        _hls_disable_mode(mode, last_err)
       continue
 
     run_id = f"{time.time():.6f}:{idx}:{mode}"
@@ -2798,6 +4305,7 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
       "start_index": idx,
       "run_id": run_id,
       "mode": mode,
+      "tier": tier,
       "started": True,
       "started_at": t0,
       "done": False,
@@ -2806,6 +4314,9 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
       "cmd": cmd,
       "attempts": attempts,
       "proc": proc,
+      "hw_slot": slot_acquired,
+      "hw_slot_mode": mode if slot_acquired else None,
+      "hw_slot_released": False,
     }
     with _hls_jobs_guard:
       _hls_jobs[key] = job
@@ -2816,10 +4327,11 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
     while time.time() < deadline:
       if _hls_segment_file_ready(target):
         if mode in {"copy", "copyfix"} and _hls_segment_oversized(target):
-          last_err = _hls_reset_bad_copy_cache(key, vid_id, src_path, job, target)
+          last_err = _hls_reset_bad_copy_cache(key, vid_id, src_path, job, target, tier)
           attempt_errors.append(f"{mode}: {last_err}")
           logging.warning("[hls] copy mode=%s produced oversized segment for %s; retry transcoding", mode, vid_id)
           break
+        logging.info("[hls] job running vid=%s tier=%s mode=%s seg=%s", vid_id, tier, mode, idx)
         return job
       if proc.poll() is not None:
         # 监控线程会填 error，给它一个短窗口。
@@ -2828,17 +4340,25 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
           cur = _hls_jobs.get(key)
           last_err = (cur or {}).get("error") or f"ffmpeg exited with {proc.returncode}"
         attempt_errors.append(f"{mode}: {last_err}")
-        logging.warning("[hls] start mode=%s exited before target seg=%s for %s: %s", mode, idx, vid_id, last_err)
+        _hls_note_hw_slot_pressure(mode, last_err)
+        if _hls_should_disable_mode(mode, last_err):
+          _hls_disable_mode(mode, last_err)
+        logging.warning("[hls] start mode=%s exited before target seg=%s for %s: %s", mode, idx, vid_id, last_err[-500:])
         break
       time.sleep(0.1)
 
     if proc.poll() is None and not _hls_segment_file_ready(target):
-      if keep_running_on_timeout:
+      # 有进展（正在写 .tmp 段或已切出其它段）→ 只是慢，保留继续跑。
+      # 0 段且无 .tmp → 解码空转/卡死（如 NVDEC 啃不动 4K H.264），杀掉换下一个模式。
+      is_last_mode = (mode == attempts[-1])
+      progressing = os.path.exists(target + ".tmp") or _hls_current_segment_index(out_dir) is not None
+      if keep_running_on_timeout and (is_last_mode or progressing):
         logging.info("[hls] start mode=%s still warming target seg=%s for %s after %.1fs", mode, idx, vid_id, wait_s)
         return job
       _hls_kill_job(job)
-      last_err = f"timeout waiting for segment {idx} (mode={mode})"
+      last_err = f"no segment within {wait_s:.0f}s (mode={mode}; likely undecodable by this path)"
       attempt_errors.append(f"{mode}: {last_err}")
+      logging.warning("[hls] start mode=%s stalled (0 seg) for %s, trying next mode", mode, vid_id)
     logging.warning("[hls] start mode=%s did not produce target seg=%s for %s: %s", mode, idx, vid_id, last_err)
 
   with _hls_jobs_guard:
@@ -2855,16 +4375,25 @@ def _hls_start_job_wait_for_segment(key: str, vid_id: str, src_path: str, idx: i
     _hls_jobs[key] = failed
   raise HTTPException(504, f"hls start failed: {last_err}")
 
-def _ensure_hls_job_for_segment(vid_id: str, src_path: str, idx: int, start_timeout_s: float | None = None, keep_running_on_timeout: bool = False):
+def _ensure_hls_job_for_segment(vid_id: str, src_path: str, idx: int, start_timeout_s: float | None = None, keep_running_on_timeout: bool = False, tier: str = "full"):
   """复用连续 HLS job；seek 距离太大时从目标段重启 job。"""
-  out_dir = _hls_dir_for(vid_id)
-  key = _hls_job_key(vid_id, src_path)
-  _ensure_hls_dynamic_cache_dir(vid_id, src_path)
+  tier = _hls_norm_tier(tier)
+  if _hls_is_abandoned(vid_id, tier):
+    _hls_clear_abandoned(vid_id, tier)
+  if _hls_is_preview_tier(tier):
+    keep_running_on_timeout = True
+    if start_timeout_s is None:
+      # 每个模式等 seg0 的窗口：正常 540p 转码 1-3s 就出段，所以 ~12s 足够；
+      # 超时仍 0 段=该硬解路径空转，快速让位下一模式（见循环里的卡死判定）。
+      start_timeout_s = 12.0
+  out_dir = _hls_dir_for(vid_id, tier)
+  key = _hls_job_key(vid_id, src_path, tier)
+  _ensure_hls_dynamic_cache_dir(vid_id, src_path, tier)
   if _hls_segment_file_ready(_hls_segment_path(out_dir, idx)):
     return _hls_job_for(key)
 
   gap_limit = max(2, int(24 / max(1, int(HLS_SEGMENT_SEC))))
-  lock = _hls_lock(f"{vid_id}:job")
+  lock = _hls_lock(f"{vid_id}:{tier}:job")
   with lock:
     if _hls_segment_file_ready(_hls_segment_path(out_dir, idx)):
       return _hls_job_for(key)
@@ -2882,14 +4411,18 @@ def _ensure_hls_job_for_segment(vid_id: str, src_path: str, idx: int, start_time
 
     if running:
       start_idx = int((job or {}).get("start_index") or 0)
-      # ffmpeg 刚启动时可能还没落第一个 ts。HLS.js 会并发请求 start_idx、start_idx+1，
-      # 这时不能因为 current_idx=None 就杀掉 job，否则首段永远等不到。
       anchor_idx = current_idx if current_idx is not None else start_idx
       if idx >= anchor_idx and (idx - anchor_idx) <= gap_limit:
-        _hls_maybe_throttle_job(vid_id, out_dir, job)
+        _hls_maybe_throttle_job(vid_id, out_dir, job, tier)
+        return job
+      # 请求的段已在磁盘上：直接复用，不因另一客户端 playhead 不同而杀 job
+      if _hls_segment_file_ready(_hls_segment_path(out_dir, idx)):
+        _hls_maybe_throttle_job(vid_id, out_dir, job, tier)
         return job
 
     if running:
+      if current_idx is not None and abs(idx - current_idx) > max(0, int(HLS_DISCONTINUITY_AFTER_GAP_SEGMENTS)):
+        _hls_mark_discontinuity(out_dir, idx)
       _hls_kill_job(job)
     if idx == 0 and os.path.isdir(out_dir):
       try:
@@ -2900,7 +4433,7 @@ def _ensure_hls_job_for_segment(vid_id: str, src_path: str, idx: int, start_time
     else:
       if current_idx is not None:
         _hls_delete_last_transcoding_file(out_dir)
-    return _hls_start_job_wait_for_segment(key, vid_id, src_path, idx, start_timeout_s, keep_running_on_timeout)
+    return _hls_start_job_wait_for_segment(key, vid_id, src_path, idx, start_timeout_s, keep_running_on_timeout, tier)
 
 def _hls_segment_ready_to_serve(out_dir: str, idx: int, job: dict | None) -> bool:
   seg_path = _hls_segment_path(out_dir, idx)
@@ -2921,12 +4454,20 @@ def _hls_wait_for_min_segments(out_dir: str, min_segments: int, deadline: float)
       return
     time.sleep(0.1)
 
-def _prime_hls_playlist(vid_id: str, src_path: str):
-  min_segments = max(0, int(HLS_PLAYLIST_PRIME_SEGMENTS))
-  wait_s = max(0.0, float(HLS_PLAYLIST_PRIME_WAIT_SEC))
+def _prime_hls_playlist(vid_id: str, src_path: str, tier: str = "full"):
+  tier = _hls_norm_tier(tier)
+  _hls_clear_abandoned(vid_id, tier)
+  if _hls_is_preview_tier(tier):
+    min_segments = max(0, int(HLS_PREVIEW_PLAYLIST_PRIME_SEGMENTS))
+    wait_s = max(8.0, float(HLS_PREVIEW_PLAYLIST_PRIME_WAIT_SEC))
+    keep_running = True
+  else:
+    min_segments = max(0, int(HLS_PLAYLIST_PRIME_SEGMENTS))
+    wait_s = max(0.0, float(HLS_PLAYLIST_PRIME_WAIT_SEC))
+    keep_running = True
   if min_segments <= 0 or wait_s <= 0:
     return
-  out_dir = _hls_dir_for(vid_id)
+  out_dir = _hls_dir_for(vid_id, tier)
   if all(_hls_segment_file_ready(_hls_segment_path(out_dir, i)) for i in range(min_segments)):
     return
   deadline = time.time() + wait_s
@@ -2935,34 +4476,37 @@ def _prime_hls_playlist(vid_id: str, src_path: str):
       vid_id,
       src_path,
       0,
-      start_timeout_s=max(0.5, min(wait_s, HLS_START_WAIT_SEC)),
-      keep_running_on_timeout=True,
+      start_timeout_s=12.0 if _hls_is_preview_tier(tier) else max(0.5, min(wait_s, HLS_START_WAIT_SEC)),
+      keep_running_on_timeout=keep_running,
+      tier=tier,
     )
     _hls_wait_for_min_segments(out_dir, min_segments, deadline)
   except Exception as e:
-    logging.warning("[hls] playlist prime skipped for %s: %s", vid_id, e)
+    logging.warning("[hls] playlist prime skipped for %s tier=%s: %s", vid_id, tier, e)
 
-def _wait_for_hls_segment(vid_id: str, src_path: str, idx: int, timeout_s: float = 90.0) -> str:
-  out_dir = _hls_dir_for(vid_id)
+def _wait_for_hls_segment(vid_id: str, src_path: str, idx: int, timeout_s: float = 90.0, tier: str = "full") -> str:
+  tier = _hls_norm_tier(tier)
+  _hls_clear_abandoned(vid_id, tier)
+  out_dir = _hls_dir_for(vid_id, tier)
   seg_path = _hls_segment_path(out_dir, idx)
-  _ensure_hls_dynamic_cache_dir(vid_id, src_path)
-  key = _hls_job_key(vid_id, src_path)
+  _ensure_hls_dynamic_cache_dir(vid_id, src_path, tier)
+  key = _hls_job_key(vid_id, src_path, tier)
   job = _hls_job_for(key)
-  if _hls_cache_matches(out_dir, src_path) and _hls_segment_ready_to_serve(out_dir, idx, job):
+  if _hls_cache_matches(out_dir, src_path, tier) and _hls_segment_ready_to_serve(out_dir, idx, job):
     return seg_path
-  job = _ensure_hls_job_for_segment(vid_id, src_path, idx) or _hls_job_for(key)
+  job = _ensure_hls_job_for_segment(vid_id, src_path, idx, tier=tier) or _hls_job_for(key)
   deadline = time.time() + timeout_s
   while time.time() < deadline:
-    if _hls_cache_matches(out_dir, src_path) and _hls_segment_ready_to_serve(out_dir, idx, job):
+    if _hls_cache_matches(out_dir, src_path, tier) and _hls_segment_ready_to_serve(out_dir, idx, job):
       return seg_path
     job = _hls_job_for(key)
-    _hls_maybe_throttle_job(vid_id, out_dir, job)
+    _hls_maybe_throttle_job(vid_id, out_dir, job, tier)
     if job and job.get("done") and job.get("error"):
       _hls_forget_job(key)
-      job = _ensure_hls_job_for_segment(vid_id, src_path, idx) or _hls_job_for(key)
+      job = _ensure_hls_job_for_segment(vid_id, src_path, idx, tier=tier) or _hls_job_for(key)
       continue
     if job is None or (job.get("done") and not job.get("error") and not _hls_segment_file_ready(seg_path)):
-      job = _ensure_hls_job_for_segment(vid_id, src_path, idx) or _hls_job_for(key)
+      job = _ensure_hls_job_for_segment(vid_id, src_path, idx, tier=tier) or _hls_job_for(key)
     time.sleep(0.15)
   raise HTTPException(504, f"hls segment not ready: {idx}")
 
@@ -2984,68 +4528,81 @@ def _hls_segment_file_ready(seg_path: str) -> bool:
   except Exception:
     return False
 
-def _ensure_hls_segment(vid_id: str, src_path: str, idx: int) -> str:
+def _ensure_hls_segment(vid_id: str, src_path: str, idx: int, tier: str = "full") -> str:
   dur_total = _hls_duration_for(src_path)
   seg_len = max(1, int(HLS_SEGMENT_SEC))
   if idx * seg_len >= dur_total + 0.5:
     raise HTTPException(404)
-  return _wait_for_hls_segment(vid_id, src_path, idx)
+  wait_s = 180.0 if _hls_is_preview_tier(tier) else 90.0
+  return _wait_for_hls_segment(vid_id, src_path, idx, timeout_s=wait_s, tier=tier)
 
 def _cleanup_hls_cache_dir():
   """LRU + 过期清理。简单实现：按 mtime 排序，超过 GB 阈值或天数阈值的整目录删。"""
   try:
-    entries = []
-    total = 0
-    now = time.time()
-    for name in os.listdir(HLS_CACHE_DIR):
-      d = os.path.join(HLS_CACHE_DIR, name)
-      if not os.path.isdir(d):
+    for cache_root in (HLS_CACHE_DIR, HLS_PREVIEW_CACHE_DIR):
+      entries = []
+      total = 0
+      now = time.time()
+      if not os.path.isdir(cache_root):
         continue
-      pl = os.path.join(d, "playlist.m3u8")
-      size = 0
-      newest_mtime = 0.0
-      has_media = os.path.isfile(pl) or os.path.isfile(os.path.join(d, "meta.json"))
-      for root, _, files in os.walk(d):
-        for fn in files:
-          p = os.path.join(root, fn)
-          try:
-            size += os.path.getsize(p)
-            newest_mtime = max(newest_mtime, os.path.getmtime(p))
-            if fn.endswith(".ts") or fn == "playlist.m3u8":
-              has_media = True
-          except Exception:
-            pass
-      if not has_media:
-        # 残骸目录直接删
-        try: shutil.rmtree(d)
-        except Exception: pass
-        continue
-      mtime = newest_mtime or os.path.getmtime(d)
-      entries.append((mtime, size, d))
-      total += size
-    # 过期
-    max_age = HLS_CACHE_MAX_AGE_DAYS * 86400
-    for mtime, size, d in list(entries):
-      if (now - mtime) > max_age:
-        try: shutil.rmtree(d); total -= size
-        except Exception: pass
-        entries.remove((mtime, size, d))
-    # 容量
-    cap = int(HLS_CACHE_MAX_TOTAL_GB * 1024 * 1024 * 1024)
-    if total > cap:
-      entries.sort(key=lambda x: x[0])  # 老的在前
-      for mtime, size, d in entries:
-        if total <= cap: break
-        try: shutil.rmtree(d); total -= size
-        except Exception: pass
+      for name in os.listdir(cache_root):
+        d = os.path.join(cache_root, name)
+        if not os.path.isdir(d):
+          continue
+        pl = os.path.join(d, "playlist.m3u8")
+        size = 0
+        newest_mtime = 0.0
+        has_media = os.path.isfile(pl) or os.path.isfile(os.path.join(d, "meta.json"))
+        for root, _, files in os.walk(d):
+          for fn in files:
+            p = os.path.join(root, fn)
+            try:
+              size += os.path.getsize(p)
+              newest_mtime = max(newest_mtime, os.path.getmtime(p))
+              if fn.endswith(".ts") or fn == "playlist.m3u8":
+                has_media = True
+            except Exception:
+              pass
+        if not has_media:
+          try: shutil.rmtree(d)
+          except Exception: pass
+          continue
+        mtime = newest_mtime or os.path.getmtime(d)
+        entries.append((mtime, size, d))
+        total += size
+      max_age = HLS_CACHE_MAX_AGE_DAYS * 86400
+      for mtime, size, d in list(entries):
+        if (now - mtime) > max_age:
+          try: shutil.rmtree(d); total -= size
+          except Exception: pass
+          entries.remove((mtime, size, d))
+      cap = int(HLS_CACHE_MAX_TOTAL_GB * 1024 * 1024 * 1024)
+      if total > cap:
+        entries.sort(key=lambda x: x[0])
+        for mtime, size, d in entries:
+          if total <= cap: break
+          try: shutil.rmtree(d); total -= size
+          except Exception: pass
   except Exception as e:
     logging.warning("[hls] cleanup error: %s", e)
 
 @app.get("/media/hls/{vid_id}/playlist.m3u8")
 def hls_playlist(vid_id: str):
   path = _hls_source_for_vid(vid_id)
-  _prime_hls_playlist(vid_id, path)
-  body = _hls_dynamic_playlist(vid_id, path)
+  _hls_note_segment_demand(vid_id, 0, "full")
+  _prime_hls_playlist(vid_id, path, "full")
+  body = _hls_dynamic_playlist(vid_id, path, "full")
+  return Response(content=body, media_type="application/vnd.apple.mpegurl", headers={
+    "Cache-Control": "no-store",
+  })
+
+@app.get("/media/hls/{vid_id}/preview/playlist.m3u8")
+def hls_preview_playlist(vid_id: str):
+  _hls_clear_abandoned(vid_id, "preview")
+  path = _hls_source_for_vid(vid_id)
+  _hls_note_segment_demand(vid_id, 0, "preview")
+  _prime_hls_playlist(vid_id, path, "preview")
+  body = _hls_dynamic_playlist(vid_id, path, "preview")
   return Response(content=body, media_type="application/vnd.apple.mpegurl", headers={
     "Cache-Control": "no-store",
   })
@@ -3067,17 +4624,18 @@ def hls_info(vid_id: str):
     "segment_sec": HLS_SEGMENT_SEC,
     "allow_copy": HLS_ALLOW_COPY,
     "transcode_fallback": HLS_TRANSCODE_FALLBACK,
-    "attempts": _hls_attempt_chain_for_source(path),
+    "attempts": _hls_attempt_chain_for_source(path, "full", vid_id=str(vid_id)),
     "start_wait_sec": HLS_START_WAIT_SEC,
     "playlist_prime_segments": HLS_PLAYLIST_PRIME_SEGMENTS,
     "playlist_prime_wait_sec": HLS_PLAYLIST_PRIME_WAIT_SEC,
   }
 
 @app.get("/media/hls/{vid_id}/debug")
-def hls_debug(vid_id: str):
+def hls_debug(vid_id: str, tier: str = Query("full")):
+  tier = _hls_norm_tier(tier)
   path = _hls_source_for_vid(vid_id)
-  out_dir = _hls_dir_for(vid_id)
-  key = _hls_job_key(vid_id, path)
+  out_dir = _hls_dir_for(vid_id, tier)
+  key = _hls_job_key(vid_id, path, tier)
   job = _hls_job_for(key)
   proc_running = False
   if job and job.get("proc") is not None:
@@ -3088,10 +4646,11 @@ def hls_debug(vid_id: str):
   indexes = _hls_existing_segment_indexes(out_dir)
   return {
     "id": str(vid_id),
+    "tier": tier,
     "pipeline_version": HLS_PIPELINE_VERSION,
     "source": path,
     "cache_dir": out_dir,
-    "cache_matches": _hls_cache_matches(out_dir, path),
+    "cache_matches": _hls_cache_matches(out_dir, path, tier),
     "segments": indexes[-20:],
     "segment_count": len(indexes),
     "source_size": _hls_source_size(path),
@@ -3106,7 +4665,7 @@ def hls_debug(vid_id: str):
     ),
     "current_index": _hls_current_segment_index(out_dir),
     "transcode_fallback": HLS_TRANSCODE_FALLBACK,
-    "attempts": _hls_attempt_chain_for_source(path),
+    "attempts": _hls_attempt_chain_for_source(path, tier, vid_id=str(vid_id)),
     "playlist_prime_segments": HLS_PLAYLIST_PRIME_SEGMENTS,
     "playlist_prime_wait_sec": HLS_PLAYLIST_PRIME_WAIT_SEC,
     "job": {
@@ -3125,13 +4684,28 @@ def hls_debug(vid_id: str):
   }
 
 # 段文件按需生成并缓存：playlist 立即返回，浏览器请求到哪段就切哪段。
+@app.get("/media/hls/{vid_id}/preview/{segment}")
+def hls_preview_segment(vid_id: str, segment: str):
+  if not re.fullmatch(r"seg_\d{1,8}\.ts", segment):
+    raise HTTPException(404)
+  _hls_clear_abandoned(vid_id, "preview")
+  idx = int(segment[4:-3])
+  path = _hls_source_for_vid(vid_id)
+  _hls_note_segment_demand(vid_id, idx, "preview")
+  seg_path = _ensure_hls_segment(vid_id, path, idx, tier="preview")
+  return FastFileResponse(seg_path, media_type="video/mp2t", headers={
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "public, max-age=31536000, immutable",
+  })
+
 @app.get("/media/hls/{vid_id}/{segment}")
 def hls_segment(vid_id: str, segment: str):
   if not re.fullmatch(r"seg_\d{1,8}\.ts", segment):
     raise HTTPException(404)
   idx = int(segment[4:-3])
   path = _hls_source_for_vid(vid_id)
-  seg_path = _ensure_hls_segment(vid_id, path, idx)
+  _hls_note_segment_demand(vid_id, idx, "full")
+  seg_path = _ensure_hls_segment(vid_id, path, idx, tier="full")
   return FastFileResponse(seg_path, media_type="video/mp2t", headers={
     "Accept-Ranges": "bytes",
     "Cache-Control": "public, max-age=31536000, immutable",

@@ -27,19 +27,19 @@
         <option value="5">文件名升序</option>
       </select>
       <label class="chk"><input type="checkbox" id="mature"> 只显示成人</label>
-      <input id="q" type="search" placeholder="筛选标题…"/>
+      <input id="q" type="search" placeholder="筛选… a:上传者 t:标题 =全字匹配"/>
       <button id="refresh">刷新</button>
       <button id="playUnwatched">播放未完成</button>
     </div>
   </header>
-
-  <div id="notice" class="notice" style="display:none;"></div>
 
   <main>
     <div id="grid" class="grid" tabindex="0"></div>
     <div id="infiniteStatus" class="inf-status" aria-live="polite"></div>
     <div id="sentinel" class="sentinel" aria-hidden="true"></div>
   </main>
+
+  <div id="notice" class="notice" style="display:none;" role="status" aria-live="polite"></div>
 
   <div id="ctxmenu" class="ctxmenu" style="display:none;"></div>
   <div id="ctxsubmenu" class="ctxmenu ctxsubmenu" style="display:none;"></div>

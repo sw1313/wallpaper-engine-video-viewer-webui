@@ -20,10 +20,36 @@ class VideoItem:
     size: int
     rating: str
     vtype: str
+    # 上传者 / 作者（来自 project.json 的 author/creator 等字段，或 Steam API）
+    author: str = ""
+    # project.json 中的 Steam ID，可跳过 GetPublishedFileDetails
+    author_steamid: str = ""
     # config.json 的 items 键：创意工坊为 10 位 id；myprojects / projects/backup 等为 UNC 或相对路径
     we_config_key: str = ""
     # 同一视频在 config 中若出现多条等价键（不同 UNC 前缀），移动时需全部 prune
     we_config_key_aliases: List[str] = field(default_factory=list)
+
+
+def _author_from_pdata(pdata: dict) -> str:
+    """从 project.json 读取上传者/作者名。"""
+    if not isinstance(pdata, dict):
+        return ""
+    for key in ("author", "creator", "publisher", "uploader", "steamauthor", "username"):
+        val = str(pdata.get(key) or "").strip()
+        if val and not (val.isdigit() and len(val) >= 15):
+            return val
+    return ""
+
+
+def _steamid_from_pdata(pdata: dict) -> str:
+    """从 project.json 读取作者 Steam ID。"""
+    if not isinstance(pdata, dict):
+        return ""
+    for key in ("authorsteamid", "creatorsteamid", "steamid"):
+        val = str(pdata.get(key) or "").strip()
+        if val.isdigit() and len(val) >= 15:
+            return val
+    return ""
 
 @dataclass
 class FolderNode:
@@ -169,6 +195,8 @@ def scan_single_workshop_item(workshop_root: str, wid: str) -> Optional[VideoIte
         id=wid, title=title,
         preview_path=preview_path, video_path=video_path,
         mtime=mtime, size=size, rating=rating, vtype=vtype,
+        author=_author_from_pdata(pdata),
+        author_steamid=_steamid_from_pdata(pdata),
         we_config_key=wid,
     )
 
@@ -254,6 +282,7 @@ def scan_single_myproject_item(we_path: str, we_cfg: dict, folder_name: str) -> 
     video_rel = ""
     rating = ""
     vtype = "video"
+    pdata: dict = {}
 
     if os.path.isfile(pj):
         try:
@@ -293,10 +322,12 @@ def scan_single_myproject_item(we_path: str, we_cfg: dict, folder_name: str) -> 
         size = getattr(st, "st_size", 0)
     except Exception:
         pass
+    author = _author_from_pdata(pdata)
     return VideoItem(
         id=canonical_id, title=title,
         preview_path=preview_path, video_path=video_path,
         mtime=mtime, size=size, rating=rating or "", vtype=vtype,
+        author=author,
         we_config_key=cfg_key,
     )
 
@@ -413,7 +444,8 @@ def _video_metadata_from_project_json(abs_video: str) -> Optional[Tuple[str, str
 
     rating = (pdata.get("contentrating", "") or "") or ""
     vtype_out = ((pdata.get("type", "") or "video")).strip().lower() or "video"
-    return (title, preview_path, rating, vtype_out)
+    author = _author_from_pdata(pdata)
+    return (title, preview_path, rating, vtype_out, author)
 
 
 def scan_config_linked_project_videos(we_path: str, we_cfg: dict) -> Dict[str, VideoItem]:
@@ -448,8 +480,9 @@ def scan_config_linked_project_videos(we_path: str, we_cfg: dict) -> Dict[str, V
 
         meta = _video_metadata_from_project_json(abs_v)
         if meta:
-            title, preview, rating, vtype = meta
+            title, preview, rating, vtype, author = meta
         else:
+            author = ""
             preview = _preview_for_standalone_video(abs_v, projects_root)
             if not preview or not os.path.isfile(preview):
                 continue
@@ -478,6 +511,7 @@ def scan_config_linked_project_videos(we_path: str, we_cfg: dict) -> Dict[str, V
             size=size,
             rating=rating or "",
             vtype=vtype or "video",
+            author=author or "",
             we_config_key=s,
             we_config_key_aliases=[],
         )
@@ -849,3 +883,130 @@ def move_items(we_path: str, ids: List[str], dest_path: str, id_map: Optional[Di
                 items[str(k)] = 1
 
         _write_config_atomic_with_backup(we_path, cfg)
+
+
+def _path_to_parts(path: str) -> List[str]:
+    return [p for p in (path or "/").strip().split("/") if p]
+
+
+def _folder_parent_path(path: str) -> str:
+    parts = _path_to_parts(path)
+    if len(parts) <= 1:
+        return "/"
+    return "/" + "/".join(parts[:-1])
+
+
+def _is_under_or_same(ancestor_parts: List[str], target_parts: List[str]) -> bool:
+    if len(ancestor_parts) > len(target_parts):
+        return False
+    return target_parts[: len(ancestor_parts)] == ancestor_parts
+
+
+def _detach_folder_by_parts(node_list: List[dict], parts: List[str]) -> Optional[dict]:
+    if not parts:
+        return None
+    name = parts[0]
+    if len(parts) == 1:
+        for i, f in enumerate(node_list):
+            if isinstance(f, dict) and f.get("title") == name:
+                return node_list.pop(i)
+        return None
+    for f in node_list:
+        if not isinstance(f, dict) or f.get("title") != name:
+            continue
+        subs = f.setdefault("subfolders", [])
+        return _detach_folder_by_parts(subs, parts[1:])
+    return None
+
+
+def _merge_folder_nodes(existing: dict, incoming: dict) -> None:
+    ex_items = existing.setdefault("items", {}) or {}
+    for k, v in (incoming.get("items") or {}).items():
+        ex_items[str(k)] = v
+    ex_subs = existing.setdefault("subfolders", [])
+    for sf in incoming.get("subfolders") or []:
+        if not isinstance(sf, dict):
+            continue
+        title = sf.get("title")
+        if not title:
+            continue
+        match = next((x for x in ex_subs if isinstance(x, dict) and x.get("title") == title), None)
+        if match:
+            _merge_folder_nodes(match, sf)
+        else:
+            ex_subs.append(sf)
+
+
+def _folder_target_list(folders: List[dict], dest_parts: List[str]) -> List[dict]:
+    if not dest_parts:
+        return folders
+    _ensure_path(folders, dest_parts)
+    cur_list = folders
+    for name in dest_parts:
+        node = next((x for x in cur_list if isinstance(x, dict) and x.get("title") == name), None)
+        if not node:
+            node = {"type": "folder", "title": name, "items": {}, "subfolders": []}
+            cur_list.append(node)
+        cur_list = node.setdefault("subfolders", [])
+    return cur_list
+
+
+def move_folders(we_path: str, source_paths: List[str], dest_path: str) -> int:
+    """
+    将若干文件夹节点移动到 dest_path 下，保留子结构。
+    例：/1 移入 /2 => /2/1；移入 / 则成为顶层文件夹。
+    """
+    norm_sources: List[List[str]] = []
+    seen: Set[str] = set()
+    for raw in source_paths or []:
+        p = (raw or "").strip()
+        if not p or p == "/":
+            continue
+        parts = _path_to_parts(p)
+        if not parts:
+            continue
+        key = "/" + "/".join(parts)
+        if key in seen:
+            continue
+        seen.add(key)
+        norm_sources.append(parts)
+
+    if not norm_sources:
+        return 0
+
+    dest_path = (dest_path or "/").strip()
+    dest_parts = _path_to_parts(dest_path) if dest_path != "/" else []
+    norm_sources.sort(key=len, reverse=True)
+
+    moved = 0
+    with _WRITE_LOCK:
+        cfg = load_we_config(we_path)
+        container, key = _locate_folders_slot(cfg)
+        folders = container.setdefault(key, [])
+
+        for src_parts in norm_sources:
+            src_path = "/" + "/".join(src_parts)
+            if dest_path != "/" and _is_under_or_same(src_parts, dest_parts):
+                continue
+            if _folder_parent_path(src_path) == (dest_path if dest_path else "/"):
+                continue
+
+            node = _detach_folder_by_parts(folders, src_parts)
+            if not node:
+                continue
+
+            title = str(node.get("title") or src_parts[-1])
+            target_list = _folder_target_list(folders, dest_parts)
+            existing = next(
+                (x for x in target_list if isinstance(x, dict) and x.get("title") == title),
+                None,
+            )
+            if existing:
+                _merge_folder_nodes(existing, node)
+            else:
+                target_list.append(node)
+            moved += 1
+
+        if moved:
+            _write_config_atomic_with_backup(we_path, cfg)
+    return moved
